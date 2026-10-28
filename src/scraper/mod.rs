@@ -1,7 +1,9 @@
 mod demo;
+pub mod extensions;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::ScraperError;
 use crate::models::{ListingPage, PageKind, ScrapedItem, ScraperCapabilities};
@@ -19,7 +21,17 @@ pub trait ContentScraper: Send + Sync {
     ///
     /// Used as the top-level directory name in the structured file layout
     /// (e.g. `"example-site"`). Must be unique across all registered scrapers.
-    fn site_key(&self) -> &'static str;
+    fn site_key(&self) -> &str;
+
+    /// Explicit extension routes take precedence over broad built-in demo routes.
+    fn routing_priority(&self) -> u32 {
+        0
+    }
+
+    /// Restricts host image requests, including redirects, for external modules.
+    fn asset_origins(&self) -> Option<&[String]> {
+        None
+    }
 
     /// Describes what kinds of pages and listing behaviors this scraper supports.
     fn capabilities(&self) -> ScraperCapabilities {
@@ -72,15 +84,18 @@ pub trait ContentScraper: Send + Sync {
 ///
 /// Add new scrapers by implementing [`ContentScraper`] and registering them
 /// explicitly through [`ScraperRegistry::register`].
+#[derive(Clone)]
 pub struct ScraperRegistry {
-    scrapers: Vec<Box<dyn ContentScraper>>,
+    scrapers: Arc<Vec<Arc<dyn ContentScraper>>>,
+    extension_statuses: Arc<Vec<extensions::ExtensionStatus>>,
 }
 
 impl ScraperRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self {
-            scrapers: Vec::new(),
+            scrapers: Arc::new(Vec::new()),
+            extension_statuses: Arc::new(Vec::new()),
         }
     }
 
@@ -97,12 +112,29 @@ impl ScraperRegistry {
 
     /// Creates a registry containing the scrapers shipped with this build.
     pub fn with_all_scrapers() -> Self {
-        Self::with_public_scrapers()
+        static REGISTRY: OnceLock<ScraperRegistry> = OnceLock::new();
+        REGISTRY
+            .get_or_init(|| Self::with_extensions_from(&extensions::default_plugin_directory()))
+            .clone()
+    }
+
+    /// Creates a deterministic startup snapshot. Restart to apply package changes.
+    pub fn with_extensions_from(directory: &std::path::Path) -> Self {
+        let mut registry = Self::with_public_scrapers();
+        registry.extension_statuses = Arc::new(extensions::discover(&mut registry, directory));
+        registry
+    }
+
+    pub fn extension_statuses(&self) -> &[extensions::ExtensionStatus] {
+        &self.extension_statuses
     }
 
     /// Registers one scraper implementation.
     pub fn register(&mut self, scraper: Box<dyn ContentScraper>) {
-        self.scrapers.push(scraper);
+        let scrapers = Arc::make_mut(&mut self.scrapers);
+        scrapers.push(Arc::from(scraper));
+        // Stable sorting preserves registration order for equal priorities.
+        scrapers.sort_by_key(|scraper| std::cmp::Reverse(scraper.routing_priority()));
     }
 
     /// Returns the scraper that supports `url`, or `None` if no match.
@@ -263,13 +295,42 @@ mod tests {
     }
 
     #[test]
-    fn all_scrapers_registry_matches_public_registry() {
+    fn all_scrapers_registry_reuses_the_same_startup_snapshot() {
         let registry = ScraperRegistry::with_all_scrapers();
+        let clone = ScraperRegistry::with_all_scrapers();
 
         assert!(registry
             .supports_url("https://demo.example.test/demo-site/galleries/summer-escape-001/"));
-        assert!(!registry.supports_url("https://unsupported.example/gallery/123/"));
-        assert_eq!(registry.list_site_keys(), vec!["demo-site"]);
+        assert_eq!(registry.list_site_keys(), clone.list_site_keys());
+        assert!(std::ptr::eq(
+            registry.scrapers[0].as_ref(),
+            clone.scrapers[0].as_ref()
+        ));
+        assert!(Arc::ptr_eq(&registry.scrapers, &clone.scrapers));
+        assert!(Arc::ptr_eq(
+            &registry.extension_statuses,
+            &clone.extension_statuses
+        ));
+    }
+
+    #[test]
+    fn registering_on_a_clone_keeps_existing_registry_snapshots_unchanged() {
+        let original = ScraperRegistry::with_public_scrapers();
+        let mut clone = original.clone();
+        assert!(Arc::ptr_eq(&original.scrapers, &clone.scrapers));
+        clone.register(Box::new(ContentOnlyScraper {
+            site_key: "extra",
+            host: "extra.test",
+        }));
+        assert_eq!(original.list_site_keys(), ["demo-site"]);
+        assert_eq!(clone.list_site_keys(), ["demo-site", "extra"]);
+        assert!(!Arc::ptr_eq(&original.scrapers, &clone.scrapers));
+        assert!(Arc::ptr_eq(
+            &original.extension_statuses,
+            &clone.extension_statuses
+        ));
+        assert!(!original.supports_url("https://extra.test/content"));
+        assert!(clone.supports_url("https://extra.test/content"));
     }
 
     #[test]

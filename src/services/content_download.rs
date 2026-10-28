@@ -6,7 +6,7 @@ use crate::app::{parse_comma_list, AppConfig};
 use crate::db::{Database, FileDownloadStore, ImageArtifactUpdate};
 use crate::error::ScraperError;
 use crate::fs::{DirectoryStrategy, StructuredDirectoryStrategy};
-use crate::http::fetch_response;
+use crate::http::{fetch_response, OriginRestrictedClient};
 use crate::models::{DownloadRequest, PageKind, ScrapedImage, ScrapedItem, ScraperDiagnosticLevel};
 use crate::scraper::ScraperRegistry;
 use crate::services::ThumbnailService;
@@ -150,8 +150,12 @@ impl
 
         let requests =
             self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url);
-        self.execute_downloads(requests, config.effective_concurrent_image_downloads())
-            .await?;
+        self.execute_downloads(
+            requests,
+            config.effective_concurrent_image_downloads(),
+            scraper.asset_origins(),
+        )
+        .await?;
 
         Ok(vec![])
     }
@@ -204,9 +208,11 @@ impl
         &self,
         requests: Vec<DownloadRequest>,
         max_concurrent_downloads: usize,
+        asset_origins: Option<&[String]>,
     ) -> AppResult<()> {
+        let restricted_client = asset_origins.map(OriginRestrictedClient::new).transpose()?;
         let results = stream::iter(requests)
-            .map(|request| self.download_one(request))
+            .map(|request| self.download_one(request, restricted_client.as_ref()))
             .buffer_unordered(max_concurrent_downloads.max(1))
             .collect::<Vec<_>>()
             .await;
@@ -224,7 +230,11 @@ impl
         Ok(())
     }
 
-    async fn download_one(&self, mut request: DownloadRequest) -> AppResult<ImageArtifactUpdate> {
+    async fn download_one(
+        &self,
+        mut request: DownloadRequest,
+        restricted_client: Option<&OriginRestrictedClient>,
+    ) -> AppResult<ImageArtifactUpdate> {
         self.ui.print_download_target(&request.image_url);
 
         // Some image URLs end in an opaque ID without a file extension. Reuse
@@ -250,7 +260,10 @@ impl
             return Ok(self.prepare_local_artifact(&request, &absolute).await);
         }
 
-        let limited_response = fetch_response(&request.image_url).await?;
+        let limited_response = match restricted_client {
+            Some(client) => client.fetch(&request.image_url).await?,
+            None => fetch_response(&request.image_url).await?,
+        };
         let (response, request_permit) = limited_response.into_parts();
         if request.relative_path.extension().is_none() {
             let extension = image_extension_from_content_type(
@@ -559,7 +572,7 @@ mod tests {
             thumb_dir,
         );
         service
-            .execute_downloads(requests, 2)
+            .execute_downloads(requests, 2, None)
             .await
             .expect("finalize existing files");
 

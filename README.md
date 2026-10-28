@@ -2,7 +2,9 @@
 
 ArchiveSift is a Rust desktop application for collecting downloadable content into a searchable local archive. The current public adapter downloads images and metadata, stores them in SQLite, and provides filters for source, tags, actors, categories, and studios.
 
-The repository ships with a self-contained demo website and demo scraper. Site adapters can be added by implementing the `ContentScraper` trait and registering the adapter in the scraper registry.
+The repository ships with a self-contained demo website and demo scraper. External
+adapters can be installed as WASM components or trusted native process packages
+without rebuilding the application. See [extension architecture and UML](docs/EXTENSION_ARCHITECTURE.md).
 
 ## Features
 
@@ -14,6 +16,7 @@ The repository ships with a self-contained demo website and demo scraper. Site a
 - Structured download folders
 - Import and export tools, plus a read-only SQL workspace
 - Static demo target for development and tests
+- Dynamic WASM and process extensions with a shared SDK and an Extensions status tab
 
 ## Demo download fixture
 
@@ -22,6 +25,18 @@ files and every metadata selector supported by the public demo scraper. The
 integration test serves this page from a local HTTP server, downloads all files,
 creates thumbnails, persists metadata in SQLite, and verifies source and tag
 filters without depending on external websites.
+
+To check installation and operation of the production WASM demo parser separately:
+
+```powershell
+python scripts/test_extensions.py --wasm-demo-only
+```
+
+This builds a component without test-only behaviors, packages it, and runs
+`tests/wasm_demo_site.rs` against the actual demo files. The checks verify registry
+discovery, WASM selection over the built-in fallback, metadata, channel/model
+listings, lazy API pagination, six distinct PNG downloads, SQLite and thumbnails.
+Disabled, missing, corrupt and incompatible packages are also checked.
 
 The `Demo Pages` workflow publishes `demo-site` to GitHub Pages after changes on
 `main`. The `CI` workflow runs unit and integration tests, builds the release
@@ -39,25 +54,37 @@ cargo build --release
 For development:
 
 ```powershell
-cargo test --locked
-cargo test --locked --test demo_site_download
+rustup target add wasm32-unknown-unknown
+python scripts/test_extensions.py
 cargo run
 ```
 
 ## Adding a scraper
 
-1. Implement `ContentScraper` in a new module under `src/scraper`.
-2. Keep URL matching inside `supports_url`.
-3. Return normalized metadata and image URLs from `scrape_content`.
-4. Implement `scrape_listing` when the source has listing or search pages.
-5. Register the adapter in `register_public_scrapers`.
-6. Add parser tests using local HTML fixtures or the included demo site.
+Use the versioned `archive-sift-scraper-api` contract and the public example in
+`plugins/demo-parser`. Package HTML/API parsers as WASM components; package
+browser automation as a trusted native process implementing the same contract.
+Install packages under `%APPDATA%/ArchiveSift/plugins` or set
+`ARCHIVESIFT_PLUGIN_DIR`. Enable the package in its `plugin.json` and restart;
+native packages also require `trusted: true`.
+
+Built-in `ContentScraper` registration remains available for demo/system modules.
+The [architecture document](docs/EXTENSION_ARCHITECTURE.md) contains installation
+commands, manifests, WIT, JSON-RPC examples, trust boundaries and the test matrix.
+Its [performance section](docs/EXTENSION_ARCHITECTURE.md#performance-analysis-and-implemented-changes)
+records the implemented optimizations, local measurements and the repeatable
+`extension_benchmark` example.
 
 The shared application code does not require credentials. Adapters that need authentication should keep credentials outside source control and scope them to the exact destination host.
 
 ## Repository layout
 
 - `src/scraper` — scraper interface, registry, and demo adapter
+- `src/scraper/extensions` — dynamic discovery, permissions, WASM and process runtimes
+- `crates/scraper-api` — independent protocol SDK and typed WIT contract
+- `plugins/demo-parser` — public HTML/API extension compiled for either runtime
+- `tools/plugin-packager` — validated component packaging and manifest generation
+- `docs/EXTENSION_ARCHITECTURE.md` — architecture and UML diagrams
 - `src/services` — queue, download, search, and thumbnail services
 - `src/db` — SQLite persistence and queries
 - `src/ui` — desktop interface

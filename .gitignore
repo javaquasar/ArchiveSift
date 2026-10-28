@@ -1,4 +1,5 @@
 /target/
+/plugins-local/
 /data/
 /.idea/
 /.vscode/

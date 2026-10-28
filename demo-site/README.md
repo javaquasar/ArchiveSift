@@ -67,3 +67,20 @@ Regenerate the PNG fixtures with:
 ```sh
 python demo-site/generate_random_images.py
 ```
+
+## Installed WASM parser checks
+
+Run from the repository root:
+
+```powershell
+python scripts/test_extensions.py --wasm-demo-only
+```
+
+The checks build and package the production WASM component, install it in a
+temporary plugin directory, and discover it through the application's registry.
+They serve these actual fixtures locally under `/demo-site` and `/ArchiveSift`,
+verify metadata and relative links, follow channel pagination and the lazy JSON
+chain, and download all six distinct showcase PNGs into a searchable archive.
+Legacy gallery placeholders are checked for parsing only. The suite also checks
+package connection errors and propagation of HTTP failures. CI runs this suite
+as part of the workspace tests after preparing the component.

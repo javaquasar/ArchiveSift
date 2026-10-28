@@ -46,7 +46,7 @@ impl LimitedHttpResponse {
     }
 }
 
-fn shared_request_limiter() -> &'static RequestLimiter {
+pub(crate) fn shared_request_limiter() -> &'static RequestLimiter {
     static LIMITER: OnceLock<RequestLimiter> = OnceLock::new();
     LIMITER.get_or_init(|| RequestLimiter::new(MAX_GLOBAL_HTTP_REQUESTS))
 }
@@ -64,8 +64,60 @@ pub fn shared_http_client() -> &'static Client {
 }
 
 pub(crate) async fn fetch_response(url: &str) -> AppResult<LimitedHttpResponse> {
+    fetch_response_using(url, shared_http_client()).await
+}
+
+/// One restricted pool is reused for every image in a content download.
+pub(crate) struct OriginRestrictedClient {
+    client: Client,
+    origins: Vec<String>,
+}
+
+impl OriginRestrictedClient {
+    pub(crate) fn new(origins: &[String]) -> AppResult<Self> {
+        let permissions = origins.to_vec();
+        let origins = origins.to_vec();
+        let client = Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 5 {
+                    return attempt.error("too many image redirects");
+                }
+                let target = attempt.url();
+                if !target.username().is_empty()
+                    || target.password().is_some()
+                    || !origins.contains(&target.origin().ascii_serialization())
+                {
+                    return attempt
+                        .error("image redirect is outside the extension network permissions");
+                }
+                attempt.follow()
+            }))
+            .build()?;
+        Ok(Self {
+            client,
+            origins: permissions,
+        })
+    }
+
+    pub(crate) async fn fetch(&self, url: &str) -> AppResult<LimitedHttpResponse> {
+        let parsed = reqwest::Url::parse(url)?;
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || !self
+                .origins
+                .contains(&parsed.origin().ascii_serialization())
+        {
+            return Err("image URL is outside the extension network permissions".into());
+        }
+        fetch_response_using(url, &self.client).await
+    }
+}
+
+async fn fetch_response_using(url: &str, client: &Client) -> AppResult<LimitedHttpResponse> {
     let permit = shared_request_limiter().acquire().await;
-    let response = shared_http_client()
+    let response = client
         .get(url)
         .send()
         .await
@@ -121,7 +173,7 @@ async fn read_bounded_text(url: &str, response: Response) -> AppResult<String> {
     Ok(decode_body(body))
 }
 
-fn decode_body(body: Vec<u8>) -> String {
+pub(crate) fn decode_body(body: Vec<u8>) -> String {
     match String::from_utf8(body) {
         Ok(text) => text,
         Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
@@ -142,6 +194,59 @@ fn append_bounded(target: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_redirect_cannot_escape_the_declared_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", source.local_addr().unwrap());
+        let location = format!("http://{}/private.png", target.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = source.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            let response = format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = OriginRestrictedClient::new(&[origin.clone()]).unwrap();
+        assert!(client.fetch(&format!("{origin}/image.png")).await.is_err());
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err()
+        );
+        assert!(client
+            .fetch("https://ungranted.invalid/image.png")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn image_client_follows_a_redirect_inside_the_allowed_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for status in [302, 200] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                stream.read(&mut request).await.unwrap();
+                let response = if status == 302 {
+                    "HTTP/1.1 302 Found\r\nLocation: /final.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\npng"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = OriginRestrictedClient::new(&[origin.clone()]).unwrap();
+        let limited = client.fetch(&format!("{origin}/image.png")).await.unwrap();
+        let (response, _permit) = limited.into_parts();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"png");
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn request_limiter_enforces_capacity_and_releases_permits() {

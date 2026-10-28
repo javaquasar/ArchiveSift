@@ -1,0 +1,61 @@
+package archivesift:scraper@1.0.0;
+
+interface types {
+    enum operation { content, listing }
+    enum http-method { get, post }
+    record http-response {
+        url: string,
+        status: u16,
+        content-type: option<string>,
+        body: string,
+    }
+    record request {
+        api-version: u32,
+        operation: operation,
+        url: string,
+        response: option<http-response>,
+        state: option<string>,
+    }
+    record header { name: string, value: string }
+    record fetch-request {
+        url: string,
+        method: http-method,
+        headers: list<header>,
+        body: option<string>,
+        state: option<string>,
+    }
+    record attribute {
+        kind: string,
+        label: string,
+        value: string,
+        source-url: option<string>,
+        is-female: option<bool>,
+    }
+    record image {
+        url: string,
+        preview-url: option<string>,
+        alt-text: option<string>,
+        width: option<u32>,
+        height: option<u32>,
+    }
+    record content {
+        title: string,
+        images: list<image>,
+        attributes: list<attribute>,
+    }
+    record discovered-url { url: string, operation: operation }
+    record listing {
+        urls: list<discovered-url>,
+        next-page-url: option<string>,
+    }
+    variant action {
+        fetch(fetch-request),
+        content(content),
+        listing(listing),
+    }
+}
+
+world scraper-plugin {
+    use types.{request, action};
+    export execute: func(input: request) -> result<action, string>;
+}

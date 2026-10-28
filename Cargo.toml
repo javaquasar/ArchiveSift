@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "A desktop content collector, downloader, and searchable local archive"
 publish = false
+default-run = "archive-sift"
+
+[workspace]
+members = ["crates/scraper-api", "plugins/demo-parser", "tools/plugin-packager"]
+resolver = "2"
 
 [lib]
 name = "archive_sift"
@@ -22,6 +27,10 @@ eframe = "0.31.1"
 rfd = "0.15.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+archive-sift-scraper-api = { path = "crates/scraper-api" }
+wasmtime = { version = "36.0.19", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }
+sha2 = "0.10"
+semver = "1"
 image = "0.25.9"
 #tokio = "1.43.0"
 arboard = "3"
@@ -45,3 +54,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[dev-dependencies]
+tempfile = "3"
+wat = "1.236"
+
+[profile.dev]
+debug = 0

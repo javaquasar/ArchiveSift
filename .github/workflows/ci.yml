@@ -15,12 +15,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -- --check
-      - name: Unit tests
-        run: cargo test --locked --lib
-      - name: Demo download integration test
-        run: cargo test --locked --test demo_site_download
+      - run: cargo fmt --all -- --check
+      - name: Build fixture plugins and production demo WASM module
+        run: python scripts/test_extensions.py --prepare-only
+      - name: Workspace tests including installed demo WASM parser
+        run: cargo test --locked --workspace
       - name: Release build
         run: cargo build --locked --release
       - name: Upload Windows executable

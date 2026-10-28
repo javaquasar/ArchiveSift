@@ -39,6 +39,7 @@ enum Tab {
     Scrape,
     Search,
     SqlQuery,
+    Extensions,
 }
 
 // ── SQL query results ─────────────────────────────────────────────────────────
@@ -593,6 +594,7 @@ impl AppWindow {
                 ui.selectable_value(&mut self.active_tab, Tab::Scrape, "Scrape");
                 ui.selectable_value(&mut self.active_tab, Tab::Search, "Search");
                 ui.selectable_value(&mut self.active_tab, Tab::SqlQuery, "SQL");
+                ui.selectable_value(&mut self.active_tab, Tab::Extensions, "Extensions");
             });
         });
 
@@ -600,6 +602,7 @@ impl AppWindow {
             Tab::Scrape => self.render_scrape_tab(ui),
             Tab::Search => self.render_search_tab(ui, ctx),
             Tab::SqlQuery => self.render_sql_tab(ui),
+            Tab::Extensions => self.render_extensions_tab(ui),
         });
 
         // Overlays (rendered outside central panel so they sit on top).
@@ -608,6 +611,35 @@ impl AppWindow {
         self.render_delete_confirm(ctx);
         self.render_rescrape_prompts(ctx);
         self.render_queue_window(ctx);
+    }
+
+    fn render_extensions_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Extensions");
+        ui.label("Install a package in the plugins folder and restart ArchiveSift to load it.");
+        ui.label("Enable a package in plugin.json. Native process extensions also require trusted=true and run with your account permissions.");
+        let directory = crate::scraper::extensions::default_plugin_directory();
+        ui.horizontal(|ui| {
+            ui.label(directory.to_string_lossy());
+            if ui.button("Copy folder path").clicked() {
+                ui.ctx().copy_text(directory.to_string_lossy().into_owned());
+            }
+        });
+        ui.separator();
+        let registry = ScraperRegistry::with_all_scrapers();
+        if registry.extension_statuses().is_empty() {
+            ui.label(
+                "No external extension packages found. The built-in demo parser is available.",
+            );
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for extension in registry.extension_statuses() {
+                ui.group(|ui| {
+                    ui.strong(format!("{} {}", extension.id, extension.version));
+                    ui.label(format!("{:?}: {}", extension.runtime, extension.message));
+                    ui.small(extension.directory.to_string_lossy());
+                });
+            }
+        });
     }
 
     fn render_description_popup(&mut self, ctx: &egui::Context) {
@@ -4646,6 +4678,16 @@ mod tests {
             UiLog::default(),
             Arc::new(RwLock::new(LivePresets::default())),
         )
+    }
+
+    #[test]
+    fn extensions_tab_renders_in_a_headless_egui_frame() {
+        let mut window = test_window();
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| window.render_extensions_tab(ui));
+        });
+        assert!(!output.shapes.is_empty());
     }
 
     fn search_result(image_id: i64, attributes: Vec<MetadataAttribute>) -> SearchImageResult {
