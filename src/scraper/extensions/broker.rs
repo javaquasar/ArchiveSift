@@ -2,23 +2,26 @@ use archive_sift_scraper_api::{FetchRequest, HttpMethod, HttpResponse};
 use futures::StreamExt;
 use reqwest::{header, Client};
 
+use super::credentials::Credentials;
 use super::manifest::PluginManifest;
 use crate::AppResult;
 
 pub struct HttpBroker {
     client: Client,
     manifest: PluginManifest,
+    credentials: Credentials,
 }
 
 impl HttpBroker {
     pub fn new(manifest: &PluginManifest) -> AppResult<Self> {
         Ok(Self {
             client: Client::builder()
-                .user_agent("ArchiveSift/0.1")
+                .user_agent(concat!("ArchiveSift/", env!("CARGO_PKG_VERSION")))
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_millis(manifest.limits.timeout_ms))
                 .build()?,
             manifest: manifest.clone(),
+            credentials: Credentials::load(manifest)?,
         })
     }
 
@@ -58,10 +61,13 @@ impl HttpBroker {
         for _ in 0..=5 {
             // Every redirect is checked before sending headers or body.
             self.manifest.allowed_url(url.as_str())?;
+            // Resolve secrets for each exact destination; they never enter guest DTOs.
+            let credentials = self.credentials.headers(&url)?;
             let mut builder = self
                 .client
                 .request(method.clone(), url.clone())
-                .headers(headers.clone());
+                .headers(headers.clone())
+                .headers(credentials);
             if let Some(body) = &body {
                 builder = builder.body(body.clone());
             }

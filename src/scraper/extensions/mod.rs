@@ -1,6 +1,7 @@
 //! Manifest discovery, permission enforcement, and adapters for both runtimes.
 mod broker;
 mod compilation_cache;
+mod credentials;
 pub mod manifest;
 mod process;
 mod wasm;
@@ -224,7 +225,7 @@ impl ExtensionScraper {
                     value: attribute.value,
                     source_url: attribute
                         .source_url
-                        .map(|value| self.resolve_url(url, &value))
+                        .map(|value| resolve_reference_url(url, &value))
                         .transpose()?,
                     is_female: attribute.is_female,
                 })
@@ -281,6 +282,18 @@ impl ExtensionScraper {
             diagnostics: Vec::new(),
         })
     }
+}
+
+fn resolve_reference_url(base: &str, value: &str) -> AppResult<String> {
+    let url = reqwest::Url::parse(base)?.join(value)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("metadata reference must be an HTTP URL without credentials".into());
+    }
+    Ok(url.into())
 }
 
 impl ContentScraper for ExtensionScraper {

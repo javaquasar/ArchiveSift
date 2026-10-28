@@ -76,6 +76,9 @@ records the implemented optimizations, local measurements and the repeatable
 `extension_benchmark` example.
 
 The shared application code does not require credentials. Adapters that need authentication should keep credentials outside source control and scope them to the exact destination host.
+Host 0.2.0 supports exact-origin/path HTTP header injection from Windows Credential
+Manager using local credential bindings. Secrets are never included in WASM
+packages. See the architecture document for configuration and template packaging.
 
 ## Repository layout
 

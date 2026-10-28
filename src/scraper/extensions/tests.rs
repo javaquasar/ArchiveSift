@@ -2,6 +2,29 @@ use super::*;
 use manifest::*;
 use sha2::{Digest, Sha256};
 
+#[test]
+fn metadata_links_do_not_grant_network_permissions() {
+    assert_eq!(
+        resolve_reference_url(
+            "https://example.test/content/one",
+            "https://publisher.test/watch"
+        )
+        .unwrap(),
+        "https://publisher.test/watch"
+    );
+    let manifest = manifest();
+    assert!(manifest
+        .allowed_url("https://publisher.test/watch")
+        .is_err());
+    for value in [
+        "javascript:alert(1)",
+        "file:///secret",
+        "https://user:password@publisher.test/watch",
+    ] {
+        assert!(resolve_reference_url("https://example.test/", value).is_err());
+    }
+}
+
 pub(super) fn manifest() -> PluginManifest {
     PluginManifest {
         schema: 1,
