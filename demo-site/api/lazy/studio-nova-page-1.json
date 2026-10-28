@@ -1,0 +1,7 @@
+{
+  "items": [
+    { "href": "../../galleries/summer-escape-001/", "title": "Summer Escape" },
+    { "href": "../../galleries/city-lights-002/", "title": "City Lights" }
+  ],
+  "next_payload": "./studio-nova-page-2.json"
+}

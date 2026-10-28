@@ -1,0 +1,13 @@
+/target/
+/data/
+/.idea/
+/.vscode/
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+Thumbs.db
+.DS_Store

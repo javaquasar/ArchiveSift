@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quiet Morning</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Georgia, "Times New Roman", serif;
+      background: #f6f0e5;
+      color: #222;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    .panel {
+      padding: 20px;
+      border: 1px solid #dacbbd;
+      background: #fffdf9;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .chip {
+      padding: 6px 10px;
+      background: #e9e0d4;
+    }
+
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 18px;
+      margin-top: 24px;
+    }
+
+    .thumb {
+      width: 100%;
+      height: 140px;
+      object-fit: cover;
+      background: linear-gradient(135deg, #d8dfce, #f2eadb);
+      display: block;
+      border: 1px solid #e2d7ca;
+    }
+  </style>
+</head>
+<body>
+  <main data-demo-role="gallery" data-demo-site="demo-site">
+    <p><a href="../../index.html">Back to demo home</a></p>
+    <section class="panel">
+      <h1 data-demo-title="Quiet Morning">Quiet Morning</h1>
+      <p data-demo-gallery-id="quiet-morning-003">Demo gallery ID: quiet-morning-003</p>
+      <div class="chips">
+        <span class="chip" data-demo-actor="Alice Blue">Alice Blue</span>
+        <span class="chip" data-demo-tag="indoor">indoor</span>
+        <span class="chip" data-demo-tag="soft-light">soft-light</span>
+        <span class="chip" data-demo-category="lifestyle">lifestyle</span>
+        <span class="chip" data-demo-studio="Morning House">Morning House</span>
+      </div>
+    </section>
+
+    <section class="image-grid">
+      <article data-demo-image="1">
+        <img
+          class="thumb"
+          alt="Quiet Morning image 1"
+          src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 240'%3E%3Crect width='400' height='240' fill='%23d9e1d3'/%3E%3Ctext x='200' y='125' text-anchor='middle' font-family='Georgia' font-size='28' fill='%235f6d56'%3EImage 1%3C/text%3E%3C/svg%3E"
+          data-demo-full="https://demo.example.test/media/quiet-morning-003/image-001.jpg">
+      </article>
+      <article data-demo-image="2">
+        <img
+          class="thumb"
+          alt="Quiet Morning image 2"
+          src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 240'%3E%3Crect width='400' height='240' fill='%23ece5d9'/%3E%3Ctext x='200' y='125' text-anchor='middle' font-family='Georgia' font-size='28' fill='%235f6d56'%3EImage 2%3C/text%3E%3C/svg%3E"
+          data-demo-full="https://demo.example.test/media/quiet-morning-003/image-002.jpg">
+      </article>
+    </section>
+  </main>
+</body>
+</html>

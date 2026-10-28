@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ArchiveSift Demo Site</title>
+  <style>
+    :root {
+      --bg: #f6f1e8;
+      --card: #fffdf8;
+      --ink: #1f1f1f;
+      --accent: #a44f2f;
+      --accent-soft: #ead3c8;
+      --line: #d8c7b7;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #fff6e8 0, transparent 28rem),
+        linear-gradient(180deg, #f9f4ea 0%, var(--bg) 100%);
+    }
+
+    .shell {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+
+    .hero {
+      padding: 28px;
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, #fff7eb 0%, #fffdf8 100%);
+      box-shadow: 0 16px 50px rgba(80, 45, 24, 0.08);
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    h1, h2, h3 {
+      margin: 0 0 12px;
+      line-height: 1.1;
+    }
+
+    p {
+      line-height: 1.6;
+    }
+
+    .grid {
+      display: grid;
+      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      margin-top: 28px;
+    }
+
+    .card {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--card);
+    }
+
+    .card ul {
+      padding-left: 18px;
+      margin: 12px 0 0;
+    }
+
+    .links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    a.button,
+    a.link {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 700;
+    }
+
+    a.button {
+      display: inline-block;
+      padding: 10px 14px;
+      border: 1px solid var(--accent);
+      background: #fff7f1;
+    }
+
+    .fixture-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+      background: var(--card);
+    }
+
+    .fixture-table th,
+    .fixture-table td {
+      padding: 12px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    code {
+      font-family: Consolas, monospace;
+      font-size: 0.95em;
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">Static Demo Target</div>
+      <h1>ArchiveSift Demo Site</h1>
+      <p>
+        This mini static website exists as a safe public scraping target for
+        demo scrapers, parser tests, fixture generation, and GitHub Pages hosting.
+      </p>
+      <div class="links">
+        <a class="button" href="./channels/studio-nova/">Open channel listing</a>
+        <a class="button" href="./channels/studio-nova/lazy/">Open lazy-load listing</a>
+        <a class="button" href="./models/alice-blue/">Open model listing</a>
+        <a class="button" href="./galleries/summer-escape-001/">Open gallery page</a>
+        <a class="button" href="./galleries/random-showcase-004/">Open random showcase</a>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>What This Covers</h2>
+        <ul>
+          <li>Gallery pages with title, metadata, and image entries</li>
+          <li>Listing pages that link to galleries and next pages</li>
+          <li>Lazy-loaded listings backed by JSON payloads</li>
+          <li>Actor/model style discovery pages</li>
+          <li>Stable CSS selectors for parser regression tests</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h2>Why It Helps</h2>
+        <ul>
+          <li>No dependency on a third-party site</li>
+          <li>Safe to publish publicly on GitHub Pages</li>
+          <li>Easy to version when scraper contracts change</li>
+          <li>Useful as a demo for multiple supported scrapers</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <h2>Suggested Parser Hooks</h2>
+        <ul>
+          <li><code>[data-demo-role="listing"]</code></li>
+          <li><code>.demo-gallery-link</code></li>
+          <li><code>.demo-next-page</code></li>
+          <li><code>[data-demo-role="gallery"]</code></li>
+          <li><code>[data-demo-full]</code></li>
+        </ul>
+      </article>
+    </section>
+
+    <table class="fixture-table">
+      <thead>
+        <tr>
+          <th>Page</th>
+          <th>Role</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><a class="link" href="./channels/studio-nova/">/channels/studio-nova/</a></td>
+          <td>Listing</td>
+          <td>Gallery discovery + pagination link</td>
+        </tr>
+        <tr>
+          <td><a class="link" href="./channels/studio-nova/page-2/">/channels/studio-nova/page-2/</a></td>
+          <td>Listing</td>
+          <td>Second page for next-page traversal tests</td>
+        </tr>
+        <tr>
+          <td><a class="link" href="./models/alice-blue/">/models/alice-blue/</a></td>
+          <td>Listing</td>
+          <td>Actor-style listing page with direct gallery links</td>
+        </tr>
+        <tr>
+          <td><a class="link" href="./channels/studio-nova/lazy/">/channels/studio-nova/lazy/</a></td>
+          <td>Lazy listing</td>
+          <td>Listing whose gallery links are discovered from JSON lazy-load payloads</td>
+        </tr>
+        <tr>
+          <td><a class="link" href="./galleries/summer-escape-001/">/galleries/summer-escape-001/</a></td>
+          <td>Gallery</td>
+          <td>Metadata + 3 image entries</td>
+        </tr>
+        <tr>
+          <td><a class="link" href="./galleries/city-lights-002/">/galleries/city-lights-002/</a></td>
+          <td>Gallery</td>
+          <td>Metadata + alternate tag/category mix</td>
+        </tr>
+        <tr>
+          <td><a class="link" href="./galleries/random-showcase-004/">/galleries/random-showcase-004/</a></td>
+          <td>Download fixture</td>
+          <td>Complete metadata + 6 local generated PNG files</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

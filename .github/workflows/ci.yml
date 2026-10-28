@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - name: Unit tests
+        run: cargo test --locked --lib
+      - name: Demo download integration test
+        run: cargo test --locked --test demo_site_download
+      - name: Release build
+        run: cargo build --locked --release
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: archive-sift-windows
+          path: target/release/archive-sift.exe
+          if-no-files-found: error

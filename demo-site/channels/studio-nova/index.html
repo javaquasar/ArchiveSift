@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Studio Nova Channel</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Georgia, "Times New Roman", serif;
+      background: #f4efe7;
+      color: #1e1e1e;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    .listing-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 18px;
+      margin-top: 24px;
+    }
+
+    .tile {
+      padding: 18px;
+      border: 1px solid #d9cabd;
+      background: #fffdf9;
+    }
+
+    .tile a {
+      color: #8f4329;
+      text-decoration: none;
+      font-weight: 700;
+    }
+
+    .pagination {
+      margin-top: 28px;
+    }
+  </style>
+</head>
+<body>
+  <main data-demo-role="listing" data-demo-site="demo-site" data-demo-listing-kind="channel">
+    <p><a href="../../index.html">Back to demo home</a></p>
+    <h1>Studio Nova</h1>
+    <p>Demo channel listing page for pagination and gallery discovery tests.</p>
+
+    <section class="listing-grid">
+      <article class="tile">
+        <h2><a class="demo-gallery-link" href="../../galleries/summer-escape-001/">Summer Escape</a></h2>
+        <p>Outdoor editorial set with 3 images and stable metadata.</p>
+      </article>
+      <article class="tile">
+        <h2><a class="demo-gallery-link" href="../../galleries/city-lights-002/">City Lights</a></h2>
+        <p>Night city set with alternate tags and category mix.</p>
+      </article>
+    </section>
+
+    <nav class="pagination">
+      <a class="demo-next-page" href="./page-2/">Next Page</a>
+    </nav>
+  </main>
+</body>
+</html>

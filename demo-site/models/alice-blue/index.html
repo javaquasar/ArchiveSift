@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Alice Blue Model Page</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Georgia, "Times New Roman", serif;
+      background: #f8f3eb;
+      color: #1f1f1f;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    .profile {
+      padding: 20px;
+      border: 1px solid #dacdbf;
+      background: #fffdf9;
+    }
+
+    .gallery-list {
+      margin-top: 24px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .gallery-card {
+      padding: 18px;
+      border: 1px solid #dacdbf;
+      background: #fff;
+    }
+
+    a {
+      color: #8f4329;
+      text-decoration: none;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main data-demo-role="listing" data-demo-site="demo-site" data-demo-listing-kind="model">
+    <p><a href="../../index.html">Back to demo home</a></p>
+    <section class="profile">
+      <h1>Alice Blue</h1>
+      <p data-demo-actor-name="Alice Blue">Primary demo model profile page.</p>
+      <p>Gender: <span data-demo-gender="female">female</span></p>
+    </section>
+
+    <section class="gallery-list">
+      <article class="gallery-card">
+        <h2><a class="demo-gallery-link" href="../../galleries/summer-escape-001/">Summer Escape</a></h2>
+        <p>Links a model page to a gallery page.</p>
+      </article>
+      <article class="gallery-card">
+        <h2><a class="demo-gallery-link" href="../../galleries/quiet-morning-003/">Quiet Morning</a></h2>
+        <p>Second direct gallery link from the actor profile listing.</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

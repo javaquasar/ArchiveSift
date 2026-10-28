@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Random Pixel Collection</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 28px; font-family: system-ui, sans-serif; background: #10151d; color: #eef3fb; }
+    main { max-width: 1120px; margin: 0 auto; }
+    a { color: #8bd5ff; }
+    .meta { padding: 24px; border: 1px solid #334155; border-radius: 18px; background: #18212d; }
+    .description { max-width: 900px; line-height: 1.55; color: #cbd5e1; }
+    .facts, .chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+    .fact, .chip { padding: 7px 11px; border-radius: 999px; background: #253346; }
+    .image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; margin-top: 24px; }
+    .image-card { overflow: hidden; border: 1px solid #334155; border-radius: 15px; background: #18212d; }
+    .image-card img { display: block; width: 100%; aspect-ratio: 8 / 5; object-fit: cover; }
+    .image-card p { margin: 0; padding: 12px 14px; color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <main data-demo-role="gallery" data-demo-site="demo-site">
+    <p><a href="../../index.html">Back to demo home</a></p>
+    <section class="meta">
+      <h1 data-demo-title="Random Pixel Collection">Random Pixel Collection</h1>
+      <p class="description"
+         data-demo-description="Six deterministic generated images used to verify metadata parsing, relative URL resolution, concurrent downloads, thumbnails, SQLite persistence, and search filters.">
+        Six deterministic generated images exercise the complete public demo download flow.
+      </p>
+      <div class="facts">
+        <span class="fact" data-demo-date="2026-10-28">Date: 2026-10-28</span>
+        <span class="fact" data-demo-director="Seed Generator">Director: Seed Generator</span>
+        <span class="fact" data-demo-duration="00:06:00">Duration: 00:06:00</span>
+        <span class="fact" data-demo-studio-code="DEMO-RANDOM-004">Code: DEMO-RANDOM-004</span>
+        <a class="fact" data-demo-resource-link="./" href="./">Resource link</a>
+      </div>
+      <div class="chips">
+        <span class="chip" data-demo-actor="Alice Blue">Alice Blue</span>
+        <span class="chip" data-demo-actor="Robin Gray">Robin Gray</span>
+        <span class="chip" data-demo-tag="generated">generated</span>
+        <span class="chip" data-demo-tag="random-seed">random-seed</span>
+        <span class="chip" data-demo-category="integration-test">integration-test</span>
+        <span class="chip" data-demo-studio="ArchiveSift Lab">ArchiveSift Lab</span>
+      </div>
+    </section>
+
+    <section class="image-grid" id="random-grid">
+      <article class="image-card"><img alt="Generated random image 1" src="../../media/random-showcase-004/random-001.png" data-demo-full="../../media/random-showcase-004/random-001.png"><p>Seed 101</p></article>
+      <article class="image-card"><img alt="Generated random image 2" src="../../media/random-showcase-004/random-002.png" data-demo-full="../../media/random-showcase-004/random-002.png"><p>Seed 202</p></article>
+      <article class="image-card"><img alt="Generated random image 3" src="../../media/random-showcase-004/random-003.png" data-demo-full="../../media/random-showcase-004/random-003.png"><p>Seed 303</p></article>
+      <article class="image-card"><img alt="Generated random image 4" src="../../media/random-showcase-004/random-004.png" data-demo-full="../../media/random-showcase-004/random-004.png"><p>Seed 404</p></article>
+      <article class="image-card"><img alt="Generated random image 5" src="../../media/random-showcase-004/random-005.png" data-demo-full="../../media/random-showcase-004/random-005.png"><p>Seed 505</p></article>
+      <article class="image-card"><img alt="Generated random image 6" src="../../media/random-showcase-004/random-006.png" data-demo-full="../../media/random-showcase-004/random-006.png"><p>Seed 606</p></article>
+    </section>
+  </main>
+  <script>
+    const grid = document.querySelector("#random-grid");
+    const cards = Array.from(grid.children);
+    for (let index = cards.length - 1; index > 0; index -= 1) {
+      const other = Math.floor(Math.random() * (index + 1));
+      [cards[index], cards[other]] = [cards[other], cards[index]];
+    }
+    cards.forEach(card => grid.appendChild(card));
+  </script>
+</body>
+</html>

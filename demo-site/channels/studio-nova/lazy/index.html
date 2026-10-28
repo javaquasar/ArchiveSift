@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Studio Nova Lazy Listing</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Georgia, "Times New Roman", serif;
+      background: #f4efe7;
+      color: #1e1e1e;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    .panel {
+      padding: 20px;
+      border: 1px solid #d9cabd;
+      background: #fffdf9;
+    }
+
+    .status {
+      margin-top: 18px;
+      color: #8f4329;
+      font-weight: 700;
+    }
+
+    .log {
+      margin-top: 22px;
+      padding: 16px;
+      background: #f9f0e6;
+      border: 1px dashed #d9cabd;
+      white-space: pre-wrap;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <main
+    data-demo-role="listing"
+    data-demo-site="demo-site"
+    data-demo-listing-kind="lazy-channel"
+    data-demo-lazy-source="../../../api/lazy/studio-nova-page-1.json">
+    <p><a href="../../../index.html">Back to demo home</a></p>
+    <section class="panel">
+      <h1>Studio Nova Lazy Listing</h1>
+      <p>
+        This page simulates a listing that renders gallery links only after a
+        client-side fetch. The scraper should inspect the lazy payload source,
+        fetch the JSON, and extract gallery URLs from it.
+      </p>
+      <p class="status">Client-side gallery tiles will be loaded from JSON.</p>
+    </section>
+
+    <section id="lazy-grid" class="log">Loading gallery tiles from lazy payload...</section>
+  </main>
+
+  <script>
+    async function renderLazyTiles() {
+      const root = document.querySelector("[data-demo-lazy-source]");
+      const output = document.getElementById("lazy-grid");
+      if (!root || !output) return;
+
+      const source = root.getAttribute("data-demo-lazy-source");
+      if (!source) return;
+
+      const seen = new Set();
+      const lines = [];
+      let nextUrl = new URL(source, window.location.href);
+
+      while (nextUrl) {
+        const payload = await fetch(nextUrl).then((r) => r.json());
+        for (const item of payload.items || []) {
+          const href = new URL(item.href, nextUrl).href;
+          if (!seen.has(href)) {
+            seen.add(href);
+            lines.push("Lazy tile: " + href);
+          }
+        }
+        nextUrl = payload.next_payload ? new URL(payload.next_payload, nextUrl) : null;
+      }
+
+      output.textContent = lines.join("\n");
+    }
+
+    renderLazyTiles();
+  </script>
+</body>
+</html>
