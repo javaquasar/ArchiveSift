@@ -51,6 +51,20 @@ cargo build --release
 .\target\release\archive-sift.exe
 ```
 
+The full desktop workspace opens on the first launch: **Scrape** contains source
+and destination settings, the URL queue and activity log; **Search** provides
+image filters and previews; **SQL** opens the database console. **Extensions**
+shows installed parser modules. Choose a download folder in Scrape to enable
+downloads. Search and SQL remain available without a download folder.
+
+Open **Settings → Storage** to select the download folder, open an existing
+SQLite library or create a new one, and optionally choose a separate thumbnail
+folder. **Save and apply** validates and saves the selection without restarting.
+Applying waits until downloads and database operations are idle. Changing paths
+does not move existing files; when opening another library, select both its
+database and its download folder. The Settings tab also displays the actual
+configuration file path. Local settings remain excluded from Git.
+
 For development:
 
 ```powershell
@@ -64,8 +78,10 @@ cargo run
 Use the versioned `archive-sift-scraper-api` contract and the public example in
 `plugins/demo-parser`. Package HTML/API parsers as WASM components; package
 browser automation as a trusted native process implementing the same contract.
-Install packages under `%APPDATA%/ArchiveSift/plugins` or set
-`ARCHIVESIFT_PLUGIN_DIR`. Enable the package in its `plugin.json` and restart;
+Install packages under `%APPDATA%\ArchiveSift\plugins` on Windows, or
+`$XDG_DATA_HOME/ArchiveSift/plugins` on Linux (falling back to
+`$HOME/.local/share/ArchiveSift/plugins`). Set `ARCHIVESIFT_PLUGIN_DIR` to override
+the location. Enable the package in its `plugin.json` and restart;
 native packages also require `trusted: true`.
 
 Built-in `ContentScraper` registration remains available for demo/system modules.

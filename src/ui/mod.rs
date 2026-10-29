@@ -225,6 +225,7 @@ pub enum UiCommand {
     },
     SetDownloadFolder(String),
     SetClipboardListener(bool),
+    ApplyStorageSettings(crate::services::StorageSettings),
     Search {
         database_path: String,
         query: SearchQuery,

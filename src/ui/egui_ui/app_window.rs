@@ -9,6 +9,7 @@ use super::preview_loader::{
     ImageLoadMode, ImageLoadTimings, OriginalLoader, PreviewLoader, PreviewSource,
     ORIGINAL_MAX_RGBA_BYTES, VIEWER_PROXY_MAX_SIDE,
 };
+use super::storage_settings::StorageSettingsEditor;
 use super::texture_cache::SizedLruCache;
 pub(crate) use super::LivePresets;
 use crate::app::{AppConfig, PreviewOpenMode};
@@ -40,6 +41,7 @@ enum Tab {
     Search,
     SqlQuery,
     Extensions,
+    Settings,
 }
 
 // ── SQL query results ─────────────────────────────────────────────────────────
@@ -137,12 +139,14 @@ pub struct AppWindow {
     pub pending_command: Option<UiCommand>,
     pub running: bool,
     pub import_running: bool,
+    pub(super) queue_worker_running: bool,
     pub error: Option<String>,
     pub queue_status: Option<String>,
     /// Monotonically increasing counter; used to discard stale search responses.
     pub search_seq: u64,
 
     active_tab: Tab,
+    storage_settings: StorageSettingsEditor,
     search_form: SearchForm,
     /// Immutable snapshot shared with the render closures. Replacing the
     /// snapshot after a search is cheap, and rendering does not deep-clone
@@ -265,16 +269,19 @@ impl AppWindow {
         live_presets: Arc<RwLock<LivePresets>>,
     ) -> Self {
         let thumb_dir = config.thumb_dir();
+        let storage_settings = StorageSettingsEditor::new(&config);
         Self {
             config,
             log,
             pending_command: None,
             running: false,
             import_running: false,
+            queue_worker_running: false,
             error: None,
             queue_status: None,
             search_seq: 0,
             active_tab: Tab::Scrape,
+            storage_settings,
             search_form: SearchForm::default(),
             search_results: Arc::new(Vec::new()),
             search_next_cursor: None,
@@ -589,28 +596,84 @@ impl AppWindow {
     pub fn render(&mut self, ctx: &egui::Context) {
         self.install_ready_previews(ctx);
 
+        let previous_tab = self.active_tab;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.active_tab, Tab::Scrape, "Scrape");
-                ui.selectable_value(&mut self.active_tab, Tab::Search, "Search");
-                ui.selectable_value(&mut self.active_tab, Tab::SqlQuery, "SQL");
-                ui.selectable_value(&mut self.active_tab, Tab::Extensions, "Extensions");
+            ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.active_tab, Tab::Scrape, "Scrape");
+                    ui.selectable_value(&mut self.active_tab, Tab::Search, "Search");
+                    ui.selectable_value(&mut self.active_tab, Tab::SqlQuery, "SQL");
+                    ui.selectable_value(&mut self.active_tab, Tab::Extensions, "Extensions");
+                    ui.selectable_value(&mut self.active_tab, Tab::Settings, "Settings");
+                });
+            });
+        });
+        if self.active_tab == Tab::Settings && previous_tab != Tab::Settings {
+            self.storage_settings = StorageSettingsEditor::new(&self.config);
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
+                match self.active_tab {
+                    Tab::Scrape => self.render_scrape_tab(ui),
+                    Tab::Search => self.render_search_tab(ui, ctx),
+                    Tab::SqlQuery => self.render_sql_tab(ui),
+                    Tab::Extensions => self.render_extensions_tab(ui),
+                    Tab::Settings => {
+                        let busy = self.storage_settings_busy();
+                        if let Some(settings) = self.storage_settings.render(ui, &self.config, busy)
+                        {
+                            self.pending_command = Some(UiCommand::ApplyStorageSettings(settings));
+                        }
+                    }
+                }
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
-            Tab::Scrape => self.render_scrape_tab(ui),
-            Tab::Search => self.render_search_tab(ui, ctx),
-            Tab::SqlQuery => self.render_sql_tab(ui),
-            Tab::Extensions => self.render_extensions_tab(ui),
-        });
-
         // Overlays (rendered outside central panel so they sit on top).
-        self.render_viewer(ctx);
-        self.render_description_popup(ctx);
-        self.render_delete_confirm(ctx);
-        self.render_rescrape_prompts(ctx);
-        self.render_queue_window(ctx);
+        if !self.storage_settings.applying {
+            self.render_viewer(ctx);
+            self.render_description_popup(ctx);
+            self.render_delete_confirm(ctx);
+            self.render_rescrape_prompts(ctx);
+            self.render_queue_window(ctx);
+        }
+    }
+
+    pub(super) fn storage_settings_busy(&self) -> bool {
+        self.running
+            || self.queue_worker_running
+            || self.import_running
+            || self.sql_running
+            || self.sql_export_running
+            || self.date_browse_loading
+            || self.storage_settings.applying
+    }
+
+    pub(super) fn storage_settings_applying(&self) -> bool {
+        self.storage_settings.applying
+    }
+
+    pub(super) fn begin_storage_settings(&mut self) {
+        self.storage_settings.applying = true;
+        self.storage_settings.status = None;
+    }
+
+    pub(super) fn storage_settings_failed(&mut self, error: String) {
+        self.storage_settings.applying = false;
+        self.storage_settings.status = Some(Err(error));
+    }
+
+    pub(super) fn storage_settings_saved(&mut self) {
+        self.active_tab = Tab::Settings;
+        self.storage_settings.status = Some(Ok(()));
+    }
+
+    pub(super) fn apply_storage_config(&mut self, config: AppConfig) {
+        let mut replacement = Self::new(config, self.log.clone(), Arc::clone(&self.live_presets));
+        replacement.sql_query = std::mem::take(&mut self.sql_query);
+        replacement.storage_settings_saved();
+        *self = replacement;
     }
 
     fn render_extensions_tab(&mut self, ui: &mut egui::Ui) {
@@ -618,8 +681,8 @@ impl AppWindow {
         ui.label("Install a package in the plugins folder and restart ArchiveSift to load it.");
         ui.label("Enable a package in plugin.json. Native process extensions also require trusted=true and run with your account permissions.");
         let directory = crate::scraper::extensions::default_plugin_directory();
-        ui.horizontal(|ui| {
-            ui.label(directory.to_string_lossy());
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(directory.to_string_lossy()).wrap());
             if ui.button("Copy folder path").clicked() {
                 ui.ctx().copy_text(directory.to_string_lossy().into_owned());
             }
@@ -631,15 +694,7 @@ impl AppWindow {
                 "No external extension packages found. The built-in demo parser is available.",
             );
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for extension in registry.extension_statuses() {
-                ui.group(|ui| {
-                    ui.strong(format!("{} {}", extension.id, extension.version));
-                    ui.label(format!("{:?}: {}", extension.runtime, extension.message));
-                    ui.small(extension.directory.to_string_lossy());
-                });
-            }
-        });
+        render_extension_packages(ui, registry.extension_statuses());
     }
 
     fn render_description_popup(&mut self, ctx: &egui::Context) {
@@ -1342,7 +1397,7 @@ impl AppWindow {
 
                 if ui
                     .add_enabled(
-                        !self.import_running,
+                        can_start && !self.import_running,
                         egui::Button::new("Import URL File"),
                     )
                     .clicked()
@@ -1369,7 +1424,7 @@ impl AppWindow {
 
                     if ui
                         .add_enabled(
-                            !self.import_running,
+                            can_start && !self.import_running,
                             egui::Button::new("Import URL File"),
                         )
                         .clicked()
@@ -1799,7 +1854,11 @@ impl AppWindow {
 
                     ui.add_space(10.0);
                     ui.label("Database path");
-                    ui.text_edit_singleline(&mut self.config.database_path);
+                    ui.add(egui::Label::new(&self.config.database_path).wrap());
+                    if ui.button("Edit storage settings").clicked() {
+                        self.storage_settings = StorageSettingsEditor::new(&self.config);
+                        self.active_tab = Tab::Settings;
+                    }
                 });
         });
             },
@@ -4485,6 +4544,49 @@ impl AppWindow {
     }
 }
 
+fn render_extension_packages(
+    ui: &mut egui::Ui,
+    extensions: &[crate::scraper::extensions::ExtensionStatus],
+) -> egui::scroll_area::ScrollAreaOutput<()> {
+    egui::ScrollArea::vertical()
+        .id_salt("extension_packages")
+        .auto_shrink([false, false])
+        .max_height(ui.available_height())
+        .show(ui, |ui| {
+            for extension in extensions {
+                render_extension_card(ui, extension);
+            }
+        })
+}
+
+fn render_extension_card(
+    ui: &mut egui::Ui,
+    extension: &crate::scraper::extensions::ExtensionStatus,
+) -> egui::Response {
+    let frame = egui::Frame::group(ui.style());
+    let content_width = (ui.available_width() - frame.total_margin().sum().x).max(0.0);
+    frame
+        .show(ui, |ui| {
+            ui.set_width(content_width);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("{} {}", extension.id, extension.version)).strong(),
+                )
+                .wrap(),
+            );
+            ui.add(
+                egui::Label::new(format!("{:?}: {}", extension.runtime, extension.message)).wrap(),
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(extension.directory.to_string_lossy()).small(),
+                )
+                .wrap(),
+            );
+        })
+        .response
+}
+
 // ── Attribute context-menu command builders ───────────────────────────────────
 
 /// Builds a "remove attribute" command for a tag / category / studio.
@@ -4681,6 +4783,30 @@ mod tests {
     }
 
     #[test]
+    fn storage_settings_rebind_thumbnail_paths_and_clear_old_library_views() {
+        let mut window = test_window();
+        window.sql_query = "SELECT COUNT(*) FROM images".to_string();
+        window.set_search_results(vec![search_result(7, Vec::new())]);
+        window.viewer_open = Some(0);
+        window.tag_suggestions.push("old suggestion".into());
+        let next = AppConfig {
+            database_path: Path::new("next-library")
+                .join("catalog.sqlite3")
+                .display()
+                .to_string(),
+            thumbnail_folder: Some("next-previews".to_string()),
+            ..window.config.clone()
+        };
+        window.apply_storage_config(next);
+        assert_eq!(window.thumb_dir, Path::new("next-previews"));
+        assert!(window.search_results.is_empty());
+        assert!(window.tag_suggestions.is_empty());
+        assert!(window.viewer_open.is_none());
+        assert_eq!(window.sql_query, "SELECT COUNT(*) FROM images");
+        assert_eq!(window.active_tab, Tab::Settings);
+    }
+
+    #[test]
     fn extensions_tab_renders_in_a_headless_egui_frame() {
         let mut window = test_window();
         let context = egui::Context::default();
@@ -4688,6 +4814,107 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| window.render_extensions_tab(ui));
         });
         assert!(!output.shapes.is_empty());
+    }
+
+    fn extension_status(id: &str, message: &str) -> crate::scraper::extensions::ExtensionStatus {
+        crate::scraper::extensions::ExtensionStatus {
+            directory: Path::new("plugins").join(id),
+            id: id.to_string(),
+            version: "1.0.0".to_string(),
+            runtime: Some(crate::scraper::extensions::manifest::RuntimeKind::Wasm),
+            loaded: true,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn extension_cards_share_available_width_and_wrap_long_content() {
+        let extensions = [
+            extension_status("demo.short", "Loaded"),
+            extension_status(
+                &format!("demo.{}", "long-name".repeat(40)),
+                &"Long diagnostic. ".repeat(60),
+            ),
+        ];
+        for width in [280.0, 640.0, 1200.0] {
+            let context = egui::Context::default();
+            let mut rects = Vec::new();
+            let mut available_width = 0.0;
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 1800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        available_width = ui.available_width();
+                        for extension in &extensions {
+                            rects.push(render_extension_card(ui, extension).rect);
+                        }
+                    });
+                },
+            );
+            for rect in &rects {
+                assert!(
+                    (rect.width() - available_width).abs() < 1.0,
+                    "{rect:?}, available {available_width}"
+                );
+            }
+            assert!(rects[1].height() > rects[0].height());
+        }
+    }
+
+    #[test]
+    fn extension_packages_scroll_when_the_list_exceeds_the_viewport() {
+        let extensions = (0..40)
+            .map(|index| extension_status(&format!("demo.parser-{index}"), "Loaded"))
+            .collect::<Vec<_>>();
+        let context = egui::Context::default();
+        let run = |time, events| {
+            let mut result = None;
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(500.0, 300.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        result = Some(render_extension_packages(ui, &extensions));
+                    });
+                },
+            );
+            result.unwrap()
+        };
+        let initial = run(0.0, Vec::new());
+        assert!(initial.content_size.y > initial.inner_rect.height());
+        assert!(initial.inner_rect.height() <= 300.0);
+        assert!(initial.content_size.x <= initial.inner_rect.width() + 1.0);
+
+        let scrolled = run(
+            0.1,
+            vec![
+                egui::Event::PointerMoved(initial.inner_rect.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -500.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(scrolled.state.offset.y > initial.state.offset.y);
+        let next = run(0.2, Vec::new());
+        assert!(
+            next.state.offset.y > 0.0,
+            "Scroll position should persist between frames"
+        );
     }
 
     fn search_result(image_id: i64, attributes: Vec<MetadataAttribute>) -> SearchImageResult {

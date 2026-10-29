@@ -126,7 +126,7 @@ sequenceDiagram
 The default directory is selected in this order:
 
 1. `ARCHIVESIFT_PLUGIN_DIR`, when set.
-2. `%APPDATA%/ArchiveSift/plugins` on Windows.
+2. `%APPDATA%\ArchiveSift\plugins` on Windows.
 3. `$XDG_DATA_HOME/ArchiveSift/plugins` on Unix.
 4. `$HOME/.local/share/ArchiveSift/plugins` on Unix.
 5. `plugins-local` if no profile directory is available.

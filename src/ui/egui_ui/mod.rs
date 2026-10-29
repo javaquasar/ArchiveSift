@@ -2,6 +2,7 @@ mod app_window;
 mod background_executor;
 mod coalescing_worker;
 mod preview_loader;
+mod storage_settings;
 mod texture_cache;
 
 pub use app_window::AppWindow;
@@ -25,11 +26,10 @@ use crate::models::{
 };
 use crate::scraper::ScraperRegistry;
 use crate::services::url_queue;
-use crate::services::{ContentDownloadService, SearchService, SettingsService, UrlQueueService};
-use crate::ui::{
-    home::{render_home_screen, HomeScreenState, HomeTransition},
-    ConsoleUi, SearchRefresh, UiBackend, UiCommand, UiLog,
+use crate::services::{
+    ContentDownloadService, SearchService, SettingsService, StorageSettings, UrlQueueService,
 };
+use crate::ui::{ConsoleUi, SearchRefresh, UiBackend, UiCommand, UiLog};
 use crate::AppResult;
 use background_executor::{shared_async_runtime, spawn_background};
 use coalescing_worker::CoalescingWorker;
@@ -61,13 +61,6 @@ impl UiBackend for EguiBackend {
         )
         .map_err(|error| error.to_string().into())
     }
-}
-
-// ── App phase state machine ───────────────────────────────────────────────────
-
-enum AppPhase {
-    Home(HomeScreenState),
-    Running(AppWindow),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -104,8 +97,7 @@ struct SearchMutationResult {
 // ── DesktopApp (eframe::App implementation) ───────────────────────────────────
 
 struct DesktopApp {
-    config: AppConfig,
-    phase: AppPhase,
+    window: AppWindow,
     queue_service: Arc<UrlQueueService>,
     worker_running: bool,
     state_rx: mpsc::Receiver<WorkerState>,
@@ -113,7 +105,7 @@ struct DesktopApp {
     suggestion_worker: CoalescingWorker<SuggestionKind, SuggestionJob>,
     search_cancellation: Option<QueryCancellation>,
     repaint_context: egui::Context,
-    /// Present only when `InputMode::ClipboardMonitor` is active.
+    /// Created on demand when clipboard monitoring is enabled.
     clipboard_rx: Option<mpsc::Receiver<ClipboardEvent>>,
     /// Live preset tags/categories shared with the running queue processor.
     /// Updated by the UI whenever the user changes the preset fields.
@@ -186,37 +178,43 @@ pub(crate) struct LivePresets {
     pub categories: String,
 }
 
+fn suggestion_worker(
+    state_tx: &RepaintingSender<WorkerState>,
+) -> CoalescingWorker<SuggestionKind, SuggestionJob> {
+    let suggestion_tx = state_tx.clone();
+    CoalescingWorker::new(move |job: SuggestionJob| {
+        let results = run_suggestions(
+            job.database_path,
+            job.kind.database_kind(),
+            job.query.clone(),
+        )
+        .unwrap_or_default();
+        let state = match job.kind {
+            SuggestionKind::Tag => WorkerState::TagSuggestions {
+                query: job.query,
+                results,
+            },
+            SuggestionKind::Actor => WorkerState::ActorSuggestions {
+                query: job.query,
+                results,
+            },
+            SuggestionKind::Category => WorkerState::CategorySuggestions {
+                query: job.query,
+                results,
+            },
+            SuggestionKind::Studio => WorkerState::StudioSuggestions {
+                query: job.query,
+                results,
+            },
+        };
+        let _ = suggestion_tx.send(state);
+    })
+}
+
 impl DesktopApp {
     fn new(config: AppConfig, repaint_context: egui::Context) -> Self {
         let (state_tx, state_rx) = repainting_channel(&repaint_context, UI_RESULT_CHANNEL_CAPACITY);
-        let suggestion_tx = state_tx.clone();
-        let suggestion_worker = CoalescingWorker::new(move |job: SuggestionJob| {
-            let results = run_suggestions(
-                job.database_path,
-                job.kind.database_kind(),
-                job.query.clone(),
-            )
-            .unwrap_or_default();
-            let state = match job.kind {
-                SuggestionKind::Tag => WorkerState::TagSuggestions {
-                    query: job.query,
-                    results,
-                },
-                SuggestionKind::Actor => WorkerState::ActorSuggestions {
-                    query: job.query,
-                    results,
-                },
-                SuggestionKind::Category => WorkerState::CategorySuggestions {
-                    query: job.query,
-                    results,
-                },
-                SuggestionKind::Studio => WorkerState::StudioSuggestions {
-                    query: job.query,
-                    results,
-                },
-            };
-            let _ = suggestion_tx.send(state);
-        });
+        let suggestion_worker = suggestion_worker(&state_tx);
         let queue_service = Arc::new(UrlQueueService::new());
 
         let live_presets = Arc::new(RwLock::new(LivePresets {
@@ -224,30 +222,15 @@ impl DesktopApp {
             categories: config.preset_categories.clone(),
         }));
 
-        // Skip the home screen if a download folder was already configured.
-        let (phase, clipboard_rx) = if config.has_download_folder() {
-            let log = UiLog::default();
-            let rx = if config.clipboard_listener_enabled {
-                Some(clipboard_event_channel(&repaint_context))
-            } else {
-                None
-            };
-            (
-                AppPhase::Running(AppWindow::new(
-                    config.clone(),
-                    log,
-                    Arc::clone(&live_presets),
-                )),
-                rx,
-            )
-        } else {
-            let home = HomeScreenState::from_config(&config);
-            (AppPhase::Home(home), None)
-        };
+        // Destination setup lives in the Scrape tab. Keep Search, SQL and
+        // Extensions accessible even before a download folder is configured.
+        let clipboard_rx = config
+            .clipboard_listener_enabled
+            .then(|| clipboard_event_channel(&repaint_context));
+        let window = AppWindow::new(config, UiLog::default(), Arc::clone(&live_presets));
 
         let app = Self {
-            config,
-            phase,
+            window,
             queue_service,
             worker_running: false,
             state_rx,
@@ -261,38 +244,18 @@ impl DesktopApp {
 
         // The SQLite-backed queue restores interrupted work itself. Remove
         // entries that were fully persisted before a previous unclean exit.
-        if let AppPhase::Running(ref w) = app.phase {
-            let db = Database::new(&w.config.database_path);
-            let _ = app.queue_service.prune_processed(&db);
-        }
+        let db = Database::new(&app.window.config.database_path);
+        let _ = app.queue_service.prune_processed(&db);
 
         app
     }
 
-    fn apply_home_transition(&mut self, transition: HomeTransition) {
-        self.config.input_mode = transition.input_mode.clone();
-        self.config
-            .set_active_download_folder(&transition.download_folder);
-        let _ = self.config.save();
-
-        // Start watcher if clipboard monitoring is enabled (regardless of input_mode).
-        if self.config.clipboard_listener_enabled && self.clipboard_rx.is_none() {
-            self.clipboard_rx = Some(clipboard_event_channel(&self.repaint_context));
-        }
-
-        let log = UiLog::default();
-        self.phase = AppPhase::Running(AppWindow::new(
-            self.config.clone(),
-            log,
-            Arc::clone(&self.live_presets),
-        ));
-    }
-
     fn enqueue_manual_url(&mut self, config: AppConfig) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
+        if !config.has_download_folder() {
+            window.error = Some("Select a download directory to enable scraping.".to_string());
+            return;
+        }
         window.error = None;
         let settings = SettingsService::new();
         let mut config = config;
@@ -307,18 +270,12 @@ impl DesktopApp {
             .enqueue_urls(&database, vec![config.source_url.clone()])
         {
             Ok(report) => {
-                let window = match &mut self.phase {
-                    AppPhase::Running(w) => w,
-                    _ => return,
-                };
+                let window = &mut self.window;
                 window.apply_queue_report(&report, "Manual queue");
                 self.start_processor_if_needed(config);
             }
             Err(error) => {
-                let window = match &mut self.phase {
-                    AppPhase::Running(w) => w,
-                    _ => return,
-                };
+                let window = &mut self.window;
                 window.error = Some(error.to_string());
                 window
                     .log
@@ -328,10 +285,11 @@ impl DesktopApp {
     }
 
     fn start_import_url_file(&mut self, file_path: String) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
+        if !window.config.has_download_folder() {
+            window.error = Some("Select a download directory to enable scraping.".to_string());
+            return;
+        }
         if !try_start_import(&mut window.import_running) {
             window.log.push("A URL-file import is already running.");
             return;
@@ -357,10 +315,7 @@ impl DesktopApp {
     }
 
     fn set_active_download_folder(&mut self, folder: String) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         let settings = SettingsService::new();
         settings.set_active_download_dir(&mut window.config, &folder);
         if let Err(error) = window.config.save() {
@@ -371,11 +326,56 @@ impl DesktopApp {
         }
     }
 
+    fn start_storage_settings(&mut self, settings: StorageSettings, config_path: PathBuf) {
+        if self.window.storage_settings_applying() {
+            return;
+        }
+        if self.worker_running || self.window.storage_settings_busy() {
+            self.window.storage_settings_failed(
+                "Wait for active operations to finish before changing storage settings."
+                    .to_string(),
+            );
+            return;
+        }
+        self.window.begin_storage_settings();
+        let config = self.window.config.clone();
+        let state_tx = self.state_tx.clone();
+        spawn_background(move || {
+            let result = SettingsService::new()
+                .apply_storage_settings(&config, &settings, &config_path)
+                .map_err(|error| error.to_string());
+            let _ = state_tx.send(WorkerState::StorageSettingsApplied(result));
+        });
+    }
+
+    fn finish_storage_settings(&mut self, result: Result<AppConfig, String>) {
+        match result {
+            Ok(config) => {
+                if let Some(cancellation) = self.search_cancellation.take() {
+                    cancellation.cancel();
+                }
+                // Old metadata and suggestion jobs must never populate the new
+                // library, even if their database IDs happen to match.
+                let (state_tx, state_rx) =
+                    repainting_channel(&self.repaint_context, UI_RESULT_CHANNEL_CAPACITY);
+                self.suggestion_worker = suggestion_worker(&state_tx);
+                self.state_tx = state_tx;
+                self.state_rx = state_rx;
+                let log = self.window.log.clone();
+                log.push("Storage settings saved and applied.");
+                self.window.apply_storage_config(config);
+            }
+            Err(error) => {
+                self.window
+                    .log
+                    .push(format!("Could not apply storage settings: {error}"));
+                self.window.storage_settings_failed(error);
+            }
+        }
+    }
+
     fn set_clipboard_listener_enabled(&mut self, enabled: bool) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.config.clipboard_listener_enabled = enabled;
         if let Err(error) = window.config.save() {
             window.error = Some(error.to_string());
@@ -402,12 +402,12 @@ impl DesktopApp {
             None => return,
         };
 
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
 
-        if !window.config.clipboard_listener_enabled {
+        if !window.config.clipboard_listener_enabled
+            || !window.config.has_download_folder()
+            || window.storage_settings_applying()
+        {
             while rx.try_recv().is_ok() {}
             return;
         }
@@ -430,10 +430,7 @@ impl DesktopApp {
                     let database = Database::new(&config.database_path);
                     match self.queue_service.enqueue_text(&database, &text) {
                         Ok(report) => {
-                            let window = match &mut self.phase {
-                                AppPhase::Running(w) => w,
-                                _ => return,
-                            };
+                            let window = &mut self.window;
                             // Log each found URL individually, not the raw clipboard text.
                             if candidates.len() == 1 {
                                 window.log.push(format!("Clipboard: {}", candidates[0]));
@@ -454,10 +451,7 @@ impl DesktopApp {
                             }
                         }
                         Err(error) => {
-                            let window = match &mut self.phase {
-                                AppPhase::Running(w) => w,
-                                _ => return,
-                            };
+                            let window = &mut self.window;
                             window
                                 .log
                                 .push(format!("Clipboard processing failed: {}", error));
@@ -465,10 +459,7 @@ impl DesktopApp {
                     }
                 }
                 ClipboardEvent::Error(error) => {
-                    let window = match &mut self.phase {
-                        AppPhase::Running(w) => w,
-                        _ => return,
-                    };
+                    let window = &mut self.window;
                     window.log.push(error);
                 }
             }
@@ -483,10 +474,7 @@ impl DesktopApp {
         cursor: Option<SearchCursor>,
         append: bool,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.running = true;
         window.error = None;
 
@@ -522,10 +510,7 @@ impl DesktopApp {
         cursor: Option<SearchCursor>,
         append: bool,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.running = true;
         window.error = None;
         if let Some(cancellation) = self.search_cancellation.take() {
@@ -615,10 +600,7 @@ impl DesktopApp {
         message: impl Into<String>,
         job: impl FnOnce() -> AppResult<SearchMutationResult> + Send + 'static,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.running = true;
         window.error = None;
 
@@ -667,10 +649,7 @@ impl DesktopApp {
         image_ids: Vec<i64>,
         refresh: SearchRefresh,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.running = true;
         window.error = None;
 
@@ -694,10 +673,7 @@ impl DesktopApp {
         actor_name: String,
         refresh: SearchRefresh,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.running = true;
         window.error = None;
 
@@ -721,10 +697,7 @@ impl DesktopApp {
         mode: DeleteMode,
         refresh: SearchRefresh,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         window.running = true;
         window.error = None;
 
@@ -754,10 +727,11 @@ impl DesktopApp {
         url: String,
         max_concurrent_downloads: usize,
     ) {
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
+        if download_dir.trim().is_empty() {
+            window.error = Some("Select a download directory to enable scraping.".to_string());
+            return;
+        }
         window.running = true;
         window.log.push(format!("Re-scraping: {}", url));
 
@@ -780,14 +754,14 @@ impl DesktopApp {
     }
 
     fn start_processor_if_needed(&mut self, config: AppConfig) {
-        if self.worker_running || !self.queue_service.has_pending_work() {
+        if !config.has_download_folder()
+            || self.worker_running
+            || !self.queue_service.has_pending_work()
+        {
             return;
         }
 
-        let window = match &mut self.phase {
-            AppPhase::Running(w) => w,
-            _ => return,
-        };
+        let window = &mut self.window;
         self.worker_running = true;
         window.running = true;
         window.log.push("Starting queued URL processing...");
@@ -810,47 +784,36 @@ impl DesktopApp {
     }
 }
 
-impl eframe::App for DesktopApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Home screen ──────────────────────────────────────────────────────
-        if let AppPhase::Home(ref mut home) = self.phase {
-            if let Some(transition) = render_home_screen(home, ctx) {
-                self.apply_home_transition(transition);
-            }
-            return;
-        }
-
-        // ── Running ──────────────────────────────────────────────────────────
+impl DesktopApp {
+    fn update_ui(&mut self, ctx: &egui::Context) {
         self.handle_clipboard_events();
 
         while let Ok(state) = self.state_rx.try_recv() {
             match state {
+                WorkerState::StorageSettingsApplied(result) => self.finish_storage_settings(result),
                 WorkerState::ImportFinished { file_path, result } => {
-                    let config_to_start = match &mut self.phase {
-                        AppPhase::Running(window) => {
-                            window.import_running = false;
-                            match result {
-                                Ok(report) => {
-                                    let should_start = report.queued_successfully > 0;
-                                    window.apply_queue_report(
-                                        &report,
-                                        &format!("Imported {}", file_path),
-                                    );
-                                    should_start.then(|| window.config.clone())
-                                }
-                                Err(error) => {
-                                    window.error = Some(error.clone());
-                                    window.queue_status =
-                                        Some(format!("Import failed: {}", file_path));
-                                    window.log.push(format!(
-                                        "Failed to import URL file {}: {}",
-                                        file_path, error
-                                    ));
-                                    None
-                                }
+                    let config_to_start = {
+                        let window = &mut self.window;
+                        window.import_running = false;
+                        match result {
+                            Ok(report) => {
+                                let should_start = report.queued_successfully > 0;
+                                window.apply_queue_report(
+                                    &report,
+                                    &format!("Imported {}", file_path),
+                                );
+                                should_start.then(|| window.config.clone())
+                            }
+                            Err(error) => {
+                                window.error = Some(error.clone());
+                                window.queue_status = Some(format!("Import failed: {}", file_path));
+                                window.log.push(format!(
+                                    "Failed to import URL file {}: {}",
+                                    file_path, error
+                                ));
+                                None
                             }
                         }
-                        AppPhase::Home(_) => None,
                     };
                     if let Some(config) = config_to_start {
                         self.start_processor_if_needed(config);
@@ -858,28 +821,24 @@ impl eframe::App for DesktopApp {
                 }
                 WorkerState::QueueFinished(Ok(())) => {
                     self.worker_running = false;
-                    if let AppPhase::Running(w) = &mut self.phase {
+                    {
+                        let w = &mut self.window;
                         w.running = false;
                         w.error = None;
                         w.log.push("Queue finished.");
                     }
-                    let cfg = match &self.phase {
-                        AppPhase::Running(w) => w.config.clone(),
-                        _ => return,
-                    };
+                    let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
                 }
                 WorkerState::QueueFinished(Err(error)) => {
                     self.worker_running = false;
-                    if let AppPhase::Running(w) = &mut self.phase {
+                    {
+                        let w = &mut self.window;
                         w.running = false;
                         w.error = Some(error.clone());
                         w.log.push(format!("Queue failed: {}", error));
                     }
-                    let cfg = match &self.phase {
-                        AppPhase::Running(w) => w.config.clone(),
-                        _ => return,
-                    };
+                    let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
                 }
                 WorkerState::SearchFinished {
@@ -887,17 +846,16 @@ impl eframe::App for DesktopApp {
                     append,
                     result,
                 } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        if w.search_seq == seq {
-                            w.running = false;
-                            match result {
-                                Ok(page) => {
-                                    w.error = None;
-                                    w.set_search_page(page, append);
-                                }
-                                Err(error) => {
-                                    w.error = Some(error);
-                                }
+                    let w = &mut self.window;
+                    if w.search_seq == seq {
+                        w.running = false;
+                        match result {
+                            Ok(page) => {
+                                w.error = None;
+                                w.set_search_page(page, append);
+                            }
+                            Err(error) => {
+                                w.error = Some(error);
                             }
                         }
                     }
@@ -906,142 +864,129 @@ impl eframe::App for DesktopApp {
                     requested_ids,
                     result,
                 } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        match result {
-                            Ok(results) => w.apply_hydrated_results(&requested_ids, results),
-                            Err(error) => {
-                                w.apply_hydrated_results(&requested_ids, Vec::new());
-                                w.log.push(format!("Metadata load failed: {error}"));
-                            }
+                    let w = &mut self.window;
+                    match result {
+                        Ok(results) => w.apply_hydrated_results(&requested_ids, results),
+                        Err(error) => {
+                            w.apply_hydrated_results(&requested_ids, Vec::new());
+                            w.log.push(format!("Metadata load failed: {error}"));
                         }
                     }
                 }
                 WorkerState::TagSuggestions { query, results } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.set_tag_suggestions(&query, results);
-                    }
+                    let w = &mut self.window;
+                    w.set_tag_suggestions(&query, results);
                 }
                 WorkerState::ActorSuggestions { query, results } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.set_actor_suggestions(&query, results);
-                    }
+                    let w = &mut self.window;
+                    w.set_actor_suggestions(&query, results);
                 }
                 WorkerState::CategorySuggestions { query, results } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.set_category_suggestions(&query, results);
-                    }
+                    let w = &mut self.window;
+                    w.set_category_suggestions(&query, results);
                 }
                 WorkerState::StudioSuggestions { query, results } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.set_studio_suggestions(&query, results);
-                    }
+                    let w = &mut self.window;
+                    w.set_studio_suggestions(&query, results);
                 }
                 WorkerState::MetadataUpdated { message, results } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.running = false;
-                        match results {
-                            Ok(results) => {
-                                w.apply_metadata_update(message);
-                                if results.replace {
-                                    w.refresh_search_page(SearchResultPage {
-                                        items: results.results,
-                                        next_cursor: results.next_cursor,
-                                    });
-                                } else {
-                                    w.patch_search_results(results.results);
-                                }
+                    let w = &mut self.window;
+                    w.running = false;
+                    match results {
+                        Ok(results) => {
+                            w.apply_metadata_update(message);
+                            if results.replace {
+                                w.refresh_search_page(SearchResultPage {
+                                    items: results.results,
+                                    next_cursor: results.next_cursor,
+                                });
+                            } else {
+                                w.patch_search_results(results.results);
                             }
-                            Err(error) => {
-                                w.error = Some(format!("{}: {}", message, error));
-                                w.log.push(format!("{}: {}", message, error));
-                            }
+                        }
+                        Err(error) => {
+                            w.error = Some(format!("{}: {}", message, error));
+                            w.log.push(format!("{}: {}", message, error));
                         }
                     }
                 }
                 WorkerState::FavoriteUpdated(result) => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.running = false;
-                        match result {
-                            Ok(results) => {
-                                if results.replace {
-                                    w.refresh_search_page(SearchResultPage {
-                                        items: results.results,
-                                        next_cursor: results.next_cursor,
-                                    });
-                                } else {
-                                    w.patch_search_results(results.results);
-                                }
+                    let w = &mut self.window;
+                    w.running = false;
+                    match result {
+                        Ok(results) => {
+                            if results.replace {
+                                w.refresh_search_page(SearchResultPage {
+                                    items: results.results,
+                                    next_cursor: results.next_cursor,
+                                });
+                            } else {
+                                w.patch_search_results(results.results);
                             }
-                            Err(error) => {
-                                w.error = Some(error.clone());
-                                w.log.push(format!("Favorite update failed: {}", error));
-                            }
+                        }
+                        Err(error) => {
+                            w.error = Some(error.clone());
+                            w.log.push(format!("Favorite update failed: {}", error));
                         }
                     }
                 }
                 WorkerState::ActorGenderUpdated(result) => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.running = false;
-                        match result {
-                            Ok(results) => {
-                                w.error = None;
-                                w.log.push("Actor gender updated.");
-                                w.patch_search_results(results);
-                            }
-                            Err(error) => {
-                                w.error = Some(error.clone());
-                                w.log.push(format!("Actor gender update failed: {}", error));
-                            }
+                    let w = &mut self.window;
+                    w.running = false;
+                    match result {
+                        Ok(results) => {
+                            w.error = None;
+                            w.log.push("Actor gender updated.");
+                            w.patch_search_results(results);
+                        }
+                        Err(error) => {
+                            w.error = Some(error.clone());
+                            w.log.push(format!("Actor gender update failed: {}", error));
                         }
                     }
                 }
                 WorkerState::PrimaryActorUpdated(result) => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.running = false;
-                        match result {
-                            Ok(results) => {
-                                w.error = None;
-                                w.log.push("Primary actor updated — images moved.");
-                                w.patch_search_results(results);
-                            }
-                            Err(error) => {
-                                w.error = Some(error.clone());
-                                w.log
-                                    .push(format!("Primary actor update failed: {}", error));
-                            }
+                    let w = &mut self.window;
+                    w.running = false;
+                    match result {
+                        Ok(results) => {
+                            w.error = None;
+                            w.log.push("Primary actor updated — images moved.");
+                            w.patch_search_results(results);
+                        }
+                        Err(error) => {
+                            w.error = Some(error.clone());
+                            w.log
+                                .push(format!("Primary actor update failed: {}", error));
                         }
                     }
                 }
                 WorkerState::SqlQueryFinished(result) => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.apply_sql_result(result);
-                    }
+                    let w = &mut self.window;
+                    w.apply_sql_result(result);
                 }
                 WorkerState::SqlExportFinished {
                     output_path,
                     result,
                 } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.apply_sql_export_result(&output_path, result);
-                    }
+                    let w = &mut self.window;
+                    w.apply_sql_export_result(&output_path, result);
                 }
                 WorkerState::DateGroupsLoaded(result) => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.apply_date_groups_loaded(result);
-                    }
+                    let w = &mut self.window;
+                    w.apply_date_groups_loaded(result);
                 }
                 WorkerState::DeleteFinished { image_ids, result } => {
-                    if let AppPhase::Running(w) = &mut self.phase {
-                        w.running = false;
-                        match result {
-                            Ok(()) => {
-                                w.log.push("Images deleted.");
-                                w.remove_search_results(&image_ids);
-                            }
-                            Err(error) => {
-                                w.error = Some(error.clone());
-                                w.log.push(format!("Delete failed: {}", error));
-                            }
+                    let w = &mut self.window;
+                    w.running = false;
+                    match result {
+                        Ok(()) => {
+                            w.log.push("Images deleted.");
+                            w.remove_search_results(&image_ids);
+                        }
+                        Err(error) => {
+                            w.error = Some(error.clone());
+                            w.log.push(format!("Delete failed: {}", error));
                         }
                     }
                 }
@@ -1051,7 +996,8 @@ impl eframe::App for DesktopApp {
         // Only clone the full pending URL list when the queue window is actually
         // visible — with 1000+ URLs in the queue, doing this every frame causes
         // noticeable UI lag on every keystroke.
-        if let AppPhase::Running(ref mut window) = self.phase {
+        {
+            let window = &mut self.window;
             if window.queue_window_open {
                 let range = window.queue_visible_range.clone();
                 window.queue_snapshot = Arc::new(self.queue_service.snapshot_range(range));
@@ -1063,18 +1009,20 @@ impl eframe::App for DesktopApp {
             }
         }
 
-        if let AppPhase::Running(ref mut window) = self.phase {
+        {
+            let window = &mut self.window;
+            window.queue_worker_running = self.worker_running;
             window.render(ctx);
         }
 
-        if let Some(command) = match &mut self.phase {
-            AppPhase::Running(w) => w.take_command(),
-            _ => None,
-        } {
+        if let Some(command) = self.window.take_command() {
             match command {
                 UiCommand::QueueUrl(config) => self.enqueue_manual_url(config),
                 UiCommand::ImportFile { file_path } => self.start_import_url_file(file_path),
                 UiCommand::SetDownloadFolder(folder) => self.set_active_download_folder(folder),
+                UiCommand::ApplyStorageSettings(settings) => {
+                    self.start_storage_settings(settings, AppConfig::config_path().to_path_buf())
+                }
                 UiCommand::SetClipboardListener(enabled) => {
                     self.set_clipboard_listener_enabled(enabled)
                 }
@@ -1239,37 +1187,35 @@ impl eframe::App for DesktopApp {
                 }
                 UiCommand::PauseQueue => {
                     self.queue_service.pause();
-                    if let AppPhase::Running(w) = &mut self.phase {
+                    {
+                        let w = &mut self.window;
                         w.log.push("Queue paused.");
                     }
                 }
                 UiCommand::ResumeQueue => {
                     self.queue_service.resume();
-                    if let AppPhase::Running(w) = &mut self.phase {
+                    {
+                        let w = &mut self.window;
                         w.log.push("Queue resumed.");
                     }
-                    let cfg = match &self.phase {
-                        AppPhase::Running(w) => w.config.clone(),
-                        _ => return,
-                    };
+                    let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
                 }
                 UiCommand::RetryFailedQueue => {
                     let retried = self.queue_service.retry_failed();
                     self.queue_service.resume();
-                    if let AppPhase::Running(w) = &mut self.phase {
+                    {
+                        let w = &mut self.window;
                         w.log
                             .push(format!("Retrying {retried} failed queue item(s)."));
                     }
-                    let cfg = match &self.phase {
-                        AppPhase::Running(w) => w.config.clone(),
-                        _ => return,
-                    };
+                    let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
                 }
                 UiCommand::ClearPendingQueue => {
                     self.queue_service.clear_pending();
-                    if let AppPhase::Running(w) = &mut self.phase {
+                    {
+                        let w = &mut self.window;
                         w.log.push("Pending queue cleared.");
                     }
                 }
@@ -1312,6 +1258,12 @@ impl eframe::App for DesktopApp {
     }
 }
 
+impl eframe::App for DesktopApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
 impl DesktopApp {
     fn start_sql_query(&self, database_path: String, query: String) {
         let state_tx = self.state_tx.clone();
@@ -1345,7 +1297,8 @@ impl DesktopApp {
         ascending: bool,
         max_favorites_exclusive: Option<usize>,
     ) {
-        if let AppPhase::Running(w) = &mut self.phase {
+        {
+            let w = &mut self.window;
             w.date_browse_loading = true;
         }
         let state_tx = self.state_tx.clone();
@@ -1368,6 +1321,7 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    StorageSettingsApplied(Result<AppConfig, String>),
     ImportFinished {
         file_path: String,
         result: Result<UrlQueueReport, String>,
@@ -2087,6 +2041,296 @@ mod sql_query_tests {
         assert!(csv.ends_with("2105,plain\n"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod startup_ui_tests {
+    use super::*;
+
+    fn test_app(configured: bool) -> (DesktopApp, tempfile::TempDir, egui::Context) {
+        let root = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            clipboard_listener_enabled: false,
+            database_path: root.path().join("archive.sqlite3").display().to_string(),
+            download_folder: if configured {
+                root.path().join("downloads").display().to_string()
+            } else {
+                String::new()
+            },
+            preset_tags: "portrait, outdoor".to_string(),
+            ..AppConfig::default()
+        };
+        let context = egui::Context::default();
+        (DesktopApp::new(config, context.clone()), root, context)
+    }
+
+    fn render(
+        app: &mut DesktopApp,
+        context: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.update_ui(ctx),
+        )
+    }
+
+    fn rendered_text(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn visit(shape: &egui::Shape, text: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(shape) => text.push((
+                    shape.galley.job.text.clone(),
+                    egui::Rect::from_min_size(shape.pos, shape.galley.size()),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        visit(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = Vec::new();
+        for shape in &output.shapes {
+            visit(&shape.shape, &mut text);
+        }
+        text
+    }
+
+    fn assert_labels(output: &egui::FullOutput, expected: &[&str]) {
+        let text = rendered_text(output);
+        for expected in expected {
+            assert!(
+                text.iter().any(|(label, _)| label == expected),
+                "Missing {expected:?} in {text:?}"
+            );
+        }
+    }
+
+    fn click_label(
+        app: &mut DesktopApp,
+        context: &egui::Context,
+        output: &egui::FullOutput,
+        label: &str,
+    ) -> egui::FullOutput {
+        let pos = rendered_text(output)
+            .into_iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("Missing click target {label:?}"))
+            .1
+            .center();
+        for pressed in [true, false] {
+            let _ = render(
+                app,
+                context,
+                egui::vec2(1900.0, 1400.0),
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        render(app, context, egui::vec2(1900.0, 1400.0), Vec::new())
+    }
+
+    #[test]
+    fn fresh_start_exposes_workspace_settings_queue_and_activity_log() {
+        let (mut app, _root, context) = test_app(false);
+        app.window.log.push("Download progress is visible here");
+        for size in [egui::vec2(800.0, 600.0), egui::vec2(1900.0, 1400.0)] {
+            let output = render(&mut app, &context, size, Vec::new());
+            assert_labels(
+                &output,
+                &["Scrape", "Search", "SQL", "Extensions", "Source"],
+            );
+            if size.x > 1440.0 {
+                assert_labels(
+                    &output,
+                    &[
+                        "Destination",
+                        "Download folder",
+                        "Queue",
+                        "Activity",
+                        "Download progress is visible here",
+                        "Select a download directory to enable scraping.",
+                    ],
+                );
+                let output = click_label(&mut app, &context, &output, "Add URL to Queue");
+                assert_labels(&output, &["Source", "Activity"]);
+                assert!(!app.worker_running);
+                assert!(!app.queue_service.has_pending_work());
+                assert!(app.window.error.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_switch_to_search_filters_sql_and_extensions_without_destination_setup() {
+        let (mut app, _root, context) = test_app(false);
+        let output = render(&mut app, &context, egui::vec2(1900.0, 1400.0), Vec::new());
+        let output = click_label(&mut app, &context, &output, "Search");
+        assert_labels(
+            &output,
+            &["Text", "Site", "Tags", "Actors", "Categories", "Studios"],
+        );
+        let output = click_label(&mut app, &context, &output, "SQL");
+        assert_labels(&output, &["SQL Console", "Ctrl+Enter"]);
+        let output = click_label(&mut app, &context, &output, "Extensions");
+        assert_labels(&output, &["Extensions", "Scrape", "Search", "SQL"]);
+        let output = click_label(&mut app, &context, &output, "Settings");
+        assert_labels(
+            &output,
+            &[
+                "Storage",
+                "Download folder",
+                "Database file",
+                "Thumbnail folder",
+                "Save and apply",
+                "Settings file",
+            ],
+        );
+        let output = click_label(&mut app, &context, &output, "Scrape");
+        assert_labels(&output, &["Source", "Destination", "Queue", "Activity"]);
+    }
+
+    #[test]
+    fn configured_start_preserves_destination_and_presets() {
+        let (mut app, root, context) = test_app(true);
+        let output = render(&mut app, &context, egui::vec2(1900.0, 1400.0), Vec::new());
+        assert_labels(
+            &output,
+            &["Scrape", "Search", "SQL", "Extensions", "Activity"],
+        );
+        assert_eq!(
+            app.window.config.download_folder,
+            root.path().join("downloads").display().to_string()
+        );
+        assert_eq!(app.live_presets.read().unwrap().tags, "portrait, outdoor");
+        assert!(app.window.error.is_none());
+        assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn missing_destination_blocks_manual_import_clipboard_rescrape_and_restored_queue() {
+        let (mut app, _root, _context) = test_app(false);
+        let config = app.window.config.clone();
+        app.enqueue_manual_url(config.clone());
+        assert!(app.window.error.is_some());
+        app.start_import_url_file("missing.txt".to_string());
+        assert!(!app.window.import_running);
+        app.start_rescrape(
+            config.database_path.clone(),
+            String::new(),
+            String::new(),
+            1,
+        );
+        assert!(!app.window.running);
+
+        app.window.config.clipboard_listener_enabled = true;
+        let (sender, receiver) = mpsc::channel();
+        app.clipboard_rx = Some(receiver);
+        let url = "https://demo.example.test/galleries/test/";
+        sender.send(ClipboardEvent::Text(url.to_string())).unwrap();
+        app.handle_clipboard_events();
+        assert!(!app.queue_service.has_pending_work());
+
+        let report = app
+            .queue_service
+            .enqueue_urls(&Database::new(&config.database_path), vec![url.to_string()])
+            .unwrap();
+        assert_eq!(report.queued_successfully, 1);
+        app.start_processor_if_needed(config);
+        assert!(app.queue_service.has_pending_work());
+        assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn storage_settings_switch_library_in_background_and_discard_old_job_results() {
+        let (mut app, root, context) = test_app(true);
+        let old_sender = app.state_tx.clone();
+        let config_path = root.path().join("app-config.json");
+        let settings = StorageSettings {
+            download_folder: root.path().join("new-files").display().to_string(),
+            database_path: root
+                .path()
+                .join("new-library.sqlite3")
+                .display()
+                .to_string(),
+            thumbnail_folder: Some(root.path().join("new-previews").display().to_string()),
+        };
+        let original_path = app.window.config.database_path.clone();
+        app.window.log.push("Previous activity");
+        app.start_storage_settings(settings.clone(), config_path.clone());
+        assert!(app.window.storage_settings_applying());
+        assert_eq!(app.window.config.database_path, original_path);
+        let result = app
+            .state_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let WorkerState::StorageSettingsApplied(result) = result else {
+            panic!("Unexpected worker result");
+        };
+        app.finish_storage_settings(result);
+        assert!(!app.window.storage_settings_applying());
+        assert_eq!(StorageSettings::from(&app.window.config), settings);
+        assert_eq!(
+            StorageSettings::from(&AppConfig::load_from(&config_path).unwrap()),
+            settings
+        );
+        assert!(old_sender
+            .send(WorkerState::TagSuggestions {
+                query: "old".into(),
+                results: vec!["stale".into()]
+            })
+            .is_err());
+        assert!(app
+            .window
+            .log
+            .snapshot()
+            .iter()
+            .any(|line| line == "Previous activity"));
+        let output = render(&mut app, &context, egui::vec2(1900.0, 1400.0), Vec::new());
+        assert_labels(
+            &output,
+            &["Settings", "Storage settings saved and applied."],
+        );
+    }
+
+    #[test]
+    fn storage_settings_do_not_switch_a_busy_or_failed_library() {
+        let (mut app, root, _context) = test_app(true);
+        let original = StorageSettings::from(&app.window.config);
+        let config_path = root.path().join("config.json");
+        app.worker_running = true;
+        app.start_storage_settings(original.clone(), config_path.clone());
+        assert!(!app.window.storage_settings_applying());
+        assert!(!config_path.exists());
+        app.worker_running = false;
+        let mut invalid = original.clone();
+        invalid.database_path.clear();
+        app.start_storage_settings(invalid, config_path);
+        let WorkerState::StorageSettingsApplied(result) = app
+            .state_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("Unexpected result");
+        };
+        assert!(result.is_err());
+        app.finish_storage_settings(result);
+        assert_eq!(StorageSettings::from(&app.window.config), original);
+        assert!(!app.window.storage_settings_applying());
     }
 }
 

@@ -3,6 +3,82 @@ use manifest::*;
 use sha2::{Digest, Sha256};
 
 #[test]
+fn plugin_directory_override_uses_native_separators_and_has_priority() {
+    let override_path = if cfg!(windows) {
+        r"C:/Plugin Store\installed"
+    } else {
+        "/opt/plugin-store/installed"
+    };
+    let directory = plugin_directory_from_env(|name| {
+        Some(
+            if name == "ARCHIVESIFT_PLUGIN_DIR" {
+                override_path
+            } else {
+                "ignored"
+            }
+            .into(),
+        )
+    });
+    if cfg!(windows) {
+        assert_eq!(directory.to_string_lossy(), r"C:\Plugin Store\installed");
+    } else {
+        assert_eq!(directory.to_string_lossy(), "/opt/plugin-store/installed");
+    }
+}
+
+#[test]
+fn plugin_directory_selects_platform_data_root() {
+    let directory = plugin_directory_from_env(|name| match name {
+        "APPDATA" => Some(r"C:\Users\Example\AppData\Roaming".into()),
+        "XDG_DATA_HOME" => Some("/var/lib/example".into()),
+        "HOME" => Some("/home/example".into()),
+        _ => None,
+    });
+    if cfg!(windows) {
+        assert_eq!(
+            directory.to_string_lossy(),
+            r"C:\Users\Example\AppData\Roaming\ArchiveSift\plugins"
+        );
+    } else {
+        assert_eq!(
+            directory.to_string_lossy(),
+            "/var/lib/example/ArchiveSift/plugins"
+        );
+    }
+}
+
+#[test]
+fn plugin_directory_supports_home_and_local_fallbacks() {
+    let root = if cfg!(windows) {
+        r"C:\Users\Example"
+    } else {
+        "/home/example"
+    };
+    let directory = plugin_directory_from_env(|name| (name == "HOME").then(|| root.into()));
+    assert_eq!(
+        directory,
+        Path::new(root)
+            .join(".local")
+            .join("share")
+            .join("ArchiveSift")
+            .join("plugins")
+    );
+    assert_eq!(
+        plugin_directory_from_env(|_| None),
+        Path::new("plugins-local")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_directory_preserves_legal_backslashes_in_unix_names() {
+    let directory = plugin_directory_from_env(|name| {
+        (name == "ARCHIVESIFT_PLUGIN_DIR").then(|| r"/opt/plugins\archive".into())
+    });
+    assert_eq!(directory.to_string_lossy(), r"/opt/plugins\archive");
+}
+
+#[test]
 fn metadata_links_do_not_grant_network_permissions() {
     assert_eq!(
         resolve_reference_url(

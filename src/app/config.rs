@@ -142,6 +142,8 @@ pub struct AppConfig {
     pub download_folder_history: Vec<String>,
     pub clipboard_listener_enabled: bool,
     pub database_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_folder: Option<String>,
     pub add_plus: bool,
     pub max_concurrent_downloads: usize,
     #[serde(default = "default_max_parallel")]
@@ -201,6 +203,7 @@ impl Default for AppConfig {
             download_folder_history: Vec::new(),
             clipboard_listener_enabled: true,
             database_path: "data/archivesift.sqlite3".to_string(),
+            thumbnail_folder: None,
             add_plus: false,
             max_concurrent_downloads: 5,
             max_parallel_downloads: 3,
@@ -230,7 +233,11 @@ pub fn parse_comma_list(s: &str) -> Vec<String> {
 
 impl AppConfig {
     pub fn load() -> AppResult<Self> {
-        let path = Self::path();
+        Self::load_from(&Self::path())
+    }
+
+    pub fn load_from(path: &Path) -> AppResult<Self> {
+        let path = path.to_path_buf();
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -261,7 +268,11 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> AppResult<()> {
-        let path = Self::path();
+        self.save_to(&Self::path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> AppResult<()> {
+        let path = path.to_path_buf();
         let mut config = self.clone();
         config.normalize_download_history();
         config.normalize_performance_limits();
@@ -284,9 +295,16 @@ impl AppConfig {
         !self.download_folder.trim().is_empty()
     }
 
-    /// Directory next to the database file where pre-scaled thumbnails are stored.
+    /// Custom thumbnail directory, or `thumbs` next to the database by default.
     /// Example: if `database_path` is `data/archivesift.sqlite3` this returns `data/thumbs`.
     pub fn thumb_dir(&self) -> PathBuf {
+        if let Some(folder) = self
+            .thumbnail_folder
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Path::new(folder.trim()).components().collect();
+        }
         Path::new(&self.database_path)
             .parent()
             .unwrap_or_else(|| Path::new("."))

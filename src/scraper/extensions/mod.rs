@@ -341,19 +341,30 @@ impl ContentScraper for ExtensionScraper {
 }
 
 pub fn default_plugin_directory() -> PathBuf {
-    if let Some(directory) = std::env::var_os("ARCHIVESIFT_PLUGIN_DIR") {
-        return directory.into();
-    }
-    if let Some(directory) = std::env::var_os("APPDATA") {
-        return PathBuf::from(directory).join("ArchiveSift/plugins");
-    }
-    if let Some(directory) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(directory).join("ArchiveSift/plugins");
-    }
-    if let Some(directory) = std::env::var_os("HOME") {
-        return PathBuf::from(directory).join(".local/share/ArchiveSift/plugins");
-    }
-    PathBuf::from("plugins-local")
+    plugin_directory_from_env(|name| std::env::var_os(name))
+}
+
+fn plugin_directory_from_env(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    let app_data = if cfg!(windows) { env("APPDATA") } else { None };
+    let directory = env("ARCHIVESIFT_PLUGIN_DIR")
+        .map(PathBuf::from)
+        .or_else(|| app_data.map(|root| PathBuf::from(root).join("ArchiveSift").join("plugins")))
+        .or_else(|| {
+            env("XDG_DATA_HOME").map(|root| PathBuf::from(root).join("ArchiveSift").join("plugins"))
+        })
+        .or_else(|| {
+            env("HOME").map(|root| {
+                PathBuf::from(root)
+                    .join(".local")
+                    .join("share")
+                    .join("ArchiveSift")
+                    .join("plugins")
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from("plugins-local"));
+    // Rebuild components so Windows also normalizes separators in overrides.
+    // On Unix a backslash can be part of a filename and must be preserved.
+    directory.components().collect()
 }
 
 fn read_manifest(directory: &Path) -> AppResult<PluginManifest> {
