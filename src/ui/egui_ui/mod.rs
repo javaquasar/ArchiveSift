@@ -1,6 +1,7 @@
 mod app_window;
 mod background_executor;
 mod coalescing_worker;
+mod icon;
 mod preview_loader;
 mod storage_settings;
 mod texture_cache;
@@ -48,7 +49,7 @@ pub struct EguiBackend;
 
 impl UiBackend for EguiBackend {
     fn run(&self, config: AppConfig) -> AppResult<()> {
-        let options = eframe::NativeOptions::default();
+        let options = icon::native_options();
         eframe::run_native(
             "ArchiveSift",
             options,

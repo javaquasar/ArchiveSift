@@ -263,6 +263,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "windows 0.54.0",
+ "winresource",
 ]
 
 [[package]]
@@ -6352,6 +6353,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a90e88e4667264a994d34e6d1ab2d26d398dcdca8b7f52bec8668957517fc7d8"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]

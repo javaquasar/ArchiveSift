@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ArchiveSift
+Comment=Collect downloadable content into a searchable local archive
+Exec=archive-sift
+Icon=archive-sift
+Terminal=false
+Categories=Utility;Graphics;

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>ArchiveSift</title>
+  <defs>
+    <linearGradient id="tile" x1="24" y1="16" x2="232" y2="256" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#19354b"/>
+      <stop offset="1" stop-color="#0b1729"/>
+    </linearGradient>
+    <linearGradient id="archive" x1="58" y1="102" x2="198" y2="204" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#91e7ef"/>
+      <stop offset="1" stop-color="#42b8d3"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#tile)"/>
+  <path d="M64 94V74a14 14 0 0 1 14-14h40" fill="none" stroke="#43869d" stroke-width="14" stroke-linecap="round"/>
+  <path d="M48 116V98a14 14 0 0 1 14-14h46" fill="none" stroke="#73c8d9" stroke-width="14" stroke-linecap="round"/>
+  <path d="M56 110h144a16 16 0 0 1 16 16v62a24 24 0 0 1-24 24H64a24 24 0 0 1-24-24v-62a16 16 0 0 1 16-16Z" fill="url(#archive)"/>
+  <path d="M40 134h49l15 22h48l15-22h49v-8a16 16 0 0 0-16-16H56a16 16 0 0 0-16 16Z" fill="#e4f8f9"/>
+  <path d="M88 183h80" fill="none" stroke="#17374b" stroke-width="12" stroke-linecap="round"/>
+  <path d="M164 48v67m-27-26 27 28 27-28" fill="none" stroke="#102237" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M164 48v67m-27-26 27 28 27-28" fill="none" stroke="#ffcb72" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

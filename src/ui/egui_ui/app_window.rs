@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use eframe::egui;
 use eframe::egui::TextureHandle;
 
+use super::icon::application_viewport;
 use super::preview_loader::{
     ImageLoadMode, ImageLoadTimings, OriginalLoader, PreviewLoader, PreviewSource,
     ORIGINAL_MAX_RGBA_BYTES, VIEWER_PROXY_MAX_SIDE,
@@ -704,7 +705,7 @@ impl AppWindow {
         let mut close = false;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("scene_description"),
-            egui::ViewportBuilder::default()
+            application_viewport()
                 .with_title(format!("Description — {}", truncate(&popup.title, 70)))
                 .with_inner_size([800.0, 440.0]),
             |vp_ctx, _class| {
@@ -3232,7 +3233,7 @@ impl AppWindow {
 
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("image_viewer"),
-            egui::ViewportBuilder::default()
+            application_viewport()
                 .with_title(&title)
                 .with_inner_size([900.0, 700.0]),
             |vp_ctx, _class| {
@@ -3934,7 +3935,7 @@ impl AppWindow {
         }
         let snapshot = clone_queue_snapshot(&self.queue_snapshot);
         let viewport_id = egui::ViewportId::from_hash_of("queue_window");
-        let viewport_builder = egui::ViewportBuilder::default()
+        let viewport_builder = application_viewport()
             .with_title("Download Queue")
             .with_inner_size([520.0, 420.0]);
 
@@ -4780,6 +4781,51 @@ mod tests {
             UiLog::default(),
             Arc::new(RwLock::new(LivePresets::default())),
         )
+    }
+
+    #[test]
+    fn every_native_child_window_receives_the_application_icon() {
+        let mut window = test_window();
+        window.set_search_results(vec![search_result(1, Vec::new())]);
+        window.viewer_open = Some(0);
+        window.description_popup = Some(DescriptionPopup {
+            title: "Demo".into(),
+            text: "Demo description".into(),
+        });
+        window.queue_window_open = true;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::clone(&captured);
+        egui::Context::set_immediate_viewport_renderer(move |_, mut viewport| {
+            requests
+                .lock()
+                .unwrap()
+                .push((viewport.ids.this, viewport.builder.clone()));
+            let child_context = egui::Context::default();
+            let mut input = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                ..Default::default()
+            };
+            input
+                .viewports
+                .insert(viewport.ids.this, egui::ViewportInfo::default());
+            let _ = child_context.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+        });
+        let context = egui::Context::default();
+        context.set_embed_viewports(false);
+        let _ = context.run(egui::RawInput::default(), |ctx| window.render(ctx));
+        let root_icon = super::super::icon::native_options().viewport.icon.unwrap();
+        let requests = captured.lock().unwrap();
+        for name in ["image_viewer", "scene_description", "queue_window"] {
+            let (_, builder) = requests
+                .iter()
+                .find(|(id, _)| *id == egui::ViewportId::from_hash_of(name))
+                .unwrap_or_else(|| panic!("Missing viewport {name}"));
+            assert!(
+                Arc::ptr_eq(builder.icon.as_ref().unwrap(), &root_icon),
+                "Wrong icon for {name}"
+            );
+            assert_eq!(builder.app_id.as_deref(), Some("archive-sift"));
+        }
     }
 
     #[test]

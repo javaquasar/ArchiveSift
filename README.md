@@ -17,6 +17,7 @@ without rebuilding the application. See [extension architecture and UML](docs/EX
 - Import and export tools, plus a read-only SQL workspace
 - Static demo target for development and tests
 - Dynamic WASM and process extensions with a shared SDK and an Extensions status tab
+- Embedded application icon shared by the main window, image viewer and auxiliary windows
 
 ## Demo download fixture
 
@@ -50,6 +51,10 @@ Install the stable Rust toolchain, then run:
 cargo build --release
 .\target\release\archive-sift.exe
 ```
+
+The application icon is embedded in the executable and native windows. Editable
+artwork, export instructions and the Linux desktop entry are in
+[assets/icons](assets/icons/README.md).
 
 The full desktop workspace opens on the first launch: **Scrape** contains source
 and destination settings, the URL queue and activity log; **Search** provides
