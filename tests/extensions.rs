@@ -21,6 +21,45 @@ const PAGE: &str = include_str!("../demo-site/galleries/random-showcase-004/inde
 const PNG: &[u8] = include_bytes!("../demo-site/media/random-showcase-004/random-001.png");
 type Response = (u16, Vec<(String, String)>, Vec<u8>);
 
+#[tokio::test]
+async fn extension_binary_attachments_obey_permissions_redirects_and_response_bounds() {
+    let server = Server::new(|request| {
+        let path = request.split_whitespace().nth(1).unwrap();
+        match path {
+            "/redirect" => (302, vec![("Location".into(), "/file".into())], vec![]),
+            "/escape" => (
+                302,
+                vec![("Location".into(), "https://ungranted.invalid/file".into())],
+                vec![],
+            ),
+            "/large" => (200, vec![], vec![0; 8 * 1024 * 1024 + 1]),
+            _ => (
+                200,
+                vec![("Content-Type".into(), "application/octet-stream".into())],
+                vec![0, 255, 128, 42],
+            ),
+        }
+    });
+    let (package, _) = make_package(RuntimeKind::Wasm, &server.origin, Limits::default());
+    let scraper = ExtensionScraper::load(package.path()).unwrap();
+    let file = scraper
+        .fetch_attachment(&format!("{}/redirect", server.origin))
+        .await
+        .unwrap();
+    assert_eq!(file.bytes, [0, 255, 128, 42]);
+    assert_eq!(file.content_type, "application/octet-stream");
+    for path in ["/escape", "/large"] {
+        assert!(scraper
+            .fetch_attachment(&format!("{}{path}", server.origin))
+            .await
+            .is_err());
+    }
+    assert!(scraper
+        .fetch_attachment("https://ungranted.invalid/file")
+        .await
+        .is_err());
+}
+
 /// Nonblocking server with bounded reads; a failed test cannot hang accept().
 struct Server {
     origin: String,

@@ -565,10 +565,19 @@ fn normalize_supported_url(registry: &ScraperRegistry, raw_input: &str) -> Optio
     let mut parsed = parsed;
     parsed.set_fragment(None);
 
-    let mut normalized = parsed.to_string();
-    if !normalized.ends_with('/') && !parsed.path().ends_with('/') {
-        normalized.push('/');
+    // Query strings and file endpoints must retain their exact request target.
+    if parsed.query().is_none()
+        && !parsed.path().ends_with('/')
+        && !parsed
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .contains('.')
+    {
+        parsed.set_path(&format!("{}/", parsed.path()));
     }
+    let normalized = parsed.to_string();
 
     if registry.supports_url(&normalized) {
         Some(normalized)
@@ -1331,5 +1340,17 @@ mod tests {
             normalize_supported_url(&registry, "https://example.com/not-supported"),
             None
         );
+    }
+
+    #[test]
+    fn normalize_supported_url_preserves_query_values_and_file_endpoints() {
+        let registry = ScraperRegistry::with_public_scrapers();
+        for suffix in ["?t=42", "/view.php?t=42&start=50", "/index.html"] {
+            let url = format!("https://demo.example.test/demo-site/galleries/example{suffix}");
+            assert_eq!(
+                normalize_supported_url(&registry, &format!("{url}#post")),
+                Some(url)
+            );
+        }
     }
 }

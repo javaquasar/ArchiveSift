@@ -20,11 +20,22 @@ impl StorageSettingsEditor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn render(
         &mut self,
         ui: &mut egui::Ui,
         config: &AppConfig,
         busy: bool,
+    ) -> Option<StorageSettings> {
+        self.render_with_accounts(ui, config, busy, |_| {})
+    }
+
+    pub(super) fn render_with_accounts(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &AppConfig,
+        busy: bool,
+        mut accounts: impl FnMut(&mut egui::Ui),
     ) -> Option<StorageSettings> {
         let mut apply = None;
         ui.heading("Settings");
@@ -32,6 +43,7 @@ impl StorageSettingsEditor {
             .id_salt("storage_settings")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                accounts(ui);
                 ui.heading("Storage");
                 ui.label("Select the folders and database used by your library.");
                 ui.label("Changing paths does not move existing files. When opening another library, select its database and download folder together.");

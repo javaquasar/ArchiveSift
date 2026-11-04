@@ -20,6 +20,12 @@ pub struct ScrapedImage {
     pub local_file_path: Option<String>,
 }
 
+/// A bounded binary response fetched by the host, never passed through guest text DTOs.
+pub struct AttachmentData {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScrapedItem {
     pub site_key: String,

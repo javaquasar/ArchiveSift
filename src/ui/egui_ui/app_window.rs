@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use eframe::egui;
 use eframe::egui::TextureHandle;
 
+use super::account_settings::AccountSettingsEditor;
 use super::icon::application_viewport;
 use super::preview_loader::{
     ImageLoadMode, ImageLoadTimings, OriginalLoader, PreviewLoader, PreviewSource,
@@ -148,6 +149,7 @@ pub struct AppWindow {
 
     active_tab: Tab,
     storage_settings: StorageSettingsEditor,
+    account_settings: Option<AccountSettingsEditor>,
     search_form: SearchForm,
     /// Immutable snapshot shared with the render closures. Replacing the
     /// snapshot after a search is cheap, and rendering does not deep-clone
@@ -283,6 +285,7 @@ impl AppWindow {
             search_seq: 0,
             active_tab: Tab::Scrape,
             storage_settings,
+            account_settings: None,
             search_form: SearchForm::default(),
             search_results: Arc::new(Vec::new()),
             search_next_cursor: None,
@@ -622,9 +625,20 @@ impl AppWindow {
                     Tab::Extensions => self.render_extensions_tab(ui),
                     Tab::Settings => {
                         let busy = self.storage_settings_busy();
-                        if let Some(settings) = self.storage_settings.render(ui, &self.config, busy)
-                        {
+                        let editor = self
+                            .account_settings
+                            .get_or_insert_with(|| AccountSettingsEditor::installed(&self.config));
+                        let mut account_command = None;
+                        if let Some(settings) = self.storage_settings.render_with_accounts(
+                            ui,
+                            &self.config,
+                            busy,
+                            |ui| account_command = editor.render(ui, false),
+                        ) {
                             self.pending_command = Some(UiCommand::ApplyStorageSettings(settings));
+                        }
+                        if let Some(command) = account_command {
+                            self.pending_command = Some(UiCommand::Account(command));
                         }
                     }
                 }
@@ -649,10 +663,38 @@ impl AppWindow {
             || self.sql_export_running
             || self.date_browse_loading
             || self.storage_settings.applying
+            || self
+                .account_settings
+                .as_ref()
+                .is_some_and(|editor| editor.busy())
     }
 
     pub(super) fn storage_settings_applying(&self) -> bool {
         self.storage_settings.applying
+    }
+
+    pub(super) fn account_finished(
+        &mut self,
+        id: String,
+        result: Result<
+            crate::scraper::extensions::accounts::AccountOutcome,
+            crate::scraper::extensions::accounts::AccountError,
+        >,
+    ) {
+        let result = super::account_settings::apply_account_result(
+            &mut self.config,
+            &id,
+            result,
+            AppConfig::config_path(),
+        );
+        self.log.push(if result.is_ok() {
+            "Extension account updated."
+        } else {
+            "Extension account operation failed. See Settings for details."
+        });
+        if let Some(editor) = &mut self.account_settings {
+            editor.finish(&id, result);
+        }
     }
 
     pub(super) fn begin_storage_settings(&mut self) {
@@ -716,14 +758,29 @@ impl AppWindow {
                 }
                 egui::CentralPanel::default().show(vp_ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.heading(&popup.title);
+                        if ui.button("Copy title").clicked() {
+                            ui.ctx().copy_text(popup.title.clone());
+                        }
+                        if ui.button("Copy text").clicked() {
+                            ui.ctx().copy_text(popup.text.clone());
+                        }
                         if ui.button("Close").clicked() {
                             close = true;
                         }
                     });
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.add(egui::Label::new(popup.text.as_str()).wrap());
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&popup.title).heading())
+                                .wrap()
+                                .selectable(true),
+                        );
+                        ui.separator();
+                        ui.add(
+                            egui::Label::new(popup.text.as_str())
+                                .wrap()
+                                .selectable(true),
+                        );
                     });
                 });
             },
@@ -2519,7 +2576,7 @@ impl AppWindow {
                             {
                                 metadata_to_request.insert(result.image_id);
                             }
-                            ui.heading(truncate(result.page_title(), 60));
+                            ui.add(egui::Label::new(egui::RichText::new(result.page_title()).heading()).wrap().selectable(true));
                             ui.label(format!("Page: {}", result.page_url()));
                             ui.hyperlink_to("Open scene/page", result.page_url());
                             ui.label(format!("Image: {}", result.source_url));
@@ -2549,13 +2606,15 @@ impl AppWindow {
                                     }
                                 });
                             }
-                            if let Some(description) = result.attributes.iter().find(|attribute| attribute.kind == "description") {
-                                if ui.button("Description").on_hover_text("Open the full description in a wide window").clicked() {
+                            for (kind, label) in [("description", "Description"), ("full_description", "Full description")] {
+                              if let Some(description) = result.attributes.iter().find(|attribute| attribute.kind == kind) {
+                                if ui.button(label).on_hover_text("Open the complete text in a wide window").clicked() {
                                     self.description_popup = Some(DescriptionPopup {
                                         title: result.page_title().to_string(),
                                         text: description.value.clone(),
                                     });
                                 }
+                              }
                             }
 
                             if let Some(path) = &result.local_file_path {
@@ -2615,11 +2674,23 @@ impl AppWindow {
                             let has_local_file = result.local_file_path.is_some();
 
                             for attribute in result.attributes.iter() {
-                                if matches!(attribute.kind.as_str(), "date" | "description" | "studio_code" | "duration" | "director") {
+                                if matches!(attribute.kind.as_str(), "date" | "description" | "full_description" | "studio_code" | "duration" | "director") {
                                     continue;
                                 }
                                 if attribute.kind == "resource" {
                                     ui.hyperlink_to(format!("Resource: {}", attribute.value), &attribute.value);
+                                    continue;
+                                }
+                                if attribute.kind == "attachment" {
+                                    if let Some(url) = &attribute.source_url {
+                                        ui.hyperlink_to(format!("Attachment: {}", attribute.label), url);
+                                    }
+                                    continue;
+                                }
+                                if attribute.kind == "magnet" {
+                                    if ui.button("Copy magnet link").clicked() {
+                                        ui.ctx().copy_text(attribute.value.clone());
+                                    }
                                     continue;
                                 }
                                 if attribute.kind == "actor" {
@@ -3192,7 +3263,7 @@ impl AppWindow {
         let has_description = result
             .attributes
             .iter()
-            .any(|attribute| attribute.kind == "description");
+            .any(|attribute| matches!(attribute.kind.as_str(), "description" | "full_description"));
         let db_path = self.config.database_path.clone();
         let viewer_refresh = self.search_refresh();
         let is_running = self.running;
@@ -3480,7 +3551,7 @@ impl AppWindow {
                             toggle_fav = true;
                         }
                         if ui.add_enabled(has_description, egui::Button::new("📄"))
-                            .on_hover_text("Open scene description")
+                            .on_hover_text("Open full description")
                             .clicked()
                         {
                             open_description = true;
@@ -3697,7 +3768,13 @@ impl AppWindow {
             if let Some(description) = result
                 .attributes
                 .iter()
-                .find(|attribute| attribute.kind == "description")
+                .find(|attribute| attribute.kind == "full_description")
+                .or_else(|| {
+                    result
+                        .attributes
+                        .iter()
+                        .find(|attribute| attribute.kind == "description")
+                })
             {
                 self.description_popup = Some(DescriptionPopup {
                     title: result.page_title().to_string(),
@@ -4701,6 +4778,7 @@ fn kind_display_label(kind: &str) -> &str {
         "tag" => "Tags",
         "date" => "Date",
         "resource" => "Resource",
+        "content_title" => "Title",
         other => other,
     }
 }
@@ -4781,6 +4859,54 @@ mod tests {
             UiLog::default(),
             Arc::new(RwLock::new(LivePresets::default())),
         )
+    }
+
+    #[test]
+    fn description_viewport_renders_complete_heading_and_text_with_copy_actions() {
+        let mut window = test_window();
+        let title = "[Example Network] A complete page heading with all its original metadata [2025, Documentary, 1080p]".to_string();
+        let text = format!(
+            "First paragraph.\n\n{}Final paragraph marker.",
+            "A complete sentence, without truncation. ".repeat(60)
+        );
+        window.description_popup = Some(DescriptionPopup {
+            title: title.clone(),
+            text: text.clone(),
+        });
+        let context = egui::Context::default();
+        context.set_embed_viewports(true);
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| window.render_description_popup(ctx),
+        );
+        fn collect(shape: &egui::Shape, text: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(shape) => text.push(shape.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut drawn = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut drawn);
+        }
+        for expected in [title.as_str(), text.as_str(), "Copy title", "Copy text"] {
+            assert!(
+                drawn.iter().any(|actual| actual == expected),
+                "missing complete text or copy action"
+            );
+        }
+        assert_eq!(window.description_popup.as_ref().unwrap().text, text);
     }
 
     #[test]

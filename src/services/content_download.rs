@@ -131,10 +131,6 @@ impl
         let mut page = scraper.scrape_content(source_url).await?;
         self.log_content_discovery(&page);
 
-        if page.images.is_empty() {
-            return Ok(vec![]);
-        }
-
         let persisted = self.database.upsert_scraped_item(&page)?;
         // The diagnostic HTML has been archived transactionally. Release the
         // potentially large allocation before image downloads start.
@@ -154,6 +150,15 @@ impl
             requests,
             config.effective_concurrent_image_downloads(),
             scraper.asset_origins(),
+        )
+        .await?;
+
+        super::attachments::download(
+            &page,
+            persisted.page_id,
+            scraper,
+            &self.database,
+            &self.base_dir,
         )
         .await?;
 
@@ -255,6 +260,13 @@ impl
         let absolute_str = absolute.to_string_lossy();
 
         if self.file_store.exists(&absolute_str) {
+            use tokio::io::AsyncReadExt;
+            let mut file = tokio::fs::File::open(&absolute).await?;
+            let mut header = [0; 32];
+            let size = file.read(&mut header).await?;
+            if image::guess_format(&header[..size]).is_err() {
+                return Err("existing image file has an invalid image header".into());
+            }
             self.ui.print_output_file(&absolute_str);
             self.ui.print_skipped_existing(&absolute_str);
             return Ok(self.prepare_local_artifact(&request, &absolute).await);
@@ -265,6 +277,22 @@ impl
             None => fetch_response(&request.image_url).await?,
         };
         let (response, request_permit) = limited_response.into_parts();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(
+            content_type.as_str(),
+            "text/html" | "application/xhtml+xml" | "application/json"
+        ) {
+            return Err("image download returned a document instead of an image".into());
+        }
         if request.relative_path.extension().is_none() {
             let extension = image_extension_from_content_type(
                 response
@@ -277,9 +305,26 @@ impl
         }
         let absolute_str = absolute.to_string_lossy();
         self.ui.print_output_file(&absolute_str);
+        // Sniff only a small prefix; replay received chunks without copying the
+        // full response, preserving streaming and atomic file finalization.
+        let mut stream = response.bytes_stream();
+        let mut chunks = Vec::new();
+        let mut header = Vec::with_capacity(32);
+        while header.len() < 32 {
+            let Some(chunk) = stream.next().await else {
+                break;
+            };
+            let chunk = chunk?;
+            header.extend(chunk.iter().take(32 - header.len()));
+            chunks.push(chunk);
+        }
+        if image::guess_format(&header).is_err() {
+            return Err("image response has an invalid image header".into());
+        }
+        let stream = stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>)).chain(stream);
         let write_result = self
             .file_store
-            .write_stream_atomic(&absolute_str, response.bytes_stream())
+            .write_stream_atomic(&absolute_str, stream)
             .await;
         drop(request_permit);
         write_result?;
@@ -512,6 +557,71 @@ mod tests {
             requests[0].image_url,
             "https://cdn.example.test/media/known.jpg"
         );
+    }
+
+    #[tokio::test]
+    async fn document_empty_and_mislabelled_responses_never_create_image_files() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (content_type, body) in [
+            ("text/html", b"<html>not an image</html>".as_slice()),
+            ("image/jpeg", b"<html>not an image</html>".as_slice()),
+            ("application/octet-stream", b"".as_slice()),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+            let service = ContentDownloadService::new(
+                ScraperRegistry::new(),
+                Database::new(root.path().join("archive.sqlite3")),
+                FileDownloadStore::new(),
+                ConsoleUi::new(),
+                StructuredDirectoryStrategy,
+                root.path().join("downloads"),
+                root.path().join("thumbs"),
+            );
+            let request = DownloadRequest {
+                image_url: format!("http://{address}/image.jpg"),
+                image_id: 1,
+                page_id: 1,
+                relative_path: "scene/image.jpg".into(),
+            };
+            assert!(service.download_one(request, None).await.is_err());
+            assert!(!root.path().join("downloads/scene/image.jpg").exists());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_document_is_rejected_without_overwriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("image.jpg");
+        let data = b"<html>an old error page</html>";
+        std::fs::write(&path, data).unwrap();
+        let service = ContentDownloadService::new(
+            ScraperRegistry::new(),
+            Database::new(root.path().join("archive.sqlite3")),
+            FileDownloadStore::new(),
+            ConsoleUi::new(),
+            StructuredDirectoryStrategy,
+            root.path().to_path_buf(),
+            root.path().join("thumbs"),
+        );
+        let request = DownloadRequest {
+            image_url: "https://unrequested.invalid/image.jpg".into(),
+            image_id: 1,
+            page_id: 1,
+            relative_path: "image.jpg".into(),
+        };
+        assert!(service.download_one(request, None).await.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), data);
     }
 
     #[tokio::test]

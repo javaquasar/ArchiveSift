@@ -11,7 +11,7 @@ use super::DirectoryStrategy;
 /// - Top level: one directory per site
 /// - Second level: one directory per actress (first female actor), falling back
 ///   to first actor of any gender, then `unknown_actor`
-/// - Third level: one directory per content item (derived from page title)
+/// - Third level: one directory per item (content title, falling back to page title)
 /// - Files: zero-padded sort-order prefix + sanitized original name
 pub struct StructuredDirectoryStrategy;
 
@@ -24,7 +24,15 @@ impl DirectoryStrategy for StructuredDirectoryStrategy {
     ) -> PathBuf {
         let site = sanitize_component(&page.site_key);
         let actor = pick_folder_actor(&page.attributes);
-        let slug = make_content_slug(&page.title);
+        let title = page
+            .attributes
+            .iter()
+            .find(|attribute| {
+                attribute.kind == "content_title" && !attribute.value.trim().is_empty()
+            })
+            .map(|attribute| attribute.value.as_str())
+            .unwrap_or(&page.title);
+        let slug = make_content_slug(title);
         let slug = if slug.is_empty() {
             page.page_url
                 .split('/')
@@ -143,6 +151,47 @@ mod tests {
     use super::*;
 
     // ── slug helpers ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn full_page_headings_preserve_the_original_content_folder_name() {
+        let mut page = ScrapedItem {
+            site_key: "example".into(),
+            page_url: "https://example.test/item/42".into(),
+            title: "Short Content Title".into(),
+            raw_html: String::new(),
+            images: Vec::new(),
+            attributes: Vec::new(),
+        };
+        let image = ScrapedImage {
+            source_url: "https://example.test/image.png".into(),
+            preview_url: None,
+            alt_text: None,
+            width: None,
+            height: None,
+            sort_order: 0,
+            local_file_path: None,
+        };
+        let original = StructuredDirectoryStrategy.relative_path(&page, &image, "image.png");
+        page.title =
+            "[Network / Studio] Actor — Short Content Title [2025, Documentary, 1080p]".into();
+        page.attributes.push(MetadataAttribute {
+            kind: "content_title".into(),
+            label: "Title".into(),
+            value: "Short Content Title".into(),
+            source_url: None,
+            is_female: None,
+        });
+        assert_eq!(
+            StructuredDirectoryStrategy.relative_path(&page, &image, "image.png"),
+            original
+        );
+        assert!(page.title.ends_with("[2025, Documentary, 1080p]"));
+        page.attributes[0].value = " ".into();
+        assert_ne!(
+            StructuredDirectoryStrategy.relative_path(&page, &image, "image.png"),
+            original
+        );
+    }
 
     #[test]
     fn slug_short_title() {

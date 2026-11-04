@@ -193,6 +193,38 @@ Listing operations do not retain this unused copy. Images and metadata are
 converted to existing application models; SQLite and directory layout are shared
 with the built-in pipeline.
 
+## Content attachments without changing API 1.0
+
+An attribute with `kind: "attachment"` declares a binary file. `label` is its
+suggested filename; `value` is its stable download URL; `source_url` is the same
+HTTP(S) URL. The host validates that URL against the package's network origins,
+fetches it with its HTTP broker and exact credential bindings, and writes it
+atomically under `<source>/attachments/<page-id>/`. Filenames are sanitized and
+prefixed with a URL digest. At most 32 attachments/references and 8 MiB per binary
+are accepted. Binary bytes never pass through the text-only guest interface.
+Cookies are recomputed for each permitted same-origin redirect.
+
+`kind: "magnet"` stores a passive magnet URI in `value` and leaves `source_url`
+unset. The host validates it, saves a `.magnet.txt` sidecar and offers a copy
+button. It does not start a torrent client. For `.torrent` attachments, the host
+checks bencoding and derives a v1, v2 or hybrid magnet reference from the original
+info bytes, retaining tracker URLs. These local files can contain account-specific
+tracker parameters and belong in the user's library, outside source control.
+HTML login responses fail the download and never become torrent files. Completed
+files and references are recorded in `page_attachments` with relative paths;
+already saved binary files are reused on a retry. Attachment-only pages are also
+persisted, even if they contain no images.
+
+These attribute conventions preserve the WIT/JSON wire contract. Older hosts
+retain the metadata but do not download attachments. Parsers requiring file
+downloads must be installed with a host that implements this convention.
+
+HTTP text responses honor an explicit `charset` in Content-Type, including
+Windows-1251. Response byte limits are checked before text decoding.
+Image downloads reject document MIME types and inspect a small raster signature
+before atomic file creation. Initial chunks are replayed without copying the full
+body. Existing files with non-image signatures are reported rather than reused.
+
 ## Process protocol
 
 The host executes the package entry directly without a shell or manifest command
@@ -482,3 +514,18 @@ does remove the intermediate JSON allocations regardless of timing noise.
 - [Wasmtime Component Model binding generator](https://docs.wasmtime.dev/api/wasmtime/component/macro.bindgen.html)
 - [WIT specification](https://github.com/WebAssembly/component-model/blob/main/design/mvp/WIT.md)
 - [JSON-RPC 2.0 specification](https://www.jsonrpc.org/specification)
+## Complete page text
+
+`Content.title` is the complete visible page heading. An optional `content_title`
+attribute retains a shorter film, clip or item title; the structured directory
+strategy prefers it for folder names. An optional `full_description` attribute
+contains the complete readable post/article, while `description` can hold its
+synopsis. Both text values are saved verbatim in SQLite and available in wide,
+scrollable description windows with copy actions. Header shortening in image
+grids and native window bars is presentation only; storage retains full values.
+
+## Extension account settings
+
+Installed packages may provide an additive `account.json` for host-managed form
+sign-in through Settings. See [Extension accounts](EXTENSION_ACCOUNTS.md) for the
+profile contract, sequence diagram, secure storage and verification behavior.

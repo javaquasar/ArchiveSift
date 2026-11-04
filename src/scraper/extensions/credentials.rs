@@ -36,6 +36,28 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl Credentials {
+    pub fn include_account(&mut self, account: &super::accounts::AccountProvider) -> AppResult<()> {
+        for path in &account.form.session_paths {
+            if let Some(binding) = self.0.iter().find(|binding| {
+                binding.origin == account.origin()
+                    && binding.path == *path
+                    && binding.header.eq_ignore_ascii_case("Cookie")
+            }) {
+                if binding.target != account.session_target() {
+                    return Err("account session conflicts with a local credential binding".into());
+                }
+                continue;
+            }
+            self.0.push(Binding {
+                plugin_id: account.id.clone(),
+                origin: account.origin(),
+                path: path.clone(),
+                header: "Cookie".into(),
+                target: account.session_target(),
+            });
+        }
+        Ok(())
+    }
     pub fn load(manifest: &PluginManifest) -> AppResult<Self> {
         match config_path() {
             Some(path) => Self::from_file(manifest, &path),
@@ -135,45 +157,68 @@ impl Credentials {
     }
 }
 
-#[cfg(windows)]
 fn read_secret(target: &str) -> AppResult<Vec<u8>> {
-    use windows::core::PCWSTR;
-    use windows::Win32::Security::Credentials::{
-        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
-    };
-    let target = target.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
-    // CredReadW owns the returned allocation until CredFree. Copy only its blob.
-    unsafe {
-        CredReadW(
-            PCWSTR(target.as_ptr()),
-            CRED_TYPE_GENERIC,
-            0,
-            &mut credential,
-        )
-        .map_err(|_| "required extension credential is missing from Windows Credential Manager")?;
-        let entry = &*credential;
-        let result = if entry.CredentialBlobSize == 0 || entry.CredentialBlobSize > 8192 {
-            Err("stored extension credential has an invalid size".into())
-        } else {
-            Ok(
-                std::slice::from_raw_parts(entry.CredentialBlob, entry.CredentialBlobSize as usize)
-                    .to_vec(),
-            )
-        };
-        CredFree(credential.cast());
-        result
-    }
-}
-
-#[cfg(not(windows))]
-fn read_secret(_: &str) -> AppResult<Vec<u8>> {
-    Err("this credential provider requires Windows Credential Manager".into())
+    use crate::secure_store::{SecretStore, SystemSecretStore};
+    let secret = SystemSecretStore
+        .get(target)?
+        .ok_or("required extension credential is missing from the system password store")?;
+    Ok(secret.bytes().to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_sessions_are_bound_to_declared_exact_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = crate::scraper::extensions::tests::manifest();
+        manifest.network_origins = vec!["https://example.test".into()];
+        std::fs::write(
+            directory.path().join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let profile = serde_json::json!({"schema":1,"login_url":"https://example.test/login","check_url":"https://example.test/home","form_selector":"form","username_field":"username","password_field":"password","session_cookie":"session","session_paths":["/download"],"success_selector":"#logout"});
+        std::fs::write(
+            directory.path().join("account.json"),
+            serde_json::to_vec(&profile).unwrap(),
+        )
+        .unwrap();
+        let account = super::super::accounts::AccountProvider::from_directory(directory.path())
+            .unwrap()
+            .unwrap();
+        let mut credentials = Credentials::default();
+        credentials.include_account(&account).unwrap();
+        credentials.include_account(&account).unwrap();
+        assert_eq!(credentials.0.len(), 1);
+        let headers = credentials
+            .headers_with(
+                &Url::parse("https://example.test/download?id=42").unwrap(),
+                |target| {
+                    assert_eq!(target, account.session_target());
+                    Ok(b"session=fixture-session".to_vec())
+                },
+            )
+            .unwrap();
+        assert_eq!(headers.get("Cookie").unwrap(), "session=fixture-session");
+        assert!(headers.get("Cookie").unwrap().is_sensitive());
+        for url in [
+            "https://example.test/download/other",
+            "https://example.test/login",
+            "https://cdn.example.test/download",
+            "http://example.test/download",
+        ] {
+            assert!(credentials
+                .headers_with(&Url::parse(url).unwrap(), |_| panic!(
+                    "out-of-scope request read a secret"
+                ))
+                .unwrap()
+                .is_empty());
+        }
+        credentials.0[0].target = format!("ArchiveSift/{}/other", account.id);
+        assert!(credentials.include_account(&account).is_err());
+    }
 
     fn configuration() -> serde_json::Value {
         serde_json::json!({"bindings":[{"plugin_id":"example.parser","origin":"https://example.test","path":"/api","header":"ApiKey","target":"ArchiveSift/example.parser/api"}]})

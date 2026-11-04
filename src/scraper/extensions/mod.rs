@@ -1,4 +1,5 @@
 //! Manifest discovery, permission enforcement, and adapters for both runtimes.
+pub mod accounts;
 mod broker;
 mod compilation_cache;
 mod credentials;
@@ -79,7 +80,8 @@ impl ExtensionScraper {
                 })
             }
         };
-        let broker = HttpBroker::new(&manifest)?;
+        let account = accounts::AccountProvider::for_manifest(directory, &manifest)?;
+        let broker = HttpBroker::with_account(&manifest, account.as_ref())?;
         Ok(Self {
             manifest,
             backend,
@@ -219,6 +221,18 @@ impl ExtensionScraper {
                 {
                     return Err("extension returned invalid metadata".into());
                 }
+                if attribute.kind == "attachment" {
+                    let target = attribute
+                        .source_url
+                        .as_deref()
+                        .ok_or("attachment has no download URL")?;
+                    self.resolve_url(url, target)?;
+                }
+                if attribute.kind == "magnet"
+                    && !crate::services::attachments::valid_magnet(&attribute.value)
+                {
+                    return Err("extension returned an invalid magnet reference".into());
+                }
                 Ok(MetadataAttribute {
                     kind: attribute.kind,
                     label: attribute.label,
@@ -314,6 +328,13 @@ impl ContentScraper for ExtensionScraper {
     }
     fn asset_origins(&self) -> Option<&[String]> {
         Some(&self.manifest.network_origins)
+    }
+
+    fn fetch_attachment<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AppResult<crate::models::AttachmentData>> + Send + 'a>> {
+        Box::pin(async move { self.broker.attachment(url).await })
     }
 
     fn scrape_content<'a>(

@@ -13,7 +13,19 @@ pub struct HttpBroker {
 }
 
 impl HttpBroker {
+    #[cfg(test)]
     pub fn new(manifest: &PluginManifest) -> AppResult<Self> {
+        Self::with_account(manifest, None)
+    }
+
+    pub fn with_account(
+        manifest: &PluginManifest,
+        account: Option<&super::accounts::AccountProvider>,
+    ) -> AppResult<Self> {
+        let mut credentials = Credentials::load(manifest)?;
+        if let Some(account) = account {
+            credentials.include_account(account)?;
+        }
         Ok(Self {
             client: Client::builder()
                 .user_agent(concat!("ArchiveSift/", env!("CARGO_PKG_VERSION")))
@@ -21,11 +33,14 @@ impl HttpBroker {
                 .timeout(std::time::Duration::from_millis(manifest.limits.timeout_ms))
                 .build()?,
             manifest: manifest.clone(),
-            credentials: Credentials::load(manifest)?,
+            credentials,
         })
     }
 
-    pub async fn fetch(&self, request: &FetchRequest) -> AppResult<HttpResponse> {
+    async fn response(
+        &self,
+        request: &FetchRequest,
+    ) -> AppResult<crate::http::LimitedHttpResponse> {
         let mut url = self.manifest.allowed_url(&request.url)?;
         if request
             .body
@@ -52,7 +67,7 @@ impl HttpBroker {
             }
             headers.insert(name, header::HeaderValue::from_str(&entry.value)?);
         }
-        let _permit = crate::http::shared_request_limiter().acquire().await;
+        let permit = crate::http::shared_request_limiter().acquire().await;
         let mut method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
@@ -95,35 +110,46 @@ impl HttpBroker {
                 url = target;
                 continue;
             }
-            if response
-                .content_length()
-                .is_some_and(|length| length > self.manifest.limits.max_response_bytes as u64)
-            {
-                return Err("extension HTTP response exceeds its limit".into());
-            }
-            let status = response.status().as_u16();
-            let content_type = response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let mut bytes = Vec::new();
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                if bytes.len().saturating_add(chunk.len()) > self.manifest.limits.max_response_bytes
-                {
-                    return Err("extension HTTP response exceeds its limit".into());
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            return Ok(HttpResponse {
-                url: url.into(),
-                status,
-                content_type,
-                body: crate::http::decode_body(bytes),
-            });
+            return Ok(crate::http::LimitedHttpResponse::new(response, permit));
         }
         Err("extension exceeded HTTP redirect limit".into())
+    }
+
+    pub async fn fetch(&self, request: &FetchRequest) -> AppResult<HttpResponse> {
+        let limited = self.response(request).await?;
+        let (response, _permit) = limited.into_parts();
+        let url = response.url().to_string();
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.manifest.limits.max_response_bytes as u64)
+        {
+            return Err("extension HTTP response exceeds its limit".into());
+        }
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len().saturating_add(chunk.len()) > self.manifest.limits.max_response_bytes {
+                return Err("extension HTTP response exceeds its limit".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        return Ok(HttpResponse {
+            url,
+            status,
+            body: crate::http::decode_text_body(bytes, content_type.as_deref()),
+            content_type,
+        });
+    }
+
+    pub async fn attachment(&self, url: &str) -> AppResult<crate::models::AttachmentData> {
+        let limited = self.response(&FetchRequest::get(url)).await?;
+        crate::http::read_attachment(limited).await
     }
 }

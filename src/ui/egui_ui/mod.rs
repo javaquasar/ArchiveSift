@@ -1,3 +1,4 @@
+mod account_settings;
 mod app_window;
 mod background_executor;
 mod coalescing_worker;
@@ -791,6 +792,9 @@ impl DesktopApp {
 
         while let Ok(state) = self.state_rx.try_recv() {
             match state {
+                WorkerState::AccountFinished { id, result } => {
+                    self.window.account_finished(id, result)
+                }
                 WorkerState::StorageSettingsApplied(result) => self.finish_storage_settings(result),
                 WorkerState::ImportFinished { file_path, result } => {
                     let config_to_start = {
@@ -1018,6 +1022,28 @@ impl DesktopApp {
 
         if let Some(command) = self.window.take_command() {
             match command {
+                UiCommand::Account(command) => {
+                    let id = command.id().to_string();
+                    let tx = self.state_tx.clone();
+                    spawn_background(move || {
+                        let result = match shared_async_runtime() {
+                            Ok(runtime) => runtime.block_on(async {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(90),
+                                    command.execute(&crate::secure_store::SystemSecretStore),
+                                )
+                                .await
+                                .unwrap_or(Err(
+                                    crate::scraper::extensions::accounts::AccountError::Network,
+                                ))
+                            }),
+                            Err(_) => {
+                                Err(crate::scraper::extensions::accounts::AccountError::Network)
+                            }
+                        };
+                        let _ = tx.send(WorkerState::AccountFinished { id, result });
+                    });
+                }
                 UiCommand::QueueUrl(config) => self.enqueue_manual_url(config),
                 UiCommand::ImportFile { file_path } => self.start_import_url_file(file_path),
                 UiCommand::SetDownloadFolder(folder) => self.set_active_download_folder(folder),
@@ -1322,6 +1348,13 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    AccountFinished {
+        id: String,
+        result: Result<
+            crate::scraper::extensions::accounts::AccountOutcome,
+            crate::scraper::extensions::accounts::AccountError,
+        >,
+    },
     StorageSettingsApplied(Result<AppConfig, String>),
     ImportFinished {
         file_path: String,

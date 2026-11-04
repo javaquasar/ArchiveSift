@@ -17,7 +17,7 @@ name = "archive_sift"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "stream", "cookies"] }
 scraper = "0.23.1"
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 select = "0.6.0"
@@ -31,6 +31,10 @@ serde_json = "1.0.140"
 archive-sift-scraper-api = { path = "crates/scraper-api" }
 wasmtime = { version = "36.0.19", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }
 sha2 = "0.10"
+sha1 = "0.10"
+encoding_rs = "0.8"
+url = "2"
+zeroize = "1"
 semver = "1"
 image = "0.25.9"
 #tokio = "1.43.0"

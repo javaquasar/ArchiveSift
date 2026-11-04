@@ -1,3 +1,4 @@
+pub(crate) mod attachments;
 mod content_download;
 mod search;
 mod settings;

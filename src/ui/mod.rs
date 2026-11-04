@@ -219,6 +219,7 @@ pub enum SearchRefresh {
 /// Commands emitted by the UI and consumed by the app orchestration layer.
 #[derive(Clone, Debug)]
 pub enum UiCommand {
+    Account(crate::scraper::extensions::accounts::AccountCommand),
     QueueUrl(AppConfig),
     ImportFile {
         file_path: String,

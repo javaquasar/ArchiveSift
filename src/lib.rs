@@ -8,6 +8,7 @@ pub mod logging;
 pub mod models;
 pub mod persistence;
 pub mod scraper;
+pub mod secure_store;
 pub mod services;
 pub mod ui;
 

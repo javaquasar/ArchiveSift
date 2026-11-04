@@ -41,6 +41,9 @@ pub(crate) struct LimitedHttpResponse {
 }
 
 impl LimitedHttpResponse {
+    pub(crate) fn new(response: Response, permit: OwnedSemaphorePermit) -> Self {
+        Self { response, permit }
+    }
     pub(crate) fn into_parts(self) -> (Response, OwnedSemaphorePermit) {
         (self.response, self.permit)
     }
@@ -180,6 +183,58 @@ pub(crate) fn decode_body(body: Vec<u8>) -> String {
     }
 }
 
+pub(crate) fn decode_text_body(body: Vec<u8>, content_type: Option<&str>) -> String {
+    let encoding = content_type.and_then(|kind| {
+        kind.split(';').skip(1).find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            name.eq_ignore_ascii_case("charset")
+                .then(|| {
+                    encoding_rs::Encoding::for_label(
+                        value.trim().trim_matches(['\'', '"']).as_bytes(),
+                    )
+                })
+                .flatten()
+        })
+    });
+    match encoding {
+        Some(encoding) if encoding != encoding_rs::UTF_8 => encoding.decode(&body).0.into_owned(),
+        _ => decode_body(body),
+    }
+}
+
+pub(crate) async fn read_attachment(
+    limited: LimitedHttpResponse,
+) -> AppResult<crate::models::AttachmentData> {
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    let (response, _permit) = limited.into_parts();
+    let response = response.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BYTES as u64)
+    {
+        return Err("attachment exceeds 8 MiB limit".into());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_BYTES {
+            return Err("attachment exceeds 8 MiB limit".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(crate::models::AttachmentData {
+        bytes,
+        content_type,
+    })
+}
+
 fn append_bounded(target: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> bool {
     let Some(new_len) = target.len().checked_add(chunk.len()) else {
         return false;
@@ -300,5 +355,24 @@ mod tests {
 
         assert_eq!(text, "bounded response");
         assert_eq!(text.as_ptr(), allocation);
+    }
+
+    #[test]
+    fn declared_legacy_charset_is_decoded_before_parsing_without_losing_unicode() {
+        let (bytes, _, _) = encoding_rs::WINDOWS_1251.encode("Название: Пример");
+        assert_eq!(
+            decode_text_body(
+                bytes.into_owned(),
+                Some("text/html; CHARSET=\"windows-1251\"")
+            ),
+            "Название: Пример"
+        );
+        assert_eq!(
+            decode_text_body(
+                "UTF-8 текст".as_bytes().to_vec(),
+                Some("text/html; charset=utf-8")
+            ),
+            "UTF-8 текст"
+        );
     }
 }

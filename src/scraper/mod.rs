@@ -33,6 +33,25 @@ pub trait ContentScraper: Send + Sync {
         None
     }
 
+    /// Fetches a declared attachment. External adapters override this to apply
+    /// their exact origin permissions and host-owned credential bindings.
+    fn fetch_attachment<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = AppResult<crate::models::AttachmentData>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = match self.asset_origins() {
+                Some(origins) => {
+                    crate::http::OriginRestrictedClient::new(origins)?
+                        .fetch(url)
+                        .await?
+                }
+                None => crate::http::fetch_response(url).await?,
+            };
+            crate::http::read_attachment(response).await
+        })
+    }
+
     /// Describes what kinds of pages and listing behaviors this scraper supports.
     fn capabilities(&self) -> ScraperCapabilities {
         ScraperCapabilities::default()

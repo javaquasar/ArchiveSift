@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,13 @@ const MAX_DOWNLOAD_HISTORY: usize = 10;
 const MAX_PARALLEL_PAGE_JOBS: usize = 16;
 const MAX_IMAGES_PER_ITEM: usize = 32;
 const MAX_TOTAL_CONCURRENT_IMAGE_DOWNLOADS: usize = 32;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ExtensionAccount {
+    pub username: String,
+    #[serde(default)]
+    pub remember_password: bool,
+}
 
 fn default_max_parallel() -> usize {
     3
@@ -133,6 +141,8 @@ impl ScrapeLayoutConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extension_accounts: BTreeMap<String, ExtensionAccount>,
     #[serde(default = "default_config_version")]
     pub config_version: u32,
     pub source_url: String,
@@ -196,6 +206,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            extension_accounts: BTreeMap::new(),
             config_version: CURRENT_CONFIG_VERSION,
             source_url: String::new(),
             download_folder: String::new(),

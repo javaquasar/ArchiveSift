@@ -632,6 +632,15 @@ impl Database {
                 FOREIGN KEY (page_id) REFERENCES source_pages(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS page_attachments (
+                page_id INTEGER NOT NULL REFERENCES source_pages(id) ON DELETE CASCADE,
+                source_url TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                local_file_path TEXT NOT NULL,
+                downloaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (page_id, source_url)
+            );
+
             CREATE TABLE IF NOT EXISTS app_schema_migrations (
                 migration_key TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -821,6 +830,20 @@ impl Database {
         let _ = connection.execute_batch("PRAGMA optimize;");
 
         initialized.insert(identity);
+        Ok(())
+    }
+
+    pub fn save_page_attachment(
+        &self,
+        page_id: i64,
+        source_url: &str,
+        filename: &str,
+        local_file_path: &str,
+    ) -> AppResult<()> {
+        self.writer_connection()?.execute(
+            "INSERT INTO page_attachments(page_id,source_url,filename,local_file_path) VALUES(?1,?2,?3,?4) ON CONFLICT(page_id,source_url) DO UPDATE SET filename=excluded.filename,local_file_path=excluded.local_file_path,downloaded_at=CURRENT_TIMESTAMP",
+            params![page_id,source_url,filename,local_file_path],
+        )?;
         Ok(())
     }
 
