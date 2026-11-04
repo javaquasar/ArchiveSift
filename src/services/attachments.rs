@@ -8,6 +8,85 @@ use crate::models::ScrapedItem;
 use crate::scraper::ContentScraper;
 use crate::AppResult;
 
+const DESCRIPTION_SOURCE: &str = "archivesift:description";
+const DESCRIPTION_FILENAME: &str = "description.txt";
+
+/// Export page-level text once, independently of image and torrent downloads.
+/// The caller holds the page lock and file lease through the complete operation.
+pub(crate) async fn save_description(
+    page: &ScrapedItem,
+    page_id: i64,
+    database: &Database,
+    base_dir: &Path,
+) -> AppResult<()> {
+    if !database.is_torrent_page(page_id)? {
+        return Ok(());
+    }
+    let existing = database.attachment_path(page_id, DESCRIPTION_SOURCE)?;
+    let relative = match &existing {
+        Some(path) => path.clone(),
+        None => match database.torrent_directory(page_id)? {
+            Some(directory) => directory.join(DESCRIPTION_FILENAME),
+            None => {
+                // Legacy cards have no managed directory. Keep the export next to
+                // their torrent or magnet, and track it for a later confirmed move.
+                let card = database.torrent_card(page_id)?;
+                let attachment = card
+                    .attachments
+                    .iter()
+                    .find(|a| a.filename.to_ascii_lowercase().ends_with(".torrent"))
+                    .or_else(|| card.attachments.first());
+                match attachment {
+                    Some(attachment) => {
+                        PathBuf::from(attachment.local_file_path.replace('\\', "/"))
+                            .with_file_name(DESCRIPTION_FILENAME)
+                    }
+                    None => relative_path(page, page_id, DESCRIPTION_SOURCE, DESCRIPTION_FILENAME)
+                        .with_file_name(DESCRIPTION_FILENAME),
+                }
+            }
+        },
+    };
+    let description = page
+        .attribute_values("full_description")
+        .find(|text| !text.trim().is_empty())
+        .or_else(|| {
+            page.attribute_values("description")
+                .find(|text| !text.trim().is_empty())
+        });
+    let mut text = page.title.clone();
+    if let Some(description) = description {
+        text.push_str("\n\n");
+        text.push_str(description);
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    tokio::fs::create_dir_all(base_dir).await?;
+    let root = tokio::fs::canonicalize(base_dir).await?;
+    let path = super::torrent_library::checked_path(&root, &relative.to_string_lossy())?;
+    if existing.is_none() && path.try_exists()? {
+        // An identical unregistered export can be left by a failed DB write.
+        // Other pre-existing text files belong to the user and must be retained.
+        if tokio::fs::metadata(&path).await?.len() != text.len() as u64
+            || tokio::fs::read(&path).await? != text.as_bytes()
+        {
+            return Err(
+                "description.txt already exists; rename it before exporting the card text".into(),
+            );
+        }
+    }
+    FileDownloadStore::new()
+        .write_bytes(&path.to_string_lossy(), text.as_bytes())
+        .await?;
+    database.save_page_attachment(
+        page_id,
+        DESCRIPTION_SOURCE,
+        DESCRIPTION_FILENAME,
+        &path.strip_prefix(&root)?.to_string_lossy(),
+    )
+}
+
 pub(crate) fn valid_magnet(value: &str) -> bool {
     if value.len() > 16 * 1024 {
         return false;

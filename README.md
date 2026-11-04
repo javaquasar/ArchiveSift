@@ -62,6 +62,10 @@ image filters and previews; **SQL** opens the database console. **Extensions**
 shows installed parser modules. Choose a download folder in Scrape to enable
 downloads. Search and SQL remain available without a download folder.
 
+**Search → By Date** follows the selected Site filter for group counts, oldest/newest
+ordering and previous/next wraparound. Changing Site while browsing restarts at the
+first matching group; All sites restores browsing across sources.
+
 Open **Settings → Storage** to select the download folder, open an existing
 SQLite library or create a new one, and optionally choose a separate thumbnail
 folder. **Save and apply** validates and saves the selection without restarting.

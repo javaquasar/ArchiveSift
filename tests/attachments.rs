@@ -176,7 +176,7 @@ async fn attachments_without_images_are_persisted_atomically_and_reused() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(files.len(), 2);
+    assert_eq!(files.len(), 3);
     for (name, relative) in files {
         let file = std::path::Path::new(&config.download_folder)
             .join(&relative)
@@ -186,6 +186,8 @@ async fn attachments_without_images_are_persisted_atomically_and_reused() {
         let bytes = std::fs::read(file).unwrap();
         if name == "Magnet" {
             assert!(bytes.starts_with(b"magnet:?xt=urn:btih:"));
+        } else if name == "description.txt" {
+            assert_eq!(bytes, b"Attachment example\n");
         } else {
             assert_eq!(bytes, b"d4:infod6:lengthi1e4:name4:demoee");
         }
@@ -234,7 +236,7 @@ async fn login_html_never_becomes_a_torrent_and_magnets_need_no_network() {
                 .query_row("SELECT count(*) FROM page_attachments", [], |r| r
                     .get::<_, i64>(0))
                 .unwrap(),
-            if magnet_only { 1 } else { 0 }
+            if magnet_only { 2 } else { 1 }
         );
         assert_eq!(
             fetched.load(Ordering::SeqCst),
@@ -300,6 +302,14 @@ async fn downloaded_images_and_attachments_are_reused_after_a_studio_move() {
         .cards
         .remove(0);
     let original = card.directory.clone().unwrap();
+    let description = config
+        .effective_download_dir()
+        .join(&original)
+        .join("description.txt");
+    assert_eq!(
+        std::fs::read_to_string(&description).unwrap(),
+        "Attachment example\n"
+    );
     let db_copy = db.clone();
     let base = config.effective_download_dir();
     tokio::task::spawn_blocking(move || {
@@ -311,7 +321,7 @@ async fn downloaded_images_and_attachments_are_reused_after_a_studio_move() {
         let plan = library
             .prepare(card.page_id, card.revision, edit, false)
             .unwrap();
-        assert_eq!(plan.files.len(), 3);
+        assert_eq!(plan.files.len(), 4);
         library.apply(plan, |_| {}).unwrap();
     })
     .await
@@ -333,6 +343,20 @@ async fn downloaded_images_and_attachments_are_reused_after_a_studio_move() {
     let relative = saved.images[0].local_file_path.as_ref().unwrap();
     assert!(relative.starts_with(saved.directory.as_ref().unwrap()));
     assert!(image::open(config.effective_download_dir().join(relative)).is_ok());
+    let description = saved
+        .attachments
+        .iter()
+        .find(|file| file.filename == "description.txt")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(
+            config
+                .effective_download_dir()
+                .join(&description.local_file_path)
+        )
+        .unwrap(),
+        "Attachment example\n"
+    );
     assert!(root.path().join("thumbs/0/1.jpg").is_file());
     server.abort();
 }

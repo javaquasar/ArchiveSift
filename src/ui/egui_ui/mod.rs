@@ -1064,9 +1064,9 @@ impl DesktopApp {
                     let w = &mut self.window;
                     w.apply_sql_export_result(&output_path, result);
                 }
-                WorkerState::DateGroupsLoaded(result) => {
+                WorkerState::DateGroupsLoaded { seq, result } => {
                     let w = &mut self.window;
-                    w.apply_date_groups_loaded(result);
+                    w.apply_date_groups_loaded(seq, result);
                 }
                 WorkerState::DeleteFinished { image_ids, result } => {
                     let w = &mut self.window;
@@ -1370,6 +1370,8 @@ impl DesktopApp {
                 }
                 UiCommand::BrowseDateGroups {
                     database_path,
+                    site_key,
+                    seq,
                     cursor,
                     direction,
                     ascending,
@@ -1377,6 +1379,8 @@ impl DesktopApp {
                 } => {
                     self.start_browse_date_groups(
                         database_path,
+                        site_key,
+                        seq,
                         cursor,
                         direction,
                         ascending,
@@ -1428,26 +1432,28 @@ impl DesktopApp {
     fn start_browse_date_groups(
         &mut self,
         database_path: String,
+        site_key: Option<String>,
+        seq: u64,
         cursor: Option<DateGroupCursor>,
         direction: DateBrowseDirection,
         ascending: bool,
         max_favorites_exclusive: Option<usize>,
     ) {
-        {
-            let w = &mut self.window;
-            w.date_browse_loading = true;
+        if let Some(cancellation) = self.search_cancellation.take() {
+            cancellation.cancel();
         }
         let state_tx = self.state_tx.clone();
         spawn_background(move || {
-            let result = Database::new(database_path).get_date_group_page(
+            let result = Database::new(database_path).get_date_group_page_for_site(
                 cursor.as_ref(),
                 direction,
                 ascending,
                 max_favorites_exclusive,
+                site_key.as_deref(),
             );
-            let worker_state = match result {
-                Ok(groups) => WorkerState::DateGroupsLoaded(Ok(groups)),
-                Err(e) => WorkerState::DateGroupsLoaded(Err(e.to_string())),
+            let worker_state = WorkerState::DateGroupsLoaded {
+                seq,
+                result: result.map_err(|error| error.to_string()),
             };
             let _ = state_tx.send(worker_state);
         });
@@ -1515,7 +1521,10 @@ enum WorkerState {
         output_path: String,
         result: Result<usize, String>,
     },
-    DateGroupsLoaded(Result<DateGroupPage, String>),
+    DateGroupsLoaded {
+        seq: u64,
+        result: Result<DateGroupPage, String>,
+    },
 }
 
 fn run_queue_processor(

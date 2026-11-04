@@ -728,7 +728,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_source_pages_site_key ON source_pages(site_key);
             CREATE INDEX IF NOT EXISTS idx_source_pages_search_order
                 ON source_pages(scraped_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_source_pages_site_date_browse
+                ON source_pages(site_key, scraped_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_images_is_favorite ON images(is_favorite);
+            CREATE INDEX IF NOT EXISTS idx_images_preview_url ON images(preview_url) WHERE preview_url IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_page_images_page_id ON page_images(page_id, sort_order);
             CREATE INDEX IF NOT EXISTS idx_page_images_image_id ON page_images(image_id, page_id);
             CREATE INDEX IF NOT EXISTS idx_page_images_local_file_path ON page_images(local_file_path);
@@ -939,6 +942,11 @@ impl Database {
         }
 
         let mut image_ids_by_url = HashMap::new();
+        let requested_sources = page
+            .images
+            .iter()
+            .map(|image| image.source_url.as_str())
+            .collect::<HashSet<_>>();
         {
             let mut link_image = transaction
                 .prepare_cached(
@@ -967,6 +975,20 @@ impl Database {
                         operation: "upsert_page_image_link",
                         source,
                     })?;
+                if let Some(preview) = image
+                    .preview_url
+                    .as_deref()
+                    .filter(|url| !requested_sources.contains(url))
+                {
+                    replace_page_preview(
+                        &transaction,
+                        page_id,
+                        image_id,
+                        preview,
+                        &image.source_url,
+                        &requested_sources,
+                    )?;
+                }
                 image_ids_by_url.insert(image.source_url.clone(), image_id);
             }
         }
@@ -2091,18 +2113,40 @@ impl Database {
         ascending: bool,
         max_favorites_exclusive: Option<usize>,
     ) -> AppResult<DateGroupPage> {
+        self.get_date_group_page_for_site(
+            cursor,
+            direction,
+            ascending,
+            max_favorites_exclusive,
+            None,
+        )
+    }
+
+    /// Scope counts, cursor navigation and wraparound to the selected source.
+    pub fn get_date_group_page_for_site(
+        &self,
+        cursor: Option<&DateGroupCursor>,
+        direction: DateBrowseDirection,
+        ascending: bool,
+        max_favorites_exclusive: Option<usize>,
+        site_key: Option<&str>,
+    ) -> AppResult<DateGroupPage> {
         let connection = self.connect()?;
-        let favorite_clause = max_favorites_exclusive
-            .map(|_| " WHERE favorite_count < ?")
-            .unwrap_or("");
-        let count_sql = format!("SELECT COUNT(*) FROM source_pages{favorite_clause}");
-        let total = if let Some(limit) = max_favorites_exclusive {
-            connection.query_row(&count_sql, params![limit as i64], |row| {
+        let mut filter = String::new();
+        let mut filter_values = Vec::<rusqlite::types::Value>::new();
+        if let Some(site_key) = site_key.map(str::trim).filter(|key| !key.is_empty()) {
+            filter.push_str(" AND site_key = ?");
+            filter_values.push(site_key.to_owned().into());
+        }
+        if let Some(limit) = max_favorites_exclusive {
+            filter.push_str(" AND favorite_count < ?");
+            filter_values.push((limit as i64).into());
+        }
+        let count_sql = format!("SELECT COUNT(*) FROM source_pages WHERE 1 = 1{filter}");
+        let total =
+            connection.query_row(&count_sql, params_from_iter(filter_values.iter()), |row| {
                 row.get::<_, i64>(0)
-            })?
-        } else {
-            connection.query_row(&count_sql, [], |row| row.get::<_, i64>(0))?
-        } as usize;
+            })? as usize;
         if total == 0 {
             return Ok(DateGroupPage { group: None, total });
         }
@@ -2126,11 +2170,8 @@ impl Database {
             let mut sql = String::from(
                 "SELECT id, scraped_at, SUBSTR(scraped_at, 1, 10), title, image_count, favorite_count FROM source_pages WHERE 1 = 1",
             );
-            let mut values = Vec::<rusqlite::types::Value>::new();
-            if let Some(limit) = max_favorites_exclusive {
-                sql.push_str(" AND favorite_count < ?");
-                values.push((limit as i64).into());
-            }
+            sql.push_str(&filter);
+            let mut values = filter_values.clone();
             if let (Some(cursor), Some(comparator)) = (cursor, comparator) {
                 sql.push_str(&format!(
                     " AND (scraped_at {comparator} ? OR (scraped_at = ? AND id {comparator} ?))"
@@ -2901,6 +2942,72 @@ fn upsert_source_page(transaction: &Transaction<'_>, page: &ScrapedItem) -> AppR
     }
 
     Ok(page_id)
+}
+
+/// Replace a page's former preview with its original while retaining manual metadata.
+fn replace_page_preview(
+    transaction: &Transaction<'_>,
+    page_id: i64,
+    image_id: i64,
+    preview: &str,
+    source_url: &str,
+    requested_sources: &HashSet<&str>,
+) -> AppResult<()> {
+    let previous = transaction.prepare_cached(
+        "SELECT i.id,i.is_favorite,i.source_url FROM images i JOIN page_images pi ON pi.image_id=i.id WHERE pi.page_id=?1 AND (i.source_url=?2 OR i.preview_url=?2) AND i.id<>?3",
+    )?.query_map(params![page_id,preview,image_id], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,bool>(1)?,row.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (previous_id, favorite, previous_source) in previous {
+        if requested_sources.contains(previous_source.as_str()) {
+            continue;
+        }
+        // Signed download URLs can change while the preview and resource path
+        // remain stable. Explicitly requested variants stay separate.
+        let same_location = match (
+            url::Url::parse(&previous_source),
+            url::Url::parse(source_url),
+        ) {
+            (Ok(mut previous), Ok(mut current)) => {
+                previous.set_query(None);
+                previous.set_fragment(None);
+                current.set_query(None);
+                current.set_fragment(None);
+                previous == current
+            }
+            _ => false,
+        };
+        if previous_source != preview && !same_location {
+            continue;
+        }
+        if favorite
+            && transaction.execute(
+                "UPDATE images SET is_favorite=1 WHERE id=?1 AND is_favorite=0",
+                [image_id],
+            )? > 0
+        {
+            let affected = transaction
+                .prepare_cached("SELECT page_id FROM page_images WHERE image_id=?1")?
+                .query_map([image_id], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for affected_page in affected {
+                refresh_page_counters(transaction, affected_page)?;
+            }
+        }
+        if transaction.execute(
+        "INSERT OR IGNORE INTO image_attributes(image_id,attribute_id) SELECT ?1,attribute_id FROM image_attributes WHERE image_id=?2",
+        params![image_id,previous_id],
+    )? > 0 {refresh_image_search_index(transaction, image_id)?;}
+        transaction.execute(
+            "UPDATE torrent_cards SET primary_image_id=?3 WHERE page_id=?1 AND primary_image_id=?2",
+            params![page_id, previous_id, image_id],
+        )?;
+        // Existing files and other pages' references are retained. The new link has
+        // no local path, so downloading the original cannot silently reuse a thumbnail.
+        transaction.execute(
+            "DELETE FROM page_images WHERE page_id=?1 AND image_id=?2",
+            params![page_id, previous_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn upsert_image(transaction: &Transaction<'_>, image: &ScrapedImage) -> AppResult<i64> {

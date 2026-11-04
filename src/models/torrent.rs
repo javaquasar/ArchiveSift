@@ -33,6 +33,7 @@ pub struct TorrentCard {
     pub page_url: String,
     pub title: String,
     pub primary_studio: String,
+    pub primary_image_id: Option<i64>,
     pub directory: Option<String>,
     pub revision: i64,
     pub attributes: Vec<MetadataAttribute>,
@@ -41,6 +42,13 @@ pub struct TorrentCard {
 }
 
 impl TorrentCard {
+    pub fn primary_image(&self) -> Option<&TorrentImage> {
+        self.images
+            .iter()
+            .find(|image| Some(image.image_id) == self.primary_image_id)
+            .or_else(|| self.images.first())
+    }
+
     pub fn values(&self, kind: &str) -> Vec<String> {
         self.attributes
             .iter()
@@ -61,6 +69,8 @@ impl TorrentCard {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TorrentEdit {
     pub primary_studio: String,
+    #[serde(default)]
+    pub primary_image_id: Option<i64>,
     pub studios: Vec<String>,
     pub tags: Vec<String>,
     pub categories: Vec<String>,
@@ -70,6 +80,7 @@ impl From<&TorrentCard> for TorrentEdit {
     fn from(card: &TorrentCard) -> Self {
         Self {
             primary_studio: card.primary_studio.clone(),
+            primary_image_id: card.primary_image_id,
             studios: card.values("studio"),
             tags: card.values("tag"),
             categories: card.values("category"),

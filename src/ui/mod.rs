@@ -369,9 +369,11 @@ pub enum UiCommand {
         query: String,
         output_path: String,
     },
-    /// Load all source pages with aggregate stats for date-group browsing.
+    /// Load one source page with aggregate stats for date-group browsing.
     BrowseDateGroups {
         database_path: String,
+        site_key: Option<String>,
+        seq: u64,
         cursor: Option<DateGroupCursor>,
         direction: DateBrowseDirection,
         ascending: bool,

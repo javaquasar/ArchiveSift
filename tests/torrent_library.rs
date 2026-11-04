@@ -122,6 +122,21 @@ impl Library {
     fn service(&self) -> TorrentLibrary {
         TorrentLibrary::new(self.db.clone(), &self.base)
     }
+    fn add_second_image(&mut self) -> i64 {
+        let mut image = self.page.images[0].clone();
+        image.source_url = "https://example.test/second.png".into();
+        image.sort_order = 1;
+        self.page.images.push(image);
+        let persisted = self.db.upsert_scraped_item(&self.page).unwrap();
+        let id = persisted.image_ids_by_url["https://example.test/second.png"];
+        let path = PathBuf::from(self.db.torrent_card(self.id).unwrap().directory.unwrap())
+            .join("images/002.png");
+        std::fs::write(self.base.join(&path), b"second image bytes").unwrap();
+        self.db
+            .update_image_artifacts(self.id, id, &path.to_string_lossy(), None)
+            .unwrap();
+        id
+    }
     fn plan(&self, studio: &str) -> archive_sift::services::torrent_library::TorrentMovePlan {
         let card = self.db.torrent_card(self.id).unwrap();
         let mut edit = TorrentEdit::from(&card);
@@ -130,6 +145,286 @@ impl Library {
             .prepare(self.id, card.revision, edit, false)
             .unwrap()
     }
+}
+
+#[test]
+fn changing_signed_urls_uses_the_stable_preview_without_merging_explicit_variants() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::new(root.path().join("archive.sqlite3"));
+    db.initialize().unwrap();
+    let mut page = page();
+    let first = "https://cdn.example.test/media/photo.jpg?signature=first&expires=1";
+    let second = "https://cdn.example.test/media/photo.jpg?signature=second&expires=2";
+    page.images[0].source_url = first.into();
+    page.images[0].preview_url = Some("https://cdn.example.test/thumb/photo.jpg".into());
+    let saved = db.upsert_scraped_item(&page).unwrap();
+    let card = db.torrent_card(saved.page_id).unwrap();
+    let library = TorrentLibrary::new(db.clone(), root.path().join("downloads"));
+    let edit = TorrentEdit {
+        primary_image_id: Some(card.images[0].image_id),
+        ..TorrentEdit::from(&card)
+    };
+    let plan = library
+        .prepare(card.page_id, card.revision, edit, false)
+        .unwrap();
+    library.apply(plan, |_| {}).unwrap();
+    page.images[0].source_url = second.into();
+    db.upsert_scraped_item(&page).unwrap();
+    let updated = db.torrent_card(saved.page_id).unwrap();
+    assert_eq!(updated.images.len(), 1);
+    assert_eq!(updated.images[0].source_url, second);
+    assert_eq!(updated.primary_image_id, Some(updated.images[0].image_id));
+    let mut previous = page.images[0].clone();
+    previous.source_url = first.into();
+    page.images.push(previous);
+    db.upsert_scraped_item(&page).unwrap();
+    assert_eq!(db.torrent_card(saved.page_id).unwrap().images.len(), 2);
+    page.images.truncate(1);
+    page.images[0].source_url = "https://cdn.example.test/other/photo.jpg?signature=third".into();
+    db.upsert_scraped_item(&page).unwrap();
+    assert_eq!(db.torrent_card(saved.page_id).unwrap().images.len(), 3);
+}
+
+#[test]
+fn original_replaces_its_preview_without_losing_cover_favorites_tags_or_other_pages() {
+    let library = Library::new(false);
+    let card = library.db.torrent_card(library.id).unwrap();
+    let old_id = card.images[0].image_id;
+    let old_path = card.images[0].local_file_path.clone().unwrap();
+    library.db.set_favorite(old_id, true).unwrap();
+    library
+        .db
+        .add_image_attributes(&[old_id], "tag", "Tag", &["Manual image tag".into()])
+        .unwrap();
+    let edit = TorrentEdit {
+        primary_image_id: Some(old_id),
+        ..TorrentEdit::from(&card)
+    };
+    let plan = library
+        .service()
+        .prepare(library.id, card.revision, edit, false)
+        .unwrap();
+    library.service().apply(plan, |_| {}).unwrap();
+    let mut other = library.page.clone();
+    other.page_url = "https://example.test/topic?t=99".into();
+    let other_id = library.db.upsert_scraped_item(&other).unwrap().page_id;
+    library
+        .db
+        .update_image_artifacts(other_id, old_id, &old_path, None)
+        .unwrap();
+    let mut original = library.page.clone();
+    original.images[0].preview_url = Some(original.images[0].source_url.clone());
+    original.images[0].source_url = "https://example.test/original.png".into();
+    let saved = library.db.upsert_scraped_item(&original).unwrap();
+    let original_id = saved.image_ids_by_url["https://example.test/original.png"];
+    let card = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(card.images.len(), 1);
+    assert_eq!(card.images[0].image_id, original_id);
+    assert_eq!(card.primary_image_id, Some(original_id));
+    assert!(
+        card.images[0].local_file_path.is_none(),
+        "the original must be downloaded instead of reusing a thumbnail"
+    );
+    let favorites = library
+        .db
+        .search_images(&SearchQuery {
+            page_id: Some(library.id),
+            favorites_only: true,
+            tags: vec!["Manual image tag".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(favorites.len(), 1);
+    assert_eq!(favorites[0].image_id, original_id);
+    let other = library.db.torrent_card(other_id).unwrap();
+    assert_eq!(other.images[0].image_id, old_id);
+    assert_eq!(
+        other.images[0].local_file_path.as_deref(),
+        Some(old_path.as_str())
+    );
+    assert!(library.base.join(&old_path).is_file());
+    library.db.upsert_scraped_item(&original).unwrap();
+    assert_eq!(library.db.torrent_card(library.id).unwrap().images.len(), 1);
+    original.images.push(library.page.images[0].clone());
+    library.db.upsert_scraped_item(&original).unwrap();
+    assert_eq!(
+        library.db.torrent_card(library.id).unwrap().images.len(),
+        2,
+        "an explicitly requested separate preview must remain"
+    );
+}
+
+#[test]
+fn failed_preview_upgrade_rolls_back_links_and_new_image_records() {
+    let library = Library::new(false);
+    let before = library.db.torrent_card(library.id).unwrap();
+    let connection =
+        rusqlite::Connection::open(library.root.path().join("archive.sqlite3")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_preview_delete BEFORE DELETE ON page_images BEGIN SELECT RAISE(ABORT,'fixture preview replacement failure'); END;").unwrap();
+    let mut original = library.page.clone();
+    original.images[0].preview_url = Some(original.images[0].source_url.clone());
+    original.images[0].source_url = "https://example.test/original.png".into();
+    assert!(library.db.upsert_scraped_item(&original).is_err());
+    let after = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(after.images[0].image_id, before.images[0].image_id);
+    assert_eq!(
+        after.images[0].local_file_path,
+        before.images[0].local_file_path
+    );
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM images WHERE source_url='https://example.test/original.png'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn primary_image_is_per_card_and_survives_reparse_restart_and_studio_moves() {
+    let mut library = Library::new(false);
+    let second = library.add_second_image();
+    let original = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(original.primary_image_id, None);
+    let first = original.primary_image().unwrap().image_id;
+    let edit = TorrentEdit {
+        primary_image_id: Some(second),
+        ..TorrentEdit::from(&original)
+    };
+    let plan = library
+        .service()
+        .prepare(library.id, original.revision, edit, false)
+        .unwrap();
+    assert!(plan.files.is_empty());
+    let saved = library.service().apply(plan, |_| {}).unwrap();
+    assert_eq!(saved.primary_image().unwrap().image_id, second);
+    assert_eq!(
+        saved.images[0].image_id, first,
+        "manual selection must not rewrite parser image order"
+    );
+    let reopened = Database::new(library.root.path().join("archive.sqlite3"));
+    reopened.initialize().unwrap();
+    assert_eq!(
+        reopened.torrent_card(library.id).unwrap().primary_image_id,
+        Some(second)
+    );
+    library.page.images.swap(0, 1);
+    for (index, image) in library.page.images.iter_mut().enumerate() {
+        image.sort_order = index as i64;
+    }
+    library.db.upsert_scraped_item(&library.page).unwrap();
+    assert_eq!(
+        library
+            .db
+            .torrent_card(library.id)
+            .unwrap()
+            .primary_image_id,
+        Some(second)
+    );
+    let mut other_page = library.page.clone();
+    other_page.page_url = "https://example.test/topic?t=43".into();
+    let other_id = library.db.upsert_scraped_item(&other_page).unwrap().page_id;
+    let other = library.db.torrent_card(other_id).unwrap();
+    assert_eq!(other.primary_image_id, None);
+    let edit = TorrentEdit {
+        primary_image_id: Some(first),
+        ..TorrentEdit::from(&other)
+    };
+    let plan = library
+        .service()
+        .prepare(other_id, other.revision, edit, false)
+        .unwrap();
+    library.service().apply(plan, |_| {}).unwrap();
+    let moved = library
+        .service()
+        .apply(library.plan("Studio Second"), |_| {})
+        .unwrap();
+    assert_eq!(moved.primary_image_id, Some(second));
+    let cover = moved.primary_image().unwrap();
+    assert!(cover
+        .local_file_path
+        .as_ref()
+        .unwrap()
+        .starts_with(moved.directory.as_ref().unwrap()));
+    assert!(library
+        .base
+        .join(cover.local_file_path.as_ref().unwrap())
+        .is_file());
+    assert_eq!(
+        library.db.torrent_card(other_id).unwrap().primary_image_id,
+        Some(first)
+    );
+    let edit = TorrentEdit {
+        primary_image_id: None,
+        ..TorrentEdit::from(&moved)
+    };
+    let plan = library
+        .service()
+        .prepare(library.id, moved.revision, edit, false)
+        .unwrap();
+    assert!(plan.files.is_empty());
+    let automatic = library.service().apply(plan, |_| {}).unwrap();
+    assert_eq!(automatic.primary_image_id, None);
+    assert_eq!(
+        automatic.primary_image().unwrap().image_id,
+        automatic.images[0].image_id
+    );
+}
+
+#[test]
+fn primary_image_must_belong_to_card_and_deletion_restores_a_safe_fallback() {
+    let mut library = Library::new(false);
+    let second = library.add_second_image();
+    let card = library.db.torrent_card(library.id).unwrap();
+    let first = card.images[0].image_id;
+    let mut foreign = library.page.clone();
+    foreign.page_url = "https://example.test/topic?t=44".into();
+    foreign.images.truncate(1);
+    foreign.images[0].source_url = "https://example.test/foreign.png".into();
+    let foreign = library.db.upsert_scraped_item(&foreign).unwrap();
+    let foreign_id = foreign.image_ids_by_url["https://example.test/foreign.png"];
+    for invalid in [i64::MAX, foreign_id] {
+        let edit = TorrentEdit {
+            primary_image_id: Some(invalid),
+            ..TorrentEdit::from(&card)
+        };
+        assert!(library
+            .service()
+            .prepare(library.id, card.revision, edit, false)
+            .is_err());
+    }
+    let edit = TorrentEdit {
+        primary_image_id: Some(second),
+        ..TorrentEdit::from(&card)
+    };
+    let plan = library
+        .service()
+        .prepare(library.id, card.revision, edit, false)
+        .unwrap();
+    library.service().apply(plan, |_| {}).unwrap();
+    let plan = library.plan("Studio Second");
+    let destination = library.base.join(plan.to_directory.as_ref().unwrap());
+    library.db.delete_images(&[second]).unwrap();
+    let fallback = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(fallback.primary_image_id, None);
+    assert_eq!(fallback.primary_image().unwrap().image_id, first);
+    assert!(library.service().apply(plan, |_| {}).is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        library.db.torrent_card(library.id).unwrap().primary_studio,
+        "Studio First"
+    );
+    library.db.delete_images(&[first]).unwrap();
+    assert!(library
+        .db
+        .torrent_card(library.id)
+        .unwrap()
+        .primary_image()
+        .is_none());
 }
 
 #[test]
@@ -312,7 +607,8 @@ fn conflicting_destination_changed_files_and_stale_cards_do_not_move_anything() 
 fn failed_database_commit_rolls_back_all_files_and_metadata() {
     let library = Library::new(false);
     let old = library.db.torrent_card(library.id).unwrap();
-    let plan = library.plan("Studio Second");
+    let mut plan = library.plan("Studio Second");
+    plan.edit.primary_image_id = Some(old.images[0].image_id);
     let destination = library.base.join(plan.to_directory.as_ref().unwrap());
     let connection =
         rusqlite::Connection::open(library.root.path().join("archive.sqlite3")).unwrap();
@@ -321,6 +617,14 @@ fn failed_database_commit_rolls_back_all_files_and_metadata() {
     assert_eq!(
         library.db.torrent_card(library.id).unwrap().primary_studio,
         old.primary_studio
+    );
+    assert_eq!(
+        library
+            .db
+            .torrent_card(library.id)
+            .unwrap()
+            .primary_image_id,
+        old.primary_image_id
     );
     assert!(!destination.exists());
     for a in old.attachments {

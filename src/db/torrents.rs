@@ -10,6 +10,7 @@ pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS torrent_cards (
             page_id INTEGER PRIMARY KEY REFERENCES source_pages(id) ON DELETE CASCADE,
             primary_studio TEXT NOT NULL DEFAULT '', directory TEXT,
+            primary_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL,
             revision INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS page_attribute_overrides (
@@ -32,6 +33,19 @@ pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
                 WHERE pa.page_id=sp.id AND a.kind IN ('attachment','magnet'));
         INSERT OR IGNORE INTO app_schema_migrations(migration_key) VALUES('torrent-library-v1');
     "#,
+    )?;
+    let has_primary_image = tx
+        .prepare("PRAGMA table_info(torrent_cards)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "primary_image_id");
+    if !has_primary_image {
+        tx.execute_batch("ALTER TABLE torrent_cards ADD COLUMN primary_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL;")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_torrent_cards_primary_image ON torrent_cards(primary_image_id) WHERE primary_image_id IS NOT NULL;
+         INSERT OR IGNORE INTO app_schema_migrations(migration_key) VALUES('torrent-primary-image-v1');",
     )?;
     tx.commit()?;
     Ok(())
@@ -128,8 +142,8 @@ fn apply_overrides(tx: &Transaction<'_>, page_id: i64) -> AppResult<()> {
 }
 
 fn read_card(connection: &Connection, page_id: i64) -> AppResult<TorrentCard> {
-    let mut card = connection.query_row("SELECT sp.id,sp.site_key,sp.page_url,sp.title,tc.primary_studio,tc.directory,tc.revision FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE tc.page_id=?1", [page_id], |r| Ok(TorrentCard {
-        page_id:r.get(0)?,site_key:r.get(1)?,page_url:r.get(2)?,title:r.get(3)?,primary_studio:r.get(4)?,directory:r.get(5)?,revision:r.get(6)?,attributes:vec![],images:vec![],attachments:vec![]
+    let mut card = connection.query_row("SELECT sp.id,sp.site_key,sp.page_url,sp.title,tc.primary_studio,tc.directory,tc.revision,tc.primary_image_id FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE tc.page_id=?1", [page_id], |r| Ok(TorrentCard {
+        page_id:r.get(0)?,site_key:r.get(1)?,page_url:r.get(2)?,title:r.get(3)?,primary_studio:r.get(4)?,directory:r.get(5)?,revision:r.get(6)?,primary_image_id:r.get(7)?,attributes:vec![],images:vec![],attachments:vec![]
     }))?;
     card.attributes = batch_load_page_attributes(connection, &[page_id])?
         .remove(&page_id)
@@ -161,6 +175,27 @@ fn read_card(connection: &Connection, page_id: i64) -> AppResult<TorrentCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_image_migration_preserves_existing_cards_and_is_repeatable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("legacy.sqlite3");
+        let db = Database::new(&path);
+        db.initialize().unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        connection.execute_batch("DROP TABLE torrent_cards;
+            CREATE TABLE torrent_cards(page_id INTEGER PRIMARY KEY REFERENCES source_pages(id) ON DELETE CASCADE, primary_studio TEXT NOT NULL DEFAULT '', directory TEXT, revision INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO source_pages(id,site_key,page_url,title,raw_html) VALUES(7,'example','https://example.test/7','Legacy','');
+            INSERT INTO torrent_cards(page_id,primary_studio,directory,revision) VALUES(7,'Selected studio','old/release',9);").unwrap();
+        initialize(&mut connection).unwrap();
+        initialize(&mut connection).unwrap();
+        let card = db.torrent_card(7).unwrap();
+        assert_eq!(card.primary_studio, "Selected studio");
+        assert_eq!(card.directory.as_deref(), Some("old/release"));
+        assert_eq!(card.revision, 9);
+        assert_eq!(card.primary_image_id, None);
+        assert!(card.primary_image().is_none());
+    }
 
     #[test]
     fn migration_discovers_legacy_attachment_only_pages_without_touching_their_paths() {
@@ -327,6 +362,12 @@ impl Database {
         let mut connection = self.writer_connection()?;
         let tx = connection.transaction()?;
         let card = read_card(&tx, page_id)?;
+        if edit
+            .primary_image_id
+            .is_some_and(|id| !card.images.iter().any(|image| image.image_id == id))
+        {
+            return Err("primary image must belong to this torrent card".into());
+        }
         for (kind, new) in [
             ("studio", &edit.studios),
             ("tag", &edit.tags),
@@ -347,7 +388,7 @@ impl Database {
                 tx.execute("INSERT INTO page_attribute_overrides(page_id,kind,normalized_value,value,removed) VALUES(?1,?2,?3,?4,0) ON CONFLICT(page_id,kind,normalized_value) DO UPDATE SET removed=0,value=excluded.value", params![page_id,kind,normalize(value),value])?;
             }
         }
-        tx.execute("UPDATE torrent_cards SET primary_studio=?2,directory=?3,revision=revision+1 WHERE page_id=?1", params![page_id,edit.primary_studio,directory])?;
+        tx.execute("UPDATE torrent_cards SET primary_studio=?2,directory=?3,primary_image_id=?4,revision=revision+1 WHERE page_id=?1", params![page_id,edit.primary_studio,directory,edit.primary_image_id])?;
         apply_overrides(&tx, page_id)?;
         for (id, path) in image_paths {
             tx.execute("UPDATE page_images SET local_file_path=?3,updated_at=CURRENT_TIMESTAMP WHERE page_id=?1 AND image_id=?2", params![page_id,id,path])?;

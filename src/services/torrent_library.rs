@@ -76,6 +76,7 @@ impl TorrentLibrary {
             return Err("card changed; reload it before editing".into());
         }
         let edit = normalize_edit(edit)?;
+        validate_primary_image(&card, &edit)?;
         let organize = organize || edit.primary_studio != card.primary_studio;
         let target = if organize {
             Some(
@@ -207,9 +208,11 @@ impl TorrentLibrary {
         if self.absolute_root()? != plan.base_dir {
             return Err("download folder changed; prepare a new move".into());
         }
-        if self.database.torrent_card(plan.page_id)?.revision != plan.revision {
+        let card = self.database.torrent_card(plan.page_id)?;
+        if card.revision != plan.revision {
             return Err("card changed; prepare and confirm a new move".into());
         }
+        validate_primary_image(&card, &plan.edit)?;
         if !plan.files.is_empty() {
             if let Some(from) = &plan.from_directory {
                 let directory = checked_path(&plan.base_dir, from)?;
@@ -423,6 +426,16 @@ impl TorrentLibrary {
         }
         Ok(path)
     }
+}
+
+fn validate_primary_image(card: &TorrentCard, edit: &TorrentEdit) -> AppResult<()> {
+    if edit
+        .primary_image_id
+        .is_some_and(|id| !card.images.iter().any(|image| image.image_id == id))
+    {
+        return Err("primary image must belong to this torrent card".into());
+    }
+    Ok(())
 }
 
 fn normalize_edit(mut edit: TorrentEdit) -> AppResult<TorrentEdit> {
@@ -671,6 +684,31 @@ mod tests {
             &serde_json::to_string(plan).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn legacy_move_journals_without_a_primary_image_are_recoverable() {
+        let (_root, db, service, plan) = fixture();
+        let mut payload = serde_json::to_value(&plan).unwrap();
+        payload["edit"]
+            .as_object_mut()
+            .unwrap()
+            .remove("primary_image_id");
+        db.begin_torrent_move(
+            plan.page_id,
+            plan.revision,
+            &serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+        service.recover().unwrap();
+        assert!(db.torrent_journals().unwrap().is_empty());
+        assert_eq!(
+            db.torrent_card(plan.page_id).unwrap().primary_image_id,
+            None
+        );
+        for file in plan.files {
+            assert!(service.base_dir.join(file.from).is_file());
+        }
     }
 
     #[test]

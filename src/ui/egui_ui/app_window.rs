@@ -71,10 +71,15 @@ struct SearchForm {
 }
 
 impl SearchForm {
+    fn site_filter(&self) -> Option<String> {
+        let key = self.site_key.trim();
+        (!key.is_empty()).then(|| key.to_owned())
+    }
+
     fn to_query(&self) -> SearchQuery {
         SearchQuery {
             text: self.text.trim().to_string(),
-            site_key: (!self.site_key.trim().is_empty()).then(|| self.site_key.trim().to_string()),
+            site_key: self.site_filter(),
             tags: split_filter_values(&self.tags),
             actors: split_filter_values(&self.actors),
             categories: split_filter_values(&self.categories),
@@ -259,6 +264,8 @@ pub struct AppWindow {
     /// Only the current database-backed group is retained in memory.
     date_browse_current: Option<DateGroup>,
     date_browse_total: usize,
+    /// Source captured by the latest date-group request.
+    date_browse_site_key: Option<String>,
     /// `true` = older first (ascending); `false` = newer first (descending, default).
     date_browse_asc: bool,
     /// When `true`, groups with ≥ `date_browse_fav_threshold` favorites are hidden.
@@ -359,6 +366,7 @@ impl AppWindow {
             date_browse_active: false,
             date_browse_current: None,
             date_browse_total: 0,
+            date_browse_site_key: None,
             date_browse_asc: false,
             date_browse_fav_enabled: true,
             date_browse_fav_threshold: 3,
@@ -2257,6 +2265,7 @@ impl AppWindow {
         ui.heading("Search");
 
         self.render_search_filters(ui);
+        self.sync_date_browse_site();
 
         // ── Recent pages row ──────────────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -2288,6 +2297,7 @@ impl AppWindow {
                 self.error = None;
                 self.recent_pages_active = true;
                 self.date_browse_active = false;
+                self.date_browse_loading = false;
                 self.search_seq += 1;
                 let seq = self.search_seq;
                 self.pending_command = Some(UiCommand::SearchRecentPages {
@@ -2321,6 +2331,7 @@ impl AppWindow {
                 self.error = None;
                 self.recent_pages_active = false;
                 self.date_browse_active = false;
+                self.date_browse_loading = false;
                 self.search_seq += 1;
                 let seq = self.search_seq;
                 self.pending_command = Some(UiCommand::Search {
@@ -2365,6 +2376,7 @@ impl AppWindow {
                 self.last_actor_query.clear();
                 self.last_category_query.clear();
                 self.last_studio_query.clear();
+                self.sync_date_browse_site();
             }
 
             // Toggle bulk-select mode.
@@ -2640,7 +2652,10 @@ impl AppWindow {
                             } else {
                                 self.pending_command = Some(UiCommand::Search {
                                     database_path: self.config.database_path.clone(),
-                                    query: self.search_form.to_query(),
+                                    query: match self.search_refresh() {
+                                        SearchRefresh::Query(query) => query,
+                                        SearchRefresh::RecentPages(_) => unreachable!(),
+                                    },
                                     seq: self.search_seq,
                                     cursor: Some(cursor),
                                     append: true,
@@ -4315,7 +4330,14 @@ impl EditKind {
 // ── Date-group browsing ───────────────────────────────────────────────────────
 
 impl AppWindow {
-    pub(super) fn apply_date_groups_loaded(&mut self, result: Result<DateGroupPage, String>) {
+    pub(super) fn apply_date_groups_loaded(
+        &mut self,
+        seq: u64,
+        result: Result<DateGroupPage, String>,
+    ) {
+        if seq != self.search_seq || !self.date_browse_active {
+            return;
+        }
         self.date_browse_loading = false;
         match result {
             Ok(page) => {
@@ -4346,6 +4368,7 @@ impl AppWindow {
             database_path: self.config.database_path.clone(),
             query: crate::models::SearchQuery {
                 page_id: Some(page_id),
+                site_key: self.search_form.site_filter(),
                 ..Default::default()
             },
             seq,
@@ -4365,16 +4388,28 @@ impl AppWindow {
     }
 
     fn request_date_group(&mut self, direction: DateBrowseDirection) {
+        self.date_browse_active = true;
+        self.recent_pages_active = false;
         self.date_browse_loading = true;
         let cursor = self
             .date_browse_current
             .as_ref()
+            .filter(|_| direction != DateBrowseDirection::Initial)
             .map(|group| DateGroupCursor {
                 scraped_at: group.scraped_at.clone(),
                 page_id: group.page_id,
             });
+        self.date_browse_current = None;
+        self.date_browse_total = 0;
+        self.date_browse_site_key = self.search_form.site_filter();
+        self.search_seq = self.search_seq.wrapping_add(1);
+        self.running = false;
+        self.error = None;
+        self.set_search_results(Vec::new());
         self.pending_command = Some(UiCommand::BrowseDateGroups {
             database_path: self.config.database_path.clone(),
+            site_key: self.date_browse_site_key.clone(),
+            seq: self.search_seq,
             cursor,
             direction,
             ascending: self.date_browse_asc,
@@ -4382,6 +4417,12 @@ impl AppWindow {
                 .date_browse_fav_enabled
                 .then_some(self.date_browse_fav_threshold as usize),
         });
+    }
+
+    fn sync_date_browse_site(&mut self) {
+        if self.date_browse_active && self.date_browse_site_key != self.search_form.site_filter() {
+            self.request_date_group(DateBrowseDirection::Initial);
+        }
     }
 
     /// Renders the date-browse controls row inside the Search tab.
@@ -4416,20 +4457,11 @@ impl AppWindow {
                 if self.date_browse_active {
                     self.date_browse_active = false;
                 } else {
-                    self.pending_command = Some(UiCommand::BrowseDateGroups {
-                        database_path: self.config.database_path.clone(),
-                        cursor: None,
-                        direction: DateBrowseDirection::Initial,
-                        ascending: self.date_browse_asc,
-                        max_favorites_exclusive: self
-                            .date_browse_fav_enabled
-                            .then_some(self.date_browse_fav_threshold as usize),
-                    });
-                    self.date_browse_loading = true;
+                    self.request_date_group(DateBrowseDirection::Initial);
                 }
             }
 
-            if loading {
+            if self.date_browse_loading {
                 ui.spinner();
                 return;
             }
@@ -4439,14 +4471,6 @@ impl AppWindow {
             }
 
             let count = self.date_browse_total;
-            if count == 0 {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 160, 0),
-                    "No groups match the current filter.",
-                );
-                return;
-            }
-
             ui.separator();
 
             // ── Sort direction ───────────────────────────────────────────────
@@ -4479,6 +4503,14 @@ impl AppWindow {
             if filter_changed || fav_resp.changed() {
                 self.date_browse_current = None;
                 self.request_date_group(DateBrowseDirection::Initial);
+            }
+
+            if count == 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 160, 0),
+                    "No groups match the current filter.",
+                );
+                return;
             }
 
             ui.separator();
@@ -4957,6 +4989,140 @@ mod tests {
             UiLog::default(),
             Arc::new(RwLock::new(LivePresets::default())),
         )
+    }
+
+    fn date_group(page_id: i64) -> DateGroup {
+        DateGroup {
+            page_id,
+            scraped_at: "2026-01-05 00:00:00".into(),
+            date_str: "2026-01-05".into(),
+            title: format!("Page {page_id}"),
+            image_count: 1,
+            fav_count: 0,
+        }
+    }
+
+    #[test]
+    fn date_browse_passes_selected_site_to_group_and_image_queries() {
+        let mut window = test_window();
+        window.search_form.site_key = "source-a".into();
+        window.request_date_group(DateBrowseDirection::Initial);
+        let seq = window.search_seq;
+        assert!(matches!(
+            window.take_command(),
+            Some(UiCommand::BrowseDateGroups {
+                site_key: Some(site), cursor: None, direction: DateBrowseDirection::Initial,
+                max_favorites_exclusive: Some(3), seq: request_seq, ..
+            }) if site == "source-a" && request_seq == seq
+        ));
+        window.apply_date_groups_loaded(
+            seq,
+            Ok(DateGroupPage {
+                group: Some(date_group(42)),
+                total: 2,
+            }),
+        );
+        match window.take_command().unwrap() {
+            UiCommand::Search { query, seq, .. } => {
+                assert_eq!(query.site_key.as_deref(), Some("source-a"));
+                assert_eq!(query.page_id, Some(42));
+                assert_eq!(seq, window.search_seq);
+            }
+            _ => panic!("expected images for the source-filtered date group"),
+        }
+        window.date_browse_next();
+        assert!(matches!(
+            window.take_command(),
+            Some(UiCommand::BrowseDateGroups {
+                site_key: Some(site), cursor: Some(cursor), direction: DateBrowseDirection::Next, ..
+            }) if site == "source-a" && cursor.page_id == 42
+        ));
+    }
+
+    #[test]
+    fn date_browse_site_changes_restart_navigation_and_ignore_stale_results() {
+        let mut window = test_window();
+        window.search_form.site_key = "source-a".into();
+        window.request_date_group(DateBrowseDirection::Initial);
+        let old_seq = window.search_seq;
+        window.take_command();
+        window.set_search_results(vec![search_result(1, Vec::new())]);
+        window.running = true;
+        window.search_form.site_key = "source-b".into();
+        let context = egui::Context::default();
+        let render = |window: &mut AppWindow| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| window.render_search_tab(ui, ctx));
+                },
+            );
+        };
+        render(&mut window);
+        let current_seq = window.search_seq;
+        assert_ne!(old_seq, current_seq);
+        assert!(window.date_browse_loading);
+        assert!(!window.running);
+        assert!(window.search_results.is_empty());
+        assert!(matches!(
+            window.take_command(),
+            Some(UiCommand::BrowseDateGroups { site_key: Some(site), cursor: None, seq, .. })
+                if site == "source-b" && seq == current_seq
+        ));
+        window.apply_date_groups_loaded(
+            old_seq,
+            Ok(DateGroupPage {
+                group: Some(date_group(1)),
+                total: 10,
+            }),
+        );
+        window.apply_date_groups_loaded(old_seq, Err("stale error".into()));
+        assert!(window.date_browse_loading);
+        assert!(window.date_browse_current.is_none());
+        assert!(window.error.is_none());
+        assert!(window.take_command().is_none());
+        window.apply_date_groups_loaded(
+            current_seq,
+            Ok(DateGroupPage {
+                group: Some(date_group(9)),
+                total: 1,
+            }),
+        );
+        assert!(matches!(
+            window.take_command(),
+            Some(UiCommand::Search { query, .. })
+                if query.site_key.as_deref() == Some("source-b") && query.page_id == Some(9)
+        ));
+        window.set_search_results(vec![search_result(9, Vec::new())]);
+        window.search_form = SearchForm::default();
+        render(&mut window);
+        let all_sites_seq = window.search_seq;
+        assert!(matches!(
+            window.take_command(),
+            Some(UiCommand::BrowseDateGroups { site_key: None, cursor: None, seq, .. })
+                if seq == all_sites_seq
+        ));
+        window.apply_date_groups_loaded(
+            all_sites_seq,
+            Ok(DateGroupPage {
+                group: None,
+                total: 0,
+            }),
+        );
+        assert!(!window.date_browse_loading);
+        assert!(!window.running);
+        assert!(window.date_browse_active);
+        assert!(window.date_browse_current.is_none());
+        assert_eq!(window.date_browse_total, 0);
+        assert!(window.search_results.is_empty());
+        assert!(window.selected_result.is_none());
+        assert!(window.take_command().is_none());
     }
 
     #[test]

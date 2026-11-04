@@ -367,12 +367,27 @@ impl TorrentLibraryUi {
         };
         ui.add(egui::Label::new(&card.title).wrap().selectable(true));
         ui.hyperlink_to("Open source page", &card.page_url);
-        if let Some(image) = card.images.first() {
+        let primary = self
+            .edit
+            .primary_image_id
+            .and_then(|id| card.images.iter().find(|image| image.image_id == id))
+            .or_else(|| card.images.first());
+        if let Some(image) = primary {
             self.preview(ui, config, image, egui::vec2(280.0, 200.0));
+            self.primary_image_checkbox(ui, image.image_id);
+            ui.weak("Choose one main image, then Review and save. With no selection, the first image is used.");
         }
         ui.horizontal_wrapped(|ui| {
-            for image in card.images.iter().skip(1) {
-                self.preview(ui, config, image, egui::vec2(70.0, 60.0));
+            for image in card
+                .images
+                .iter()
+                .filter(|image| Some(image.image_id) != primary.map(|image| image.image_id))
+            {
+                ui.vertical(|ui| {
+                    ui.set_max_width(110.0);
+                    self.preview(ui, config, image, egui::vec2(70.0, 60.0));
+                    self.primary_image_checkbox(ui, image.image_id);
+                });
             }
         });
         for kind in ["date", "year", "release_date", "duration", "actor"] {
@@ -511,6 +526,15 @@ impl TorrentLibraryUi {
                         &plan.edit.primary_studio
                     }
                 ));
+                let image_number = self.selected.as_ref().and_then(|card| {
+                    card.images
+                        .iter()
+                        .position(|image| Some(image.image_id) == plan.edit.primary_image_id)
+                });
+                ui.label(match image_number {
+                    Some(index) => format!("Main image: image {}", index + 1),
+                    None => "Main image: automatic (first image)".into(),
+                });
                 ui.label("From:");
                 ui.add(
                     egui::Label::new(
@@ -600,6 +624,19 @@ impl TorrentLibraryUi {
                 .insert(preview.key, texture, preview.estimated_bytes);
         }
     }
+
+    fn primary_image_checkbox(&mut self, ui: &mut egui::Ui, image_id: i64) {
+        ui.push_id(("primary_image", image_id), |ui| {
+            let mut selected = self.edit.primary_image_id == Some(image_id);
+            if ui.add_enabled(
+                !self.busy && self.plan.is_none(),
+                egui::Checkbox::new(&mut selected, "Main image"),
+            ).on_hover_text("Choose this image as the card preview. Save with Review and save; clear the choice to use the first image automatically.").changed() {
+                self.edit.primary_image_id = selected.then_some(image_id);
+            }
+        });
+    }
+
     fn preview(
         &mut self,
         ui: &mut egui::Ui,
@@ -649,6 +686,7 @@ impl TorrentLibraryUi {
             .open(&mut open)
             .show(ctx, |ui| {
                 self.preview(ui, config, &image, egui::vec2(800.0, 700.0));
+                self.primary_image_checkbox(ui, image.image_id);
             });
         if !open {
             self.image_popup = None;
@@ -814,6 +852,14 @@ mod tests {
             .find(|(text, _)| text == label)
             .unwrap_or_else(|| panic!("missing {label}"))
             .1;
+        click_at(editor, config, ctx, position);
+    }
+    fn click_at(
+        editor: &mut TorrentLibraryUi,
+        config: &AppConfig,
+        ctx: &egui::Context,
+        position: egui::Pos2,
+    ) {
         for pressed in [true, false] {
             render(
                 editor,
@@ -831,6 +877,24 @@ mod tests {
             );
         }
     }
+
+    fn click_main_image(
+        editor: &mut TorrentLibraryUi,
+        config: &AppConfig,
+        ctx: &egui::Context,
+        index: usize,
+    ) {
+        render(editor, config, ctx, vec![]);
+        let output = render(editor, config, ctx, vec![]);
+        let position = texts(&output)
+            .into_iter()
+            .filter(|(text, _)| text == "Main image")
+            .nth(index)
+            .expect("main image checkbox")
+            .1;
+        click_at(editor, config, ctx, position);
+    }
+
     fn finish(editor: &mut TorrentLibraryUi) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut changed = false;
@@ -866,6 +930,96 @@ mod tests {
         editor.inputs[2] = "My category".into();
         // Local draft changes never write to the database before confirmation.
         assert!(editor.selected.as_ref().unwrap().values("tag").is_empty());
+    }
+
+    #[test]
+    fn main_image_checkboxes_are_exclusive_and_save_only_after_confirmation() {
+        let (_root, config, db, mut editor, ctx) = fixture();
+        let card = editor.selected.clone().unwrap();
+        let page = ScrapedItem {
+            site_key: card.site_key.clone(),
+            page_url: card.page_url.clone(),
+            title: card.title.clone(),
+            raw_html: String::new(),
+            attributes: card.attributes.clone(),
+            images: (0..2)
+                .map(|index| crate::models::ScrapedImage {
+                    source_url: format!("https://example.test/image-{index}.png"),
+                    preview_url: None,
+                    alt_text: None,
+                    width: None,
+                    height: None,
+                    sort_order: index,
+                    local_file_path: None,
+                })
+                .collect(),
+        };
+        let persisted = db.upsert_scraped_item(&page).unwrap();
+        for (index, image) in page.images.iter().enumerate() {
+            let id = persisted.image_ids_by_url[&image.source_url];
+            let path = std::path::Path::new(card.directory.as_ref().unwrap())
+                .join(format!("images/{index}.png"));
+            let absolute = config.effective_download_dir().join(&path);
+            std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            image::DynamicImage::new_rgb8(2, 2).save(&absolute).unwrap();
+            db.update_image_artifacts(card.page_id, id, &path.to_string_lossy(), None)
+                .unwrap();
+            let key = format!("torrent:{id}:{}", path.to_string_lossy());
+            let texture = ctx.load_texture(
+                &key,
+                egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255; 16]),
+                Default::default(),
+            );
+            editor.textures.insert(key, texture, 16);
+        }
+        let card = db.torrent_card(card.page_id).unwrap();
+        let first = card.images[0].image_id;
+        let second = card.images[1].image_id;
+        editor.page = db.search_torrents(&TorrentQuery::default()).unwrap();
+        editor.select(card.clone());
+        click_main_image(&mut editor, &config, &ctx, 1);
+        assert_eq!(editor.edit.primary_image_id, Some(second));
+        assert_eq!(
+            db.torrent_card(card.page_id).unwrap().primary_image_id,
+            None
+        );
+        click_main_image(&mut editor, &config, &ctx, 1);
+        assert_eq!(editor.edit.primary_image_id, Some(first));
+        click_main_image(&mut editor, &config, &ctx, 0);
+        assert_eq!(editor.edit.primary_image_id, None);
+        click_main_image(&mut editor, &config, &ctx, 1);
+        assert_eq!(editor.edit.primary_image_id, Some(second));
+        click(&mut editor, &config, &ctx, "Review and save");
+        finish(&mut editor);
+        assert_eq!(
+            editor.plan.as_ref().unwrap().edit.primary_image_id,
+            Some(second)
+        );
+        assert!(editor.plan.as_ref().unwrap().files.is_empty());
+        click(&mut editor, &config, &ctx, "Cancel");
+        assert_eq!(
+            db.torrent_card(card.page_id).unwrap().primary_image_id,
+            None
+        );
+        assert_eq!(editor.edit.primary_image_id, Some(second));
+        click(&mut editor, &config, &ctx, "Review and save");
+        finish(&mut editor);
+        click(&mut editor, &config, &ctx, "Confirm and save");
+        assert!(finish(&mut editor));
+        assert_eq!(
+            db.torrent_card(card.page_id).unwrap().primary_image_id,
+            Some(second)
+        );
+        assert_eq!(
+            editor
+                .selected
+                .as_ref()
+                .unwrap()
+                .primary_image()
+                .unwrap()
+                .image_id,
+            second
+        );
     }
 
     #[test]

@@ -168,6 +168,14 @@ impl
                 .collect::<Vec<_>>(),
         )?;
 
+        super::attachments::save_description(
+            &page,
+            persisted.page_id,
+            &self.database,
+            &self.base_dir,
+        )
+        .await?;
+
         let requests =
             self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)?;
         self.execute_downloads(
@@ -231,11 +239,29 @@ impl
                 let image_id = image_ids_by_url.get(&image.source_url)?;
                 let mut request =
                     build_download_request(image, page, page_id, *image_id, &self.strategy);
-                if let Some(path) = existing.get(image_id).filter(|p| !p.is_empty()) {
+                let existing_path = existing.get(image_id).filter(|p| !p.is_empty());
+                if let Some(path) = existing_path {
                     request.relative_path = path.into();
                 } else if let Some(directory) = &directory {
                     let filename = request.relative_path.file_name()?.to_owned();
                     request.relative_path = directory.join("images").join(filename);
+                }
+                if existing_path.is_none()
+                    && image
+                        .preview_url
+                        .as_deref()
+                        .is_some_and(|preview| preview != image.source_url)
+                    && self.base_dir.join(&request.relative_path).exists()
+                {
+                    // A newly resolved original may share the preview's basename.
+                    // Give it a stable separate path instead of accepting old pixels.
+                    let mut name = request.relative_path.file_stem()?.to_os_string();
+                    name.push(format!("_{image_id}"));
+                    if let Some(extension) = request.relative_path.extension() {
+                        name.push(".");
+                        name.push(extension);
+                    }
+                    request.relative_path.set_file_name(name);
                 }
                 Some(request)
             })
