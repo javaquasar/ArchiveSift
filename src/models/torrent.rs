@@ -1,0 +1,84 @@
+use super::MetadataAttribute;
+
+#[derive(Clone, Debug, Default)]
+pub struct TorrentQuery {
+    pub text: String,
+    pub site_key: String,
+    pub studio: String,
+    pub tags: Vec<String>,
+    pub categories: Vec<String>,
+    pub year: String,
+    pub offset: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct TorrentImage {
+    pub image_id: i64,
+    pub source_url: String,
+    pub local_file_path: Option<String>,
+    pub thumbnail_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TorrentAttachment {
+    pub source_url: String,
+    pub filename: String,
+    pub local_file_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TorrentCard {
+    pub page_id: i64,
+    pub site_key: String,
+    pub page_url: String,
+    pub title: String,
+    pub primary_studio: String,
+    pub directory: Option<String>,
+    pub revision: i64,
+    pub attributes: Vec<MetadataAttribute>,
+    pub images: Vec<TorrentImage>,
+    pub attachments: Vec<TorrentAttachment>,
+}
+
+impl TorrentCard {
+    pub fn values(&self, kind: &str) -> Vec<String> {
+        self.attributes
+            .iter()
+            .filter(|a| a.kind == kind)
+            .map(|a| a.value.clone())
+            .collect()
+    }
+
+    pub fn content_title(&self) -> &str {
+        self.attributes
+            .iter()
+            .find(|a| a.kind == "content_title" && !a.value.trim().is_empty())
+            .map(|a| a.value.as_str())
+            .unwrap_or(&self.title)
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TorrentEdit {
+    pub primary_studio: String,
+    pub studios: Vec<String>,
+    pub tags: Vec<String>,
+    pub categories: Vec<String>,
+}
+
+impl From<&TorrentCard> for TorrentEdit {
+    fn from(card: &TorrentCard) -> Self {
+        Self {
+            primary_studio: card.primary_studio.clone(),
+            studios: card.values("studio"),
+            tags: card.values("tag"),
+            categories: card.values("category"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TorrentPage {
+    pub cards: Vec<TorrentCard>,
+    pub total: usize,
+}

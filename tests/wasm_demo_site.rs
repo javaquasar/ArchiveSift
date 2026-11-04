@@ -152,6 +152,11 @@ impl InstalledDemo {
         let package = plugin_root.join(&manifest.id);
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(package.join(&manifest.entry), module).unwrap();
+        std::fs::copy(
+            source.join("settings.schema.json"),
+            package.join("settings.schema.json"),
+        )
+        .unwrap();
         manifest.network_origins = vec![site.origin.clone()];
         manifest.allow_http = true;
         manifest.enabled = true;
@@ -191,6 +196,58 @@ impl InstalledDemo {
         );
         registry
     }
+}
+
+#[tokio::test]
+async fn declared_settings_reach_installed_wasm_and_the_download_pipeline() {
+    use serde_json::json;
+    let site = DemoSite::start("").await;
+    let installed = InstalledDemo::new(&site);
+    let registry = installed.registry();
+    let url = site.url(CONTENT_PATH);
+    let parser = registry.scraper_for_url(&url).unwrap();
+    let options = json!({"max_images":2,"include_description":false});
+    let page = parser
+        .scrape_content_configured(&url, Some(&options))
+        .await
+        .unwrap();
+    assert_eq!(page.images.len(), 2);
+    assert!(!page.attributes.iter().any(|a| a.kind == "description"));
+    let before = site.requested_paths().len();
+    assert!(parser
+        .scrape_content_configured(&url, Some(&json!({"max_images":0})))
+        .await
+        .is_err());
+    assert_eq!(site.requested_paths().len(), before);
+    let root = tempfile::tempdir().unwrap();
+    let mut config = AppConfig {
+        source_url: url,
+        database_path: root.path().join("library.sqlite3").display().to_string(),
+        download_folder: root.path().join("files").display().to_string(),
+        ..Default::default()
+    };
+    config.extension_settings.insert(
+        "demo.wasm".into(),
+        json!({"max_images":1,"include_description":false}),
+    );
+    let db = Database::new(&config.database_path);
+    let service = ContentDownloadService::new(
+        registry,
+        db.clone(),
+        FileDownloadStore::new(),
+        ConsoleUi::new(),
+        StructuredDirectoryStrategy,
+        config.effective_download_dir(),
+        root.path().join("thumbs"),
+    );
+    service.run(&config).await.unwrap();
+    let images = db.search_images(&SearchQuery::default()).unwrap();
+    assert_eq!(images.len(), 1);
+    assert!(config
+        .effective_download_dir()
+        .join(images[0].local_file_path.as_ref().unwrap())
+        .is_file());
+    assert!(!images[0].attributes.iter().any(|a| a.kind == "description"));
 }
 
 fn wasm_for_url<'a>(registry: &'a ScraperRegistry, url: &str) -> &'a dyn ContentScraper {

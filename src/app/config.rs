@@ -142,6 +142,8 @@ impl ScrapeLayoutConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extension_settings: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extension_accounts: BTreeMap<String, ExtensionAccount>,
     #[serde(default = "default_config_version")]
     pub config_version: u32,
@@ -207,6 +209,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             extension_accounts: BTreeMap::new(),
+            extension_settings: BTreeMap::new(),
             config_version: CURRENT_CONFIG_VERSION,
             source_url: String::new(),
             download_folder: String::new(),

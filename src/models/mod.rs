@@ -1,3 +1,6 @@
+mod torrent;
+pub use torrent::*;
+
 #[derive(Clone, Debug)]
 pub struct MetadataAttribute {
     pub kind: String,
@@ -200,7 +203,7 @@ impl SearchImageResult {
 
     /// Returns the best available "source" label: studio -> channel -> author -> None.
     pub fn display_source(&self) -> Option<&str> {
-        for kind in &["studio", "channel", "author"] {
+        for kind in &["primary_studio", "studio", "channel", "author"] {
             if let Some(attr) = self.attributes.iter().find(|a| a.kind == *kind) {
                 return Some(&attr.value);
             }

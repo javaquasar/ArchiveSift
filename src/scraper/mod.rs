@@ -17,6 +17,25 @@ pub use demo::DemoSiteScraper;
 /// to add support for a new site. The registry routes each URL to the first
 /// scraper whose [`supports_url`](ContentScraper::supports_url) returns `true`.
 pub trait ContentScraper: Send + Sync {
+    fn extension_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn scrape_content_configured<'a>(
+        &'a self,
+        url: &'a str,
+        _settings: Option<&'a serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = AppResult<ScrapedItem>> + Send + 'a>> {
+        self.scrape_content(url)
+    }
+
+    fn scrape_listing_configured<'a>(
+        &'a self,
+        url: &'a str,
+        _settings: Option<&'a serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = AppResult<ListingPage>> + Send + 'a>> {
+        self.scrape_listing(url)
+    }
     /// A short, stable identifier for the site this scraper handles.
     ///
     /// Used as the top-level directory name in the structured file layout

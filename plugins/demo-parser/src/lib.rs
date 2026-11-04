@@ -3,7 +3,35 @@ use archive_sift_scraper_api::*;
 use scraper::{Html, Selector};
 use url::Url;
 
-pub fn execute(input: Request) -> Result<Action, String> {
+pub fn execute(mut input: Request) -> Result<Action, String> {
+    let settings = archive_sift_scraper_api::settings_schema::unpack_settings(&mut input)?;
+    let mut action = execute_inner(input)?;
+    if let Action::Content(content) = &mut action {
+        let max = settings
+            .get("max_images")
+            .map(|v| {
+                v.as_u64()
+                    .filter(|n| (1..=5000).contains(n))
+                    .ok_or("invalid max_images")
+            })
+            .transpose()?
+            .unwrap_or(5000);
+        content.images.truncate(max as usize);
+        let include = settings
+            .get("include_description")
+            .map(|v| v.as_bool().ok_or("invalid include_description"))
+            .transpose()?
+            .unwrap_or(true);
+        if !include {
+            content
+                .attributes
+                .retain(|a| !matches!(a.kind.as_str(), "description" | "full_description"));
+        }
+    }
+    Ok(action)
+}
+
+fn execute_inner(input: Request) -> Result<Action, String> {
     if input.api_version != API_VERSION {
         return Err("unsupported scraper API version".into());
     }

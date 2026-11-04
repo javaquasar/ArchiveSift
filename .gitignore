@@ -1,6 +1,7 @@
 /target/
 /plugins-local/
 /data/
+.archive-sift-locks/
 /.idea/
 /.vscode/
 .env

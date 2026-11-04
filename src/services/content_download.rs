@@ -108,7 +108,12 @@ impl
             return Ok(vec![]);
         }
 
-        let listing = scraper.scrape_listing(source_url).await?;
+        let settings = scraper
+            .extension_id()
+            .and_then(|id| config.extension_settings.get(id));
+        let listing = scraper
+            .scrape_listing_configured(source_url, settings)
+            .await?;
         for diagnostic in &listing.diagnostics {
             let message = format!("[{}] {}", diagnostic.code, diagnostic.message);
             match diagnostic.level {
@@ -128,7 +133,26 @@ impl
         config: &AppConfig,
         source_url: &str,
     ) -> AppResult<Vec<String>> {
-        let mut page = scraper.scrape_content(source_url).await?;
+        let settings = scraper
+            .extension_id()
+            .and_then(|id| config.extension_settings.get(id));
+        let mut page = scraper
+            .scrape_content_configured(source_url, settings)
+            .await?;
+        let content_lock = self.database.content_lock(&page.page_url);
+        let _guard = content_lock.lock_owned().await;
+        let recovery_database = self.database.clone();
+        let recovery_root = self.base_dir.clone();
+        let recovery_url = page.page_url.clone();
+        let _lease = tokio::task::spawn_blocking(move || -> AppResult<std::fs::File> {
+            let lease = recovery_database
+                .try_content_lease(&recovery_url)?
+                .ok_or("this page is being updated by another application instance")?;
+            super::torrent_library::TorrentLibrary::new(recovery_database, recovery_root)
+                .recover_page_locked(&recovery_url)?;
+            Ok(lease)
+        })
+        .await??;
         self.log_content_discovery(&page);
 
         let persisted = self.database.upsert_scraped_item(&page)?;
@@ -145,7 +169,7 @@ impl
         )?;
 
         let requests =
-            self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url);
+            self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)?;
         self.execute_downloads(
             requests,
             config.effective_concurrent_image_downloads(),
@@ -193,20 +217,29 @@ impl
         page: &ScrapedItem,
         page_id: i64,
         image_ids_by_url: &std::collections::HashMap<String, i64>,
-    ) -> Vec<DownloadRequest> {
-        page.images
+    ) -> AppResult<Vec<DownloadRequest>> {
+        let directory = self.database.torrent_directory(page_id)?;
+        let existing = self
+            .database
+            .get_page_images_with_paths(page_id)?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        Ok(page
+            .images
             .iter()
             .filter_map(|image| {
                 let image_id = image_ids_by_url.get(&image.source_url)?;
-                Some(build_download_request(
-                    image,
-                    page,
-                    page_id,
-                    *image_id,
-                    &self.strategy,
-                ))
+                let mut request =
+                    build_download_request(image, page, page_id, *image_id, &self.strategy);
+                if let Some(path) = existing.get(image_id).filter(|p| !p.is_empty()) {
+                    request.relative_path = path.into();
+                } else if let Some(directory) = &directory {
+                    let filename = request.relative_path.file_name()?.to_owned();
+                    request.relative_path = directory.join("images").join(filename);
+                }
+                Some(request)
             })
-            .collect()
+            .collect())
     }
 
     async fn execute_downloads(
@@ -523,9 +556,12 @@ mod tests {
 
     #[test]
     fn build_download_requests_skips_images_without_persisted_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::new(root.path().join("archive.sqlite3"));
+        database.initialize().unwrap();
         let service = ContentDownloadService::new(
             ScraperRegistry::with_public_scrapers(),
-            Database::new(std::env::temp_dir().join("content_download_request_skip.db")),
+            database,
             FileDownloadStore::new(),
             ConsoleUi::new(),
             StructuredDirectoryStrategy,
@@ -548,7 +584,9 @@ mod tests {
             41,
         )]);
 
-        let requests = service.build_download_requests(&page, 11, &image_ids_by_url);
+        let requests = service
+            .build_download_requests(&page, 11, &image_ids_by_url)
+            .unwrap();
 
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].page_id, 11);

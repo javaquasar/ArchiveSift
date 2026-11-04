@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 mod json_budget;
+pub mod settings_schema;
 mod wit_conversion;
 
 pub use json_budget::{check_json_size, to_json_bounded};

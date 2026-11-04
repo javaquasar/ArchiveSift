@@ -149,8 +149,12 @@ pub struct AppWindow {
 
     active_tab: Tab,
     storage_settings: StorageSettingsEditor,
+    settings_json_mode: bool,
+    raw_settings: Option<super::raw_settings::RawSettingsEditor>,
     account_settings: Option<AccountSettingsEditor>,
     search_form: SearchForm,
+    torrent_mode: bool,
+    torrent_library: super::torrent_library::TorrentLibraryUi,
     /// Immutable snapshot shared with the render closures. Replacing the
     /// snapshot after a search is cheap, and rendering does not deep-clone
     /// every result (including all metadata attributes) on every frame.
@@ -285,8 +289,12 @@ impl AppWindow {
             search_seq: 0,
             active_tab: Tab::Scrape,
             storage_settings,
+            settings_json_mode: false,
+            raw_settings: None,
             account_settings: None,
             search_form: SearchForm::default(),
+            torrent_mode: false,
+            torrent_library: Default::default(),
             search_results: Arc::new(Vec::new()),
             search_next_cursor: None,
             hydrated_image_ids: HashSet::new(),
@@ -598,19 +606,36 @@ impl AppWindow {
     }
 
     pub fn render(&mut self, ctx: &egui::Context) {
+        if self.torrent_library.poll() {
+            self.torrent_card_saved();
+        }
+        if let Some(error) = self.torrent_library.startup_error.take() {
+            self.log
+                .push(format!("Torrent operation recovery failed: {error}"));
+            self.error = Some(format!("Torrent operation recovery failed: {error}"));
+        }
         self.install_ready_previews(ctx);
 
         let previous_tab = self.active_tab;
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut self.active_tab, Tab::Scrape, "Scrape");
-                    ui.selectable_value(&mut self.active_tab, Tab::Search, "Search");
-                    ui.selectable_value(&mut self.active_tab, Tab::SqlQuery, "SQL");
-                    ui.selectable_value(&mut self.active_tab, Tab::Extensions, "Extensions");
-                    ui.selectable_value(&mut self.active_tab, Tab::Settings, "Settings");
+            if self.torrent_library.busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Library operation in progress…");
                 });
-            });
+            }
+            ui.add_enabled_ui(
+                !self.storage_settings.applying && !self.torrent_library.busy,
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(&mut self.active_tab, Tab::Scrape, "Scrape");
+                        ui.selectable_value(&mut self.active_tab, Tab::Search, "Search");
+                        ui.selectable_value(&mut self.active_tab, Tab::SqlQuery, "SQL");
+                        ui.selectable_value(&mut self.active_tab, Tab::Extensions, "Extensions");
+                        ui.selectable_value(&mut self.active_tab, Tab::Settings, "Settings");
+                    });
+                },
+            );
         });
         if self.active_tab == Tab::Settings && previous_tab != Tab::Settings {
             self.storage_settings = StorageSettingsEditor::new(&self.config);
@@ -624,7 +649,30 @@ impl AppWindow {
                     Tab::SqlQuery => self.render_sql_tab(ui),
                     Tab::Extensions => self.render_extensions_tab(ui),
                     Tab::Settings => {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.settings_json_mode, false, "Form");
+                            ui.selectable_value(&mut self.settings_json_mode, true, "JSON");
+                        });
                         let busy = self.storage_settings_busy();
+                        if self.settings_json_mode {
+                            let editor = self.raw_settings.get_or_insert_with(|| {
+                                super::raw_settings::RawSettingsEditor::installed(&self.config)
+                            });
+                            ui.heading("Settings · JSON");
+                            egui::ScrollArea::vertical()
+                                .id_salt("raw_settings_scroll")
+                                .show(ui, |ui| {
+                                    if let Some(command) = editor.render(
+                                        ui,
+                                        &self.config,
+                                        busy,
+                                        self.storage_settings.applying,
+                                    ) {
+                                        self.pending_command = Some(command);
+                                    }
+                                });
+                            return;
+                        }
                         let editor = self
                             .account_settings
                             .get_or_insert_with(|| AccountSettingsEditor::installed(&self.config));
@@ -657,6 +705,8 @@ impl AppWindow {
 
     pub(super) fn storage_settings_busy(&self) -> bool {
         self.running
+            || self.torrent_library.busy
+            || self.raw_settings.as_ref().is_some_and(|e| e.busy())
             || self.queue_worker_running
             || self.import_running
             || self.sql_running
@@ -667,6 +717,19 @@ impl AppWindow {
                 .account_settings
                 .as_ref()
                 .is_some_and(|editor| editor.busy())
+    }
+
+    pub(super) fn recover_torrent_operations(&mut self, ctx: &egui::Context) {
+        self.torrent_library.recover_on_start(ctx, &self.config);
+    }
+
+    fn torrent_card_saved(&mut self) {
+        // Results computed before a transfer must not restore obsolete file paths.
+        self.search_seq = self.search_seq.wrapping_add(1);
+        self.running = false;
+        self.set_search_results(Vec::new());
+        self.log
+            .push("Torrent card updated; local file paths refreshed.");
     }
 
     pub(super) fn storage_settings_applying(&self) -> bool {
@@ -704,6 +767,9 @@ impl AppWindow {
 
     pub(super) fn storage_settings_failed(&mut self, error: String) {
         self.storage_settings.applying = false;
+        if let Some(editor) = &mut self.raw_settings {
+            editor.status = Some(error.clone());
+        }
         self.storage_settings.status = Some(Err(error));
     }
 
@@ -714,9 +780,21 @@ impl AppWindow {
 
     pub(super) fn apply_storage_config(&mut self, config: AppConfig) {
         let mut replacement = Self::new(config, self.log.clone(), Arc::clone(&self.live_presets));
+        replacement.settings_json_mode = self.settings_json_mode;
+        if self.settings_json_mode {
+            let mut editor = super::raw_settings::RawSettingsEditor::installed(&replacement.config);
+            editor.status = Some("Full configuration saved and applied.".into());
+            replacement.raw_settings = Some(editor);
+        }
         replacement.sql_query = std::mem::take(&mut self.sql_query);
         replacement.storage_settings_saved();
         *self = replacement;
+    }
+
+    pub(super) fn setting_secret_finished(&mut self, target: &str, result: Result<(), String>) {
+        if let Some(editor) = &mut self.raw_settings {
+            editor.secret_finished(target, result);
+        }
     }
 
     fn render_extensions_tab(&mut self, ui: &mut egui::Ui) {
@@ -2149,6 +2227,22 @@ impl AppWindow {
     }
 
     fn render_search_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let was_torrent_mode = self.torrent_mode;
+        ui.add_enabled_ui(!self.torrent_library.busy && !self.running, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.torrent_mode, false, "Images");
+                ui.selectable_value(&mut self.torrent_mode, true, "Torrents");
+            });
+        });
+        if self.torrent_mode && !was_torrent_mode {
+            self.viewer_open = None;
+            self.delete_confirm = None;
+            self.viewer_delete_confirm = None;
+        }
+        if self.torrent_mode {
+            self.torrent_library.render(ui, &self.config);
+            return;
+        }
         // ── Keyboard shortcuts for date-group navigation ──────────────────────
         if self.date_browse_active && !self.date_browse_loading {
             let go_next = ctx.input(|i| i.key_pressed(egui::Key::PageDown));
@@ -2671,7 +2765,8 @@ impl AppWindow {
                                 .as_deref()
                                 .and_then(primary_actor_from_path);
 
-                            let has_local_file = result.local_file_path.is_some();
+                            let has_local_file = result.local_file_path.is_some()
+                                && !result.attributes.iter().any(|a| matches!(a.kind.as_str(), "attachment" | "magnet" | "primary_studio"));
 
                             for attribute in result.attributes.iter() {
                                 if matches!(attribute.kind.as_str(), "date" | "description" | "full_description" | "studio_code" | "duration" | "director") {
@@ -4735,6 +4830,9 @@ fn attr_add_cmd(
 /// Extracts the actor folder name (path component index 1) from a stored relative path.
 /// Path structure: `{site}/{actor}/{content}/{filename}`
 fn primary_actor_from_path(local_file_path: &str) -> Option<String> {
+    if local_file_path.split(['/', '\\']).next() == Some("torrents") {
+        return None;
+    }
     std::path::Path::new(local_file_path)
         .components()
         .nth(1)
@@ -5145,6 +5243,34 @@ mod tests {
         let expected = Path::new("downloads").join("gallery");
 
         assert_eq!(containing_folder(&image), expected.as_path());
+    }
+
+    #[test]
+    fn torrent_paths_do_not_expose_a_primary_actor_folder() {
+        for path in [
+            "torrents/source/studio/card/images/file.png",
+            "torrents\\source\\studio\\card\\images\\file.png",
+        ] {
+            assert!(primary_actor_from_path(path).is_none());
+        }
+        assert_eq!(
+            primary_actor_from_path("source/actor/card/image.png").as_deref(),
+            Some("actor")
+        );
+    }
+
+    #[test]
+    fn torrent_updates_invalidate_inflight_image_queries_and_obsolete_paths() {
+        let mut window = test_window();
+        window.set_search_results(vec![search_result(1, Vec::new())]);
+        window.viewer_open = Some(0);
+        window.search_seq = 7;
+        window.running = true;
+        window.torrent_card_saved();
+        assert_eq!(window.search_seq, 8);
+        assert!(!window.running);
+        assert!(window.search_results.is_empty());
+        assert!(window.viewer_open.is_none());
     }
 
     #[test]
@@ -5908,7 +6034,7 @@ fn image_texture_cache_key(
     )
 }
 
-fn open_in_explorer(path: &std::path::Path) {
+pub(super) fn open_in_explorer(path: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         // CommandExt::raw_arg is required so Rust does NOT wrap the argument in
@@ -5953,8 +6079,10 @@ fn containing_folder(path: &Path) -> &Path {
 }
 
 fn open_containing_folder(path: &Path) {
-    let folder = containing_folder(path);
+    open_folder(containing_folder(path));
+}
 
+pub(super) fn open_folder(folder: &Path) {
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("explorer.exe")

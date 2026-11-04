@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Demo parser settings",
+  "type": "object",
+  "x-archivesift-delivery": "state-v1",
+  "additionalProperties": false,
+  "properties": {
+    "max_images": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 5000, "description": "Maximum images collected from one content page."},
+    "include_description": {"type": "boolean", "default": true, "description": "Keep description metadata in downloaded cards."}
+  },
+  "required": ["max_images", "include_description"]
+}

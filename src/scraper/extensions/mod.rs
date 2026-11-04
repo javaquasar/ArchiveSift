@@ -5,6 +5,7 @@ mod compilation_cache;
 mod credentials;
 pub mod manifest;
 mod process;
+pub mod settings;
 mod wasm;
 
 use std::future::Future;
@@ -47,6 +48,7 @@ pub struct ExtensionScraper {
     manifest: PluginManifest,
     backend: Backend,
     broker: HttpBroker,
+    settings: settings::PluginSettings,
 }
 
 enum Output {
@@ -65,6 +67,7 @@ impl ExtensionScraper {
         if !manifest.enabled {
             return Err("extension is disabled".into());
         }
+        let settings = settings::PluginSettings::from_directory(directory, &manifest)?;
         let backend = match manifest.runtime {
             RuntimeKind::Wasm => {
                 let (_, bytes) = manifest.verified_entry(directory)?;
@@ -86,6 +89,7 @@ impl ExtensionScraper {
             manifest,
             backend,
             broker,
+            settings,
         })
     }
 
@@ -94,6 +98,17 @@ impl ExtensionScraper {
     }
 
     async fn run(&self, operation: Operation, url: &str) -> AppResult<Output> {
+        self.run_configured(operation, url, None).await
+    }
+
+    async fn run_configured(
+        &self,
+        operation: Operation,
+        url: &str,
+        values: Option<&serde_json::Value>,
+    ) -> AppResult<Output> {
+        let values = self.settings.effective(values)?;
+        let values = self.settings.guest_settings(&values);
         let expected = match operation {
             Operation::Content => PageKind::Content,
             Operation::Listing => PageKind::Listing,
@@ -103,13 +118,18 @@ impl ExtensionScraper {
         }
         tokio::time::timeout(
             Duration::from_millis(self.manifest.limits.timeout_ms),
-            self.run_steps(operation, url),
+            self.run_steps(operation, url, &values),
         )
         .await
         .map_err(|_| "extension execution timed out")?
     }
 
-    async fn run_steps(&self, operation: Operation, url: &str) -> AppResult<Output> {
+    async fn run_steps(
+        &self,
+        operation: Operation,
+        url: &str,
+        settings: &serde_json::Value,
+    ) -> AppResult<Output> {
         let mut process = match &self.backend {
             Backend::Process(process) => {
                 Some(ProcessSession::spawn(&self.manifest, &process.directory).await?)
@@ -121,7 +141,7 @@ impl ExtensionScraper {
             operation: operation.clone(),
             url: url.to_string(),
             response: None,
-            state: None,
+            state: self.configured_state(settings, None)?,
         };
         let mut raw_html = String::new();
         let mut total_response_bytes = 0;
@@ -156,7 +176,7 @@ impl ExtensionScraper {
                         operation: operation.clone(),
                         url: url.to_string(),
                         response: Some(response),
-                        state: request.state,
+                        state: self.configured_state(settings, request.state)?,
                     };
                 }
                 Action::Content(content) if operation == Operation::Content => {
@@ -171,6 +191,20 @@ impl ExtensionScraper {
             }
         }
         Err("extension exceeded its step budget".into())
+    }
+
+    fn configured_state(
+        &self,
+        settings: &serde_json::Value,
+        state: Option<String>,
+    ) -> AppResult<Option<String>> {
+        if self.settings.schema.value()["x-archivesift-delivery"] == "state-v1" {
+            Ok(Some(
+                archive_sift_scraper_api::settings_schema::settings_state(settings, state)?,
+            ))
+        } else {
+            Ok(state)
+        }
     }
 
     fn resolve_url(&self, base: &str, value: &str) -> AppResult<String> {
@@ -311,6 +345,39 @@ fn resolve_reference_url(base: &str, value: &str) -> AppResult<String> {
 }
 
 impl ContentScraper for ExtensionScraper {
+    fn extension_id(&self) -> Option<&str> {
+        Some(&self.manifest.id)
+    }
+    fn scrape_content_configured<'a>(
+        &'a self,
+        url: &'a str,
+        settings: Option<&'a serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = AppResult<ScrapedItem>> + Send + 'a>> {
+        Box::pin(async move {
+            match self
+                .run_configured(Operation::Content, url, settings)
+                .await?
+            {
+                Output::Content(content) => Ok(content),
+                _ => unreachable!(),
+            }
+        })
+    }
+    fn scrape_listing_configured<'a>(
+        &'a self,
+        url: &'a str,
+        settings: Option<&'a serde_json::Value>,
+    ) -> Pin<Box<dyn Future<Output = AppResult<ListingPage>> + Send + 'a>> {
+        Box::pin(async move {
+            match self
+                .run_configured(Operation::Listing, url, settings)
+                .await?
+            {
+                Output::Listing(listing) => Ok(listing),
+                _ => unreachable!(),
+            }
+        })
+    }
     fn site_key(&self) -> &str {
         &self.manifest.source_key
     }

@@ -2,6 +2,7 @@
 name = "archive-sift"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.89"
 description = "A desktop content collector, downloader, and searchable local archive"
 publish = false
 default-run = "archive-sift"

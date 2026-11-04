@@ -529,3 +529,17 @@ grids and native window bars is presentation only; storage retains full values.
 Installed packages may provide an additive `account.json` for host-managed form
 sign-in through Settings. See [Extension accounts](EXTENSION_ACCOUNTS.md) for the
 profile contract, sequence diagram, secure storage and verification behavior.
+
+## Torrent library
+
+The host owns studio folder organization, manual metadata overrides and recoverable
+file transfers. Extensions emit ordinary `studio`, `date`, `tag`, `category`,
+`attachment` and `magnet` attributes without filesystem access. See
+[Torrent library](TORRENT_LIBRARY.md) for the storage contract and transfer sequence.
+
+## Declarative plugin settings
+
+Packages can declare `settings.schema.json` for full-document completion, validation
+and per-operation options. The opt-in state envelope preserves WIT 1.0 and both
+runtime types. See [Configuration editor](CONFIGURATION_EDITOR.md) for the schema
+contract, credential separation, UML and tests.

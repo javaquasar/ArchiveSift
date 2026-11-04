@@ -8,6 +8,24 @@ permissions:
   contents: read
 
 jobs:
+  torrent-library-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native UI build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Torrent library integration tests on Linux
+        run: cargo test --locked --test torrent_library
+      - name: Recovery, path validation and headless card editor tests
+        run: cargo test --locked --lib torrent
+      - name: Configuration validation and completion integration tests
+        run: cargo test --locked --test configuration
+      - name: Headless JSON editor and full configuration apply tests
+        run: cargo test --locked --lib configuration
+      - run: cargo test --locked --lib raw_settings
+
   test:
     runs-on: windows-latest
     steps:

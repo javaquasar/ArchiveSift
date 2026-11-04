@@ -48,6 +48,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "network_origins": [origin.origin().ascii_serialization()], "allow_http": origin.scheme() == "http"
         })
     };
+    let schema = if args.len() == 5 {
+        let path = std::path::Path::new(&args[4])
+            .parent()
+            .ok_or("template has no directory")?
+            .join("settings.schema.json");
+        if path.is_file() {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(archive_sift_scraper_api::settings_schema::MAX_SCHEMA_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > archive_sift_scraper_api::settings_schema::MAX_SCHEMA_BYTES {
+                return Err("settings schema exceeds 64 KiB".into());
+            }
+            Some(bytes)
+        } else {
+            None
+        }
+    } else {
+        Some(include_bytes!("../../../plugins/demo-parser/settings.schema.json").to_vec())
+    };
+    if let Some(bytes) = &schema {
+        let compiled = archive_sift_scraper_api::settings_schema::SettingsSchema::compile(
+            serde_json::from_slice(bytes)?,
+        )?;
+        compiled.validate_plugin_identity(manifest["id"].as_str().ok_or("missing plugin ID")?)?;
+    }
     std::fs::create_dir_all(&directory)?;
     std::fs::write(directory.join(entry), &bytes)?;
     #[cfg(unix)]
@@ -62,6 +89,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         directory.join("plugin.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
+    let schema_path = directory.join("settings.schema.json");
+    if let Some(bytes) = schema {
+        std::fs::write(schema_path, bytes)?;
+    } else if schema_path.exists() {
+        std::fs::remove_file(schema_path)?;
+    }
     println!(
         "Created disabled extension package: {}",
         directory.display()

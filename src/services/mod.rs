@@ -10,3 +10,6 @@ pub use search::SearchService;
 pub use settings::{SettingsService, StorageSettings};
 pub(crate) use thumbnail::ThumbnailService;
 pub use url_queue::UrlQueueService;
+pub mod config_completion;
+pub mod configuration;
+pub mod torrent_library;

@@ -286,8 +286,10 @@ dependencies = [
 name = "archive-sift-plugin-packager"
 version = "0.1.0"
 dependencies = [
+ "archive-sift-scraper-api",
  "serde_json",
  "sha2",
+ "tempfile",
  "url",
  "wit-component",
 ]
@@ -298,6 +300,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

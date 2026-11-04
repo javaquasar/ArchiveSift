@@ -1,3 +1,5 @@
+mod torrents;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -236,6 +238,7 @@ pub struct Database {
 }
 
 struct DatabaseRuntime {
+    content_locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     path: PathBuf,
     readers: Arc<ReadConnectionPool>,
     writer: Mutex<Option<Connection>>,
@@ -505,6 +508,7 @@ impl Database {
                     runtimes.remove(&inactive_path);
                 }
                 let runtime = Arc::new(DatabaseRuntime {
+                    content_locks: Mutex::new(HashMap::new()),
                     path: path.clone(),
                     readers: Arc::new(ReadConnectionPool::new(path.clone(), READ_POOL_SIZE)),
                     writer: Mutex::new(None),
@@ -514,6 +518,51 @@ impl Database {
             }
         };
         Self { path, runtime }
+    }
+
+    pub(crate) fn content_lock(&self, url: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .runtime
+            .content_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(url).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(url.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    /// OS locks disappear on process exit; a second instance must never recover
+    /// a journal while the process owning that operation is still writing files.
+    pub(crate) fn try_content_lease(&self, url: &str) -> AppResult<Option<std::fs::File>> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(url.as_bytes()));
+        let database = format!(
+            "{:x}",
+            Sha256::digest(self.path.to_string_lossy().as_bytes())
+        );
+        let folder = self
+            .path
+            .parent()
+            .ok_or("database has no parent folder")?
+            .join(".archive-sift-locks")
+            .join(&database[..12])
+            .join(&hash[..2]);
+        fs::create_dir_all(&folder)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(folder.join(format!("{hash}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
     }
 
     fn connect(&self) -> AppResult<PooledReadConnection> {
@@ -827,6 +876,7 @@ impl Database {
                 })?;
         }
 
+        torrents::initialize(&mut connection)?;
         let _ = connection.execute_batch("PRAGMA optimize;");
 
         initialized.insert(identity);
@@ -921,6 +971,7 @@ impl Database {
             }
         }
 
+        torrents::after_scrape(&transaction, page, page_id)?;
         refresh_page_search_index(&transaction, page_id)?;
         refresh_page_counters(&transaction, page_id)?;
 

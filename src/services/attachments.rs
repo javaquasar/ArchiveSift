@@ -197,6 +197,23 @@ fn relative_path(page: &ScrapedItem, page_id: i64, source: &str, name: &str) -> 
         .join(format!("{:.12}_{}", format!("{hash:x}"), clean(name)))
 }
 
+fn stored_relative_path(
+    database: &Database,
+    page: &ScrapedItem,
+    page_id: i64,
+    source: &str,
+    name: &str,
+) -> AppResult<PathBuf> {
+    if let Some(path) = database.attachment_path(page_id, source)? {
+        return Ok(path);
+    }
+    let old = relative_path(page, page_id, source, name);
+    Ok(match database.torrent_directory(page_id)? {
+        Some(directory) => directory.join(old.file_name().ok_or("attachment has no filename")?),
+        None => old,
+    })
+}
+
 pub(crate) async fn download(
     page: &ScrapedItem,
     page_id: i64,
@@ -220,7 +237,7 @@ pub(crate) async fn download(
                 .source_url
                 .as_deref()
                 .ok_or("attachment has no download URL")?;
-            let relative = relative_path(page, page_id, url, &attribute.label);
+            let relative = stored_relative_path(database, page, page_id, url, &attribute.label)?;
             let path = base_dir.join(&relative);
             let data = if path.is_file() {
                 if std::fs::metadata(&path)?.len() > 8 * 1024 * 1024 {
@@ -275,7 +292,7 @@ async fn save_magnet(
     if !valid_magnet(magnet) {
         return Err("invalid magnet reference".into());
     }
-    let relative = relative_path(page, page_id, magnet, "download.magnet.txt");
+    let relative = stored_relative_path(database, page, page_id, magnet, "download.magnet.txt")?;
     store
         .write_bytes(
             &base_dir.join(&relative).to_string_lossy(),

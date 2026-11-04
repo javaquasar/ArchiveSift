@@ -78,6 +78,15 @@ python scripts/test_extensions.py
 cargo run
 ```
 
+Torrent pages are available in **Search → Torrents**, including cards without
+images. Select a primary studio, edit tags/categories and confirm file moves in
+the card editor. See [Torrent library](docs/TORRENT_LIBRARY.md) for storage layout,
+migration, recovery and test details.
+
+**Settings → JSON** edits the full configuration with schema-based completion and
+validation. Plugins declare their options in `settings.schema.json`; credentials
+stay in the system password store. See [Configuration editor](docs/CONFIGURATION_EDITOR.md).
+
 ## Adding a scraper
 
 Use the versioned `archive-sift-scraper-api` contract and the public example in

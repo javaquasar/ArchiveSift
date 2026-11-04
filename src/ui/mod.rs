@@ -219,6 +219,15 @@ pub enum SearchRefresh {
 /// Commands emitted by the UI and consumed by the app orchestration layer.
 #[derive(Clone, Debug)]
 pub enum UiCommand {
+    ApplyConfiguration {
+        document: serde_json::Value,
+        expected: serde_json::Value,
+    },
+    ReloadConfiguration,
+    StoreSettingSecret {
+        target: String,
+        value: crate::secure_store::Secret,
+    },
     Account(crate::scraper::extensions::accounts::AccountCommand),
     QueueUrl(AppConfig),
     ImportFile {

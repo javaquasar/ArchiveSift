@@ -90,6 +90,11 @@ impl SettingsService {
         Database::new(&config.database_path).initialize()?;
         if config.has_download_folder() {
             std::fs::create_dir_all(&config.download_folder)?;
+            super::torrent_library::TorrentLibrary::new(
+                Database::new(&config.database_path),
+                config.effective_download_dir(),
+            )
+            .recover()?;
         }
         std::fs::create_dir_all(config.thumb_dir())?;
         config.save_to(config_path)?;

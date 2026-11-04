@@ -4,8 +4,10 @@ mod background_executor;
 mod coalescing_worker;
 mod icon;
 mod preview_loader;
+mod raw_settings;
 mod storage_settings;
 mod texture_cache;
+mod torrent_library;
 
 pub use app_window::AppWindow;
 
@@ -229,9 +231,11 @@ impl DesktopApp {
         let clipboard_rx = config
             .clipboard_listener_enabled
             .then(|| clipboard_event_channel(&repaint_context));
+        let recover =
+            config.has_download_folder() && std::path::Path::new(&config.database_path).is_file();
         let window = AppWindow::new(config, UiLog::default(), Arc::clone(&live_presets));
 
-        let app = Self {
+        let mut app = Self {
             window,
             queue_service,
             worker_running: false,
@@ -248,6 +252,10 @@ impl DesktopApp {
         // entries that were fully persisted before a previous unclean exit.
         let db = Database::new(&app.window.config.database_path);
         let _ = app.queue_service.prune_processed(&db);
+
+        if recover {
+            app.window.recover_torrent_operations(&app.repaint_context);
+        }
 
         app
     }
@@ -353,6 +361,16 @@ impl DesktopApp {
     fn finish_storage_settings(&mut self, result: Result<AppConfig, String>) {
         match result {
             Ok(config) => {
+                if let Ok(mut presets) = self.live_presets.write() {
+                    presets.tags = config.preset_tags.clone();
+                    presets.categories = config.preset_categories.clone();
+                }
+                if config.clipboard_listener_enabled && self.clipboard_rx.is_none() {
+                    self.clipboard_rx = Some(clipboard_event_channel(&self.repaint_context));
+                }
+                if !config.clipboard_listener_enabled {
+                    self.clipboard_rx = None;
+                }
                 if let Some(cancellation) = self.search_cancellation.take() {
                     cancellation.cancel();
                 }
@@ -395,6 +413,72 @@ impl DesktopApp {
             "Clipboard listener enabled."
         } else {
             "Clipboard listener disabled."
+        });
+    }
+
+    fn start_full_configuration(
+        &mut self,
+        document: Option<(serde_json::Value, serde_json::Value)>,
+        config_path: PathBuf,
+    ) {
+        self.start_configuration_job(
+            document,
+            config_path,
+            crate::scraper::extensions::settings::SettingsCatalog::installed,
+        );
+    }
+
+    fn start_configuration_job(
+        &mut self,
+        document: Option<(serde_json::Value, serde_json::Value)>,
+        config_path: PathBuf,
+        load_catalog: impl FnOnce() -> crate::scraper::extensions::settings::SettingsCatalog
+            + Send
+            + 'static,
+    ) {
+        if self.window.storage_settings_applying() {
+            return;
+        }
+        if self.worker_running || self.window.storage_settings_busy() {
+            self.window.storage_settings_failed(
+                "Wait for active operations to finish before applying configuration.".into(),
+            );
+            return;
+        }
+        if document.as_ref().is_some_and(|(_, expected)| {
+            serde_json::to_value(&self.window.config).ok().as_ref() != Some(expected)
+        }) {
+            self.window.storage_settings_failed(
+                "Settings changed while the document was open. Reload before saving.".into(),
+            );
+            return;
+        }
+        self.window.begin_storage_settings();
+        let current = self.window.config.clone();
+        let state_tx = self.state_tx.clone();
+        spawn_background(move || {
+            let result = (|| -> AppResult<AppConfig> {
+                let catalog = load_catalog();
+                let (current, value) = if let Some((value, _)) = document {
+                    (current, value)
+                } else {
+                    let raw = std::fs::read_to_string(&config_path)?;
+                    let raw = crate::services::configuration::parse_json(&raw)?;
+                    crate::services::configuration::validate(&raw, &catalog).map_err(|errors| {
+                        errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })?;
+                    let saved = AppConfig::load_from(&config_path)?;
+                    let value = crate::services::configuration::document(&saved, &catalog)?;
+                    (saved, value)
+                };
+                SettingsService::new().apply_configuration(&current, &value, &catalog, &config_path)
+            })()
+            .map_err(|e| e.to_string());
+            let _ = state_tx.send(WorkerState::StorageSettingsApplied(result));
         });
     }
 
@@ -792,6 +876,9 @@ impl DesktopApp {
 
         while let Ok(state) = self.state_rx.try_recv() {
             match state {
+                WorkerState::SettingSecretStored { target, result } => {
+                    self.window.setting_secret_finished(&target, result)
+                }
                 WorkerState::AccountFinished { id, result } => {
                     self.window.account_finished(id, result)
                 }
@@ -1022,6 +1109,28 @@ impl DesktopApp {
 
         if let Some(command) = self.window.take_command() {
             match command {
+                UiCommand::ApplyConfiguration { document, expected } => self
+                    .start_full_configuration(
+                        Some((document, expected)),
+                        AppConfig::config_path().to_owned(),
+                    ),
+                UiCommand::ReloadConfiguration => {
+                    self.start_full_configuration(None, AppConfig::config_path().to_owned())
+                }
+                UiCommand::StoreSettingSecret { target, value } => {
+                    let tx = self.state_tx.clone();
+                    spawn_background(move || {
+                        let result =
+                            crate::scraper::extensions::settings::SettingsCatalog::installed()
+                                .store_secret(
+                                    &target,
+                                    &value,
+                                    &crate::secure_store::SystemSecretStore,
+                                )
+                                .map_err(|e| e.to_string());
+                        let _ = tx.send(WorkerState::SettingSecretStored { target, result });
+                    });
+                }
                 UiCommand::Account(command) => {
                     let id = command.id().to_string();
                     let tx = self.state_tx.clone();
@@ -1348,6 +1457,10 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    SettingSecretStored {
+        target: String,
+        result: Result<(), String>,
+    },
     AccountFinished {
         id: String,
         result: Result<
@@ -1770,6 +1883,10 @@ fn run_set_primary_actor(
 
     let database = Database::new(&database_path);
     let new_actor_dir = actor_folder_name(&actor_name);
+    database.initialize()?;
+    if database.is_torrent_page(page_id)? {
+        return Err("Torrent cards are organized by primary studio. Use Search → Torrents to move their files.".into());
+    }
     let base = Path::new(&download_folder);
 
     let images = database.get_page_images_with_paths(page_id)?;
@@ -1819,6 +1936,64 @@ fn run_set_primary_actor(
 
     let service = SearchService::new(Database::new(&database_path));
     service.load_images_by_ids(&page_image_ids)
+}
+
+#[cfg(test)]
+mod torrent_actor_guard_tests {
+    use super::*;
+    use crate::models::{MetadataAttribute, ScrapedImage, ScrapedItem};
+
+    #[test]
+    fn actor_folder_command_cannot_relocate_torrent_images() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("library.sqlite3");
+        let db = Database::new(&path);
+        db.initialize().unwrap();
+        let item = ScrapedItem {
+            site_key: "example".into(),
+            page_url: "https://example.test/topic?t=1".into(),
+            title: "Example".into(),
+            raw_html: String::new(),
+            images: vec![ScrapedImage {
+                source_url: "https://example.test/image.png".into(),
+                preview_url: None,
+                alt_text: None,
+                width: None,
+                height: None,
+                sort_order: 0,
+                local_file_path: None,
+            }],
+            attributes: vec![MetadataAttribute {
+                kind: "magnet".into(),
+                label: "Magnet".into(),
+                value: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+                source_url: None,
+                is_female: None,
+            }],
+        };
+        let persisted = db.upsert_scraped_item(&item).unwrap();
+        let image_id = persisted.image_ids_by_url[&item.images[0].source_url];
+        let relative = "torrents/example/studio/item/images/cover.png";
+        let base = root.path().join("files");
+        let image = base.join(relative);
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"original").unwrap();
+        db.update_image_file_location(persisted.page_id, image_id, relative)
+            .unwrap();
+        let result = run_set_primary_actor(
+            path.display().to_string(),
+            base.display().to_string(),
+            persisted.page_id,
+            "Actor".into(),
+            SearchRefresh::Query(SearchQuery::default()),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(image).unwrap(), b"original");
+        assert_eq!(
+            db.get_page_images_with_paths(persisted.page_id).unwrap()[0].1,
+            relative
+        );
+    }
 }
 
 // ── SQL query runner ──────────────────────────────────────────────────────────
@@ -2097,6 +2272,92 @@ mod startup_ui_tests {
         };
         let context = egui::Context::default();
         (DesktopApp::new(config, context.clone()), root, context)
+    }
+
+    #[test]
+    fn full_configuration_jobs_apply_presets_accounts_and_reload_the_saved_document() {
+        use crate::scraper::extensions::settings::SettingsCatalog;
+        let (mut app, root, _ctx) = test_app(true);
+        let path = root.path().join("app-config.json");
+        app.window.config.save_to(&path).unwrap();
+        app.window.config = AppConfig::load_from(&path).unwrap();
+        let expected = serde_json::to_value(&app.window.config).unwrap();
+        let mut document = crate::services::configuration::document(
+            &app.window.config,
+            &SettingsCatalog::default(),
+        )
+        .unwrap();
+        document["preset_tags"] = serde_json::json!("new tags");
+        document["preset_categories"] = serde_json::json!("new category");
+        document["search_columns"] = serde_json::json!(6);
+        document["extension_accounts"]["example.parser"] =
+            serde_json::json!({"username":"test-user","remember_password":true});
+        app.start_configuration_job(
+            Some((document, expected)),
+            path.clone(),
+            SettingsCatalog::default,
+        );
+        assert!(app.window.storage_settings_applying());
+        app.start_configuration_job(None, path.clone(), SettingsCatalog::default);
+        assert!(
+            app.window.storage_settings_applying(),
+            "a duplicate request must not unlock an active apply"
+        );
+        let WorkerState::StorageSettingsApplied(result) = app
+            .state_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("unexpected result")
+        };
+        assert!(result.is_ok());
+        app.finish_storage_settings(result);
+        assert_eq!(app.window.config.search_columns, 6);
+        assert_eq!(app.live_presets.read().unwrap().tags, "new tags");
+        assert_eq!(app.live_presets.read().unwrap().categories, "new category");
+        assert_eq!(
+            app.window.config.extension_accounts["example.parser"].username,
+            "test-user"
+        );
+        assert!(!app.window.storage_settings_applying());
+        let mut saved = AppConfig::load_from(&path).unwrap();
+        saved.search_columns = 8;
+        saved.save_to(&path).unwrap();
+        app.start_configuration_job(None, path, SettingsCatalog::default);
+        let WorkerState::StorageSettingsApplied(result) = app
+            .state_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("unexpected result")
+        };
+        app.finish_storage_settings(result);
+        assert_eq!(app.window.config.search_columns, 8);
+    }
+
+    #[test]
+    fn full_configuration_jobs_reject_stale_documents_and_busy_downloads_before_writing() {
+        use crate::scraper::extensions::settings::SettingsCatalog;
+        let (mut app, root, _ctx) = test_app(true);
+        let path = root.path().join("app-config.json");
+        let document = serde_json::to_value(&app.window.config).unwrap();
+        let mut stale = document.clone();
+        stale["search_columns"] = serde_json::json!(9);
+        app.start_configuration_job(
+            Some((document.clone(), stale)),
+            path.clone(),
+            SettingsCatalog::default,
+        );
+        assert!(!app.window.storage_settings_applying());
+        assert!(!path.exists());
+        app.worker_running = true;
+        app.start_configuration_job(
+            Some((document.clone(), document)),
+            path.clone(),
+            SettingsCatalog::default,
+        );
+        assert!(!app.window.storage_settings_applying());
+        assert!(!path.exists());
     }
 
     fn render(
