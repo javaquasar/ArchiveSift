@@ -6,6 +6,7 @@ mod coalescing_worker;
 mod creator_filter;
 mod extensions_manager;
 mod icon;
+mod peerlume;
 mod preview_loader;
 mod raw_settings;
 mod storage_settings;

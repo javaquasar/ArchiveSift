@@ -165,6 +165,7 @@ pub struct AppWindow {
     search_form: SearchForm,
     torrent_mode: bool,
     torrent_library: super::torrent_library::TorrentLibraryUi,
+    peerlume: super::peerlume::PeerLumeUi,
     /// Immutable snapshot shared with the render closures. Replacing the
     /// snapshot after a search is cheap, and rendering does not deep-clone
     /// every result (including all metadata attributes) on every frame.
@@ -309,6 +310,7 @@ impl AppWindow {
             search_form: SearchForm::default(),
             torrent_mode: false,
             torrent_library: Default::default(),
+            peerlume: Default::default(),
             search_results: Arc::new(Vec::new()),
             search_next_cursor: None,
             hydrated_image_ids: HashSet::new(),
@@ -665,6 +667,7 @@ impl AppWindow {
     }
 
     pub fn render(&mut self, ctx: &egui::Context) {
+        self.peerlume.poll(&self.config);
         self.extensions_manager.poll(ctx, &self.config);
         if std::mem::take(&mut self.extensions_manager.changed) {
             self.account_settings = None;
@@ -750,16 +753,24 @@ impl AppWindow {
                             .account_settings
                             .get_or_insert_with(|| AccountSettingsEditor::installed(&self.config));
                         let mut account_command = None;
+                        let mut integration_command = None;
                         if let Some(settings) = self.storage_settings.render_with_accounts(
                             ui,
                             &self.config,
                             busy,
-                            |ui| account_command = editor.render(ui, false),
+                            |ui| {
+                                integration_command =
+                                    self.peerlume.settings(ui, &self.config, busy);
+                                account_command = editor.render(ui, false);
+                            },
                         ) {
                             self.pending_command = Some(UiCommand::ApplyStorageSettings(settings));
                         }
                         if let Some(command) = account_command {
                             self.pending_command = Some(UiCommand::Account(command));
+                        }
+                        if let Some(command) = integration_command {
+                            self.pending_command = Some(command);
                         }
                     }
                 }
@@ -767,6 +778,13 @@ impl AppWindow {
         });
 
         // Overlays (rendered outside central panel so they sit on top).
+        if let Some(ids) = self.torrent_library.take_handoff() {
+            if !self.storage_settings.applying {
+                self.peerlume.prepare(ctx, &self.config, ids);
+            }
+        }
+        let storage_busy = self.storage_settings.applying || self.torrent_library.busy;
+        self.peerlume.render(ctx, &self.config, storage_busy);
         if !self.storage_settings.applying {
             self.render_viewer(ctx);
             self.render_description_popup(ctx);
@@ -778,6 +796,7 @@ impl AppWindow {
 
     pub(super) fn storage_settings_busy(&self) -> bool {
         self.running
+            || self.peerlume.blocks_settings()
             || self.torrent_library.busy
             || self.raw_settings.as_ref().is_some_and(|e| e.busy())
             || self.queue_worker_running

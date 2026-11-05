@@ -63,6 +63,8 @@ enum Message {
 }
 
 pub(super) struct TorrentLibraryUi {
+    handoff: Option<Vec<i64>>,
+    checked_cards: std::collections::BTreeSet<i64>,
     pending_command: Option<crate::ui::UiCommand>,
     filters: Filters,
     page: TorrentSummaryPage,
@@ -91,6 +93,8 @@ pub(super) struct TorrentLibraryUi {
 impl Default for TorrentLibraryUi {
     fn default() -> Self {
         Self {
+            handoff: None,
+            checked_cards: Default::default(),
             pending_command: None,
             filters: Filters::default(),
             page: TorrentSummaryPage {
@@ -122,6 +126,9 @@ impl Default for TorrentLibraryUi {
 }
 
 impl TorrentLibraryUi {
+    pub(super) fn take_handoff(&mut self) -> Option<Vec<i64>> {
+        self.handoff.take()
+    }
     pub(super) fn take_command(&mut self) -> Option<crate::ui::UiCommand> {
         self.pending_command.take()
     }
@@ -375,6 +382,24 @@ impl TorrentLibraryUi {
             }
         });
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!("{} selected", self.checked_cards.len()));
+            if ui
+                .add_enabled(
+                    !self.busy
+                        && config.peerlume.enabled
+                        && !self.checked_cards.is_empty()
+                        && self.checked_cards.len() <= 100,
+                    egui::Button::new("Download selected in PeerLume"),
+                )
+                .clicked()
+            {
+                self.handoff = Some(self.checked_cards.iter().copied().collect());
+            }
+            if ui.button("Clear selection").clicked() {
+                self.checked_cards.clear();
+            }
+        });
         let height = ui.available_height();
         ui.columns(2, |columns| {
             egui::ScrollArea::vertical()
@@ -384,6 +409,14 @@ impl TorrentLibraryUi {
                     let mut choose = None;
                     for card in &self.page.cards {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
+                            let mut checked = self.checked_cards.contains(&card.page_id);
+                            if ui.checkbox(&mut checked, "Select for PeerLume").changed() {
+                                if checked {
+                                    self.checked_cards.insert(card.page_id);
+                                } else {
+                                    self.checked_cards.remove(&card.page_id);
+                                }
+                            }
                             ui.set_width(ui.available_width());
                             if ui
                                 .add_enabled(
@@ -452,6 +485,18 @@ impl TorrentLibraryUi {
             });
         }
         ui.hyperlink_to("Open source page", &card.page_url);
+        if ui
+            .add_enabled(
+                !self.busy && config.peerlume.enabled,
+                egui::Button::new("Download in PeerLume"),
+            )
+            .clicked()
+        {
+            self.handoff = Some(vec![card.page_id]);
+        }
+        if !config.peerlume.enabled {
+            ui.weak("Enable the PeerLume integration in Settings to hand off torrents.");
+        }
         let primary = self
             .edit
             .primary_image_id
@@ -1317,5 +1362,22 @@ mod tests {
         assert!(editor.error.is_some());
         render(&mut editor, &config, &ctx, vec![]);
         assert!(!editor.busy);
+    }
+
+    #[test]
+    fn peerlume_card_and_batch_buttons_only_request_review_and_respect_the_enable_switch() {
+        let (_root, mut config, _db, mut editor, ctx) = fixture();
+        let id = editor.selected.as_ref().unwrap().page_id;
+        click(&mut editor, &config, &ctx, "Download in PeerLume");
+        assert!(editor.take_handoff().is_none());
+        config.peerlume.enabled = true;
+        click(&mut editor, &config, &ctx, "Download in PeerLume");
+        assert_eq!(editor.take_handoff(), Some(vec![id]));
+        click(&mut editor, &config, &ctx, "Select for PeerLume");
+        click(&mut editor, &config, &ctx, "Download selected in PeerLume");
+        assert_eq!(editor.take_handoff(), Some(vec![id]));
+        click(&mut editor, &config, &ctx, "Clear selection");
+        assert!(editor.checked_cards.is_empty());
+        assert!(editor.receiver.is_none());
     }
 }

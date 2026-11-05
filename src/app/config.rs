@@ -141,6 +141,8 @@ impl ScrapeLayoutConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub peerlume: crate::services::peerlume::PeerLumeConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extension_settings: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -208,6 +210,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            peerlume: Default::default(),
             extension_accounts: BTreeMap::new(),
             extension_settings: BTreeMap::new(),
             config_version: CURRENT_CONFIG_VERSION,

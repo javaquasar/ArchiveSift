@@ -37,6 +37,8 @@ jobs:
         run: cargo test --locked --test search_optimizations
       - name: Local agent access and real MCP stdio adapter tests
         run: cargo test --locked --test agent_control && cargo test --locked --lib agent
+      - name: PeerLume durable handoff and native control CLI contract
+        run: cargo test --locked --test peerlume_control --jobs 1 && cargo test --locked --lib peerlume --jobs 1
       - name: Recovery, path validation and headless card editor tests
         run: cargo test --locked --lib torrent
       - name: Configuration validation and completion integration tests

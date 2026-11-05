@@ -17,6 +17,7 @@ without rebuilding the application. See [extension architecture and UML](docs/EX
 - Import and export tools, plus a read-only SQL workspace
 - Static demo target for development and tests
 - Signed extension packages, live updates, side-by-side versions and rollback in Extensions
+- Reviewed single-card and batch torrent handoff to PeerLume, with a durable delivery journal and transfer status
 - Embedded application icon shared by the main window, image viewer and auxiliary windows
 
 ## Demo download fixture
@@ -62,6 +63,10 @@ image filters and previews; **SQL** opens the database console. **Extensions**
 installs and checks parser packages, manages permissions and switches versions without
 restarting. See the [extension manager guide](docs/EXTENSION_MANAGER.md). Choose a download folder in Scrape to enable
 downloads. Search and SQL remain available without a download folder.
+
+Configure the optional local download-client connection under **Settings →
+Integrations · PeerLume**. Setup, release scope, the wire contract and recovery
+behavior are described in the [PeerLume integration release document](docs/releases/peerlume-integration.md).
 
 **Search → By Date** follows the selected Site filter for group counts, oldest/newest
 ordering and previous/next wraparound. Changing Site while browsing restarts at the

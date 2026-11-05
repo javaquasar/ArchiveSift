@@ -86,6 +86,7 @@ pub fn schema(catalog: &SettingsCatalog) -> Result<SettingsSchema, String> {
         &serde_json::to_value(AppConfig::default()).map_err(|_| "Cannot describe configuration")?,
     );
     let properties = root["properties"].as_object_mut().unwrap();
+    properties.get_mut("peerlume").unwrap()["description"] = json!("PeerLume local control integration; tokens are stored separately in the OS credential store");
     properties.insert("extension_accounts".into(),json!({"type":"object","additionalProperties":{"type":"object","properties":{"username":{"type":"string","maxLength":512,"default":""},"remember_password":{"type":"boolean","default":false}},"required":["username"],"additionalProperties":false},"properties":{}}));
     properties.insert("extension_settings".into(),json!({"type":"object","properties":{},"additionalProperties":{"type":"object","additionalProperties":true},"required":[]}));
     for (id, plugin) in &catalog.plugins {
@@ -205,6 +206,9 @@ pub fn validate(
             message: message.into(),
         })
     };
+    if let Err(error) = config.peerlume.validate() {
+        add("/peerlume", &error.to_string());
+    }
     for (id, plugin) in &catalog.plugins {
         if plugin.enabled || config.extension_settings.contains_key(id) {
             if let Err(error) = plugin.effective(config.extension_settings.get(id)) {

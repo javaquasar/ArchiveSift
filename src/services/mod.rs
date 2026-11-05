@@ -12,4 +12,5 @@ pub(crate) use thumbnail::ThumbnailService;
 pub use url_queue::UrlQueueService;
 pub mod config_completion;
 pub mod configuration;
+pub mod peerlume;
 pub mod torrent_library;
