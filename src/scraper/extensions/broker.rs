@@ -18,11 +18,22 @@ impl HttpBroker {
         Self::with_account(manifest, None)
     }
 
+    #[cfg(test)]
     pub fn with_account(
         manifest: &PluginManifest,
         account: Option<&super::accounts::AccountProvider>,
     ) -> AppResult<Self> {
+        Self::with_package(manifest, account, None)
+    }
+    pub fn with_package(
+        manifest: &PluginManifest,
+        account: Option<&super::accounts::AccountProvider>,
+        bindings: Option<&[u8]>,
+    ) -> AppResult<Self> {
         let mut credentials = Credentials::load(manifest)?;
+        if let Some(bytes) = bindings {
+            credentials.include_package(manifest, bytes)?;
+        }
         if let Some(account) = account {
             credentials.include_account(account)?;
         }

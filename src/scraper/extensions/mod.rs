@@ -3,6 +3,8 @@ pub mod accounts;
 mod broker;
 mod compilation_cache;
 mod credentials;
+mod disk_cache;
+pub mod manager;
 pub mod manifest;
 mod process;
 pub mod settings;
@@ -71,7 +73,9 @@ impl ExtensionScraper {
         let backend = match manifest.runtime {
             RuntimeKind::Wasm => {
                 let (_, bytes) = manifest.verified_entry(directory)?;
-                Backend::Wasm(Arc::new(WasmBackend::new(&bytes, manifest.limits.clone())?))
+                let backend = WasmBackend::new(&bytes, manifest.limits.clone())?;
+                backend.check_offline_test(directory)?;
+                Backend::Wasm(Arc::new(backend))
             }
             RuntimeKind::Process => {
                 if !manifest.trusted {
@@ -84,7 +88,13 @@ impl ExtensionScraper {
             }
         };
         let account = accounts::AccountProvider::for_manifest(directory, &manifest)?;
-        let broker = HttpBroker::with_account(&manifest, account.as_ref())?;
+        let bindings_path = directory.join("credential-bindings.json");
+        let bindings = if bindings_path.exists() {
+            Some(manager::bounded_read(&bindings_path, 64 * 1024)?)
+        } else {
+            None
+        };
+        let broker = HttpBroker::with_package(&manifest, account.as_ref(), bindings.as_deref())?;
         Ok(Self {
             manifest,
             backend,
@@ -471,9 +481,8 @@ fn read_manifest(directory: &Path) -> AppResult<PluginManifest> {
 
 /// A bad package is reported without preventing the other packages from loading.
 pub fn discover(registry: &mut ScraperRegistry, root: &Path) -> Vec<ExtensionStatus> {
-    let entries = match std::fs::read_dir(root) {
+    let entries = match manager::package_entries(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(error) => {
             return vec![ExtensionStatus {
                 directory: root.into(),
@@ -485,16 +494,17 @@ pub fn discover(registry: &mut ScraperRegistry, root: &Path) -> Vec<ExtensionSta
             }]
         }
     };
-    let mut directories = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join("plugin.json").exists())
-        .collect::<Vec<_>>();
-    directories.sort();
+    discover_entries(registry, entries)
+}
+
+fn discover_entries(
+    registry: &mut ScraperRegistry,
+    entries: Vec<(PathBuf, AppResult<PluginManifest>)>,
+) -> Vec<ExtensionStatus> {
     let mut statuses = Vec::new();
     let mut ids = std::collections::HashSet::new();
     let mut claimed_routes: Vec<(String, String)> = Vec::new();
-    for directory in directories {
+    for (directory, manifest) in entries {
         let mut status = ExtensionStatus {
             directory: directory.clone(),
             id: String::new(),
@@ -503,8 +513,32 @@ pub fn discover(registry: &mut ScraperRegistry, root: &Path) -> Vec<ExtensionSta
             loaded: false,
             message: String::new(),
         };
+        // A corrupt payload must still be identifiable and disableable using
+        // its local installation identity, independent of publisher bytes.
+        if directory
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "packages")
+        {
+            status.id = directory
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            status.version = directory
+                .file_name()
+                .map(|s| {
+                    s.to_string_lossy()
+                        .split("--")
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .unwrap_or_default();
+        }
         let result = (|| -> AppResult<()> {
-            let manifest = read_manifest(&directory)?;
+            let manifest = manifest?;
             status.id = manifest.id.clone();
             status.version = manifest.version.clone();
             status.runtime = Some(manifest.runtime);

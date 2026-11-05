@@ -27,6 +27,7 @@ struct QueueStore {
 
 pub struct UrlQueueService {
     registry: ScraperRegistry,
+    live_registry: Option<crate::scraper::RegistryProvider>,
     store: Arc<QueueStore>,
     paused: Arc<AtomicBool>,
 }
@@ -45,7 +46,11 @@ impl UrlQueueService {
             return Self::with_registry_and_queue_path(ScraperRegistry::with_all_scrapers(), path);
         }
         #[cfg(not(test))]
-        Self::with_registry(ScraperRegistry::with_all_scrapers())
+        {
+            let mut service = Self::with_registry(ScraperRegistry::with_all_scrapers());
+            service.live_registry = Some(crate::scraper::global_registry().clone());
+            service
+        }
     }
 
     pub fn with_registry(registry: ScraperRegistry) -> Self {
@@ -94,6 +99,7 @@ impl UrlQueueService {
             .unwrap_or_else(|error| panic!("failed to initialize queue database: {error}"));
         Self {
             registry,
+            live_registry: None,
             store: Arc::new(QueueStore {
                 connection: Mutex::new(connection),
             }),
@@ -101,12 +107,23 @@ impl UrlQueueService {
         }
     }
 
+    pub fn with_provider_and_queue_path(
+        provider: crate::scraper::RegistryProvider,
+        queue_path: impl Into<PathBuf>,
+    ) -> Self {
+        let mut service = Self::with_registry_and_queue_path(provider.snapshot(), queue_path);
+        service.live_registry = Some(provider);
+        service
+    }
+
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn registry(&self) -> ScraperRegistry {
-        self.registry.clone()
+        self.live_registry
+            .as_ref()
+            .map_or_else(|| self.registry.clone(), |provider| provider.snapshot())
     }
 
     pub fn resume(&self) {
@@ -281,13 +298,14 @@ impl UrlQueueService {
         database.initialize()?;
 
         let mut report = UrlQueueReport::default();
+        let registry = self.registry();
         let mut input = urls.into_iter();
         loop {
             let prepared = input
                 .by_ref()
                 .take(URL_ENQUEUE_BATCH_SIZE)
                 .map(|raw_input| {
-                    let normalized_url = normalize_supported_url(&self.registry, &raw_input);
+                    let normalized_url = normalize_supported_url(&registry, &raw_input);
                     (raw_input, normalized_url)
                 })
                 .collect::<Vec<_>>();

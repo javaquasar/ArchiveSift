@@ -16,7 +16,7 @@ without rebuilding the application. See [extension architecture and UML](docs/EX
 - Structured download folders
 - Import and export tools, plus a read-only SQL workspace
 - Static demo target for development and tests
-- Dynamic WASM and process extensions with a shared SDK and an Extensions status tab
+- Signed extension packages, live updates, side-by-side versions and rollback in Extensions
 - Embedded application icon shared by the main window, image viewer and auxiliary windows
 
 ## Demo download fixture
@@ -59,7 +59,8 @@ artwork, export instructions and the Linux desktop entry are in
 The full desktop workspace opens on the first launch: **Scrape** contains source
 and destination settings, the URL queue and activity log; **Search** provides
 image filters and previews; **SQL** opens the database console. **Extensions**
-shows installed parser modules. Choose a download folder in Scrape to enable
+installs and checks parser packages, manages permissions and switches versions without
+restarting. See the [extension manager guide](docs/EXTENSION_MANAGER.md). Choose a download folder in Scrape to enable
 downloads. Search and SQL remain available without a download folder.
 
 **Search → By Date** follows the selected Site filter for group counts, oldest/newest

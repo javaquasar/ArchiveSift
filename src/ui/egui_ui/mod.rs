@@ -4,6 +4,7 @@ mod app_window;
 mod background_executor;
 mod coalescing_worker;
 mod creator_filter;
+mod extensions_manager;
 mod icon;
 mod preview_loader;
 mod raw_settings;
@@ -316,6 +317,7 @@ impl DesktopApp {
         let (state_tx, state_rx) = repainting_channel(&repaint_context, UI_RESULT_CHANNEL_CAPACITY);
         let suggestion_worker = suggestion_worker(&state_tx);
         let queue_service = Arc::new(UrlQueueService::new());
+        crate::scraper::global_registry().configure_settings(config.extension_settings.clone());
 
         let live_presets = Arc::new(RwLock::new(LivePresets {
             tags: config.preset_tags.clone(),
@@ -329,7 +331,11 @@ impl DesktopApp {
             .then(|| clipboard_event_channel(&repaint_context));
         let recover =
             config.has_download_folder() && std::path::Path::new(&config.database_path).is_file();
-        let window = AppWindow::new(config, UiLog::default(), Arc::clone(&live_presets));
+        let mut window = AppWindow::new(config, UiLog::default(), Arc::clone(&live_presets));
+        let startup_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if startup_args.len() == 2 && startup_args[0] == "--install-extension" {
+            window.review_extension(&repaint_context, PathBuf::from(&startup_args[1]));
+        }
 
         let metadata_worker = metadata_worker(&state_tx);
         let mut app = Self {
@@ -598,6 +604,8 @@ impl DesktopApp {
                 let log = self.window.log.clone();
                 log.push("Storage settings saved and applied.");
                 self.window.apply_storage_config(config);
+                crate::scraper::global_registry()
+                    .configure_settings(self.window.config.extension_settings.clone());
             }
             Err(error) => {
                 self.window
@@ -1178,6 +1186,13 @@ impl DesktopApp {
                     self.window.account_finished(id, result)
                 }
                 WorkerState::StorageSettingsApplied(result) => self.finish_storage_settings(result),
+                WorkerState::ExtensionVersionSwitched(result) => match result {
+                    Ok(config) => {
+                        self.window.config.extension_settings = config.extension_settings;
+                        self.window.extension_version_switched();
+                    }
+                    Err(error) => self.window.storage_settings_failed(error),
+                },
                 WorkerState::ImportFinished { file_path, result } => {
                     let config_to_start = {
                         let window = &mut self.window;
@@ -1430,6 +1445,31 @@ impl DesktopApp {
                         Some((document, expected)),
                         AppConfig::config_path().to_owned(),
                     ),
+                UiCommand::SwitchExtensionVersion {
+                    id,
+                    version,
+                    expected,
+                } => {
+                    if !self.window.storage_settings_applying()
+                        && !self.window.extension_manager_busy()
+                        && serde_json::to_value(&self.window.config).ok().as_ref()
+                            == Some(&expected)
+                    {
+                        self.window.begin_storage_settings();
+                        let current = self.window.config.clone();
+                        let tx = self.state_tx.clone();
+                        if let Err(error) = spawn_background(move || {
+                            let result = crate::scraper::extensions::manager::global_manager()
+                                .switch_and_save(&id, &version, &current, AppConfig::config_path())
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(WorkerState::ExtensionVersionSwitched(result));
+                        }) {
+                            self.window.storage_settings_failed(error);
+                        }
+                    } else {
+                        self.window.storage_settings_failed("Wait for active operations to finish and reload changed settings before switching versions.".into());
+                    }
+                }
                 UiCommand::ReloadConfiguration => {
                     self.start_full_configuration(None, AppConfig::config_path().to_owned())
                 }
@@ -1804,6 +1844,7 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    ExtensionVersionSwitched(Result<AppConfig, String>),
     SettingSecretStored {
         target: String,
         result: Result<(), String>,
@@ -1913,6 +1954,7 @@ fn run_queue_processor(
                         }
                         let base_dir = base_dir.clone();
                         let log = log.clone();
+                        let scraper_registry = crate::scraper::global_registry().for_job(&mut config);
                         active.push(Box::pin(async move {
                             // ── Random throttle delay ─────────────────────────
                             let delay_ms = sample_delay(
@@ -1928,7 +1970,7 @@ fn run_queue_processor(
                             // ─────────────────────────────────────────────────
                             let thumb_dir = config.thumb_dir();
                             let service = ContentDownloadService::new(
-                                ScraperRegistry::with_all_scrapers(),
+                                scraper_registry,
                                 Database::new(&config.database_path),
                                 FileDownloadStore::new(),
                                 ConsoleUi::from_log(log),

@@ -16,3 +16,6 @@
 *.agent-endpoint.*.tmp
 Thumbs.db
 .DS_Store
+*.pk8
+*.key
+*.pem

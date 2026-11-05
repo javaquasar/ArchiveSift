@@ -82,7 +82,7 @@ impl Credentials {
         Self::parse(manifest, &bytes)
     }
 
-    fn parse(manifest: &PluginManifest, bytes: &[u8]) -> AppResult<Self> {
+    pub(super) fn parse(manifest: &PluginManifest, bytes: &[u8]) -> AppResult<Self> {
         let config: Configuration =
             serde_json::from_slice(bytes).map_err(|_| "invalid local credential bindings")?;
         if config.bindings.len() > 128 {
@@ -133,6 +133,29 @@ impl Credentials {
         self.headers_with(url, read_secret)
     }
 
+    pub(super) fn include_package(
+        &mut self,
+        manifest: &PluginManifest,
+        bytes: &[u8],
+    ) -> AppResult<()> {
+        for binding in Self::parse(manifest, bytes)?.0 {
+            if let Some(existing) = self.0.iter().find(|b| {
+                b.origin == binding.origin
+                    && b.path == binding.path
+                    && b.header.eq_ignore_ascii_case(&binding.header)
+            }) {
+                if existing.target != binding.target {
+                    return Err(
+                        "package credential reference conflicts with a local binding".into(),
+                    );
+                }
+            } else {
+                self.0.push(binding);
+            }
+        }
+        Ok(())
+    }
+
     fn headers_with(
         &self,
         url: &Url,
@@ -168,6 +191,35 @@ fn read_secret(target: &str) -> AppResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn even_host_named_plugins_cannot_bind_or_declare_host_owned_secrets() {
+        let github = super::super::manager::updates::UpdateSource::Github {
+            repository: "owner/example".into(),
+            asset_prefix: "parser-".into(),
+        }
+        .credential_target()
+        .unwrap();
+        let cache = crate::secure_store::host_secret_target("wasm-cache-hmac-v1");
+        for id in ["host", "extensions", "example.parser"] {
+            let mut manifest = super::super::tests::manifest();
+            manifest.id = id.into();
+            manifest.validate().unwrap();
+            for target in [&github, &cache] {
+                let mut bindings = configuration();
+                bindings["bindings"][0]["plugin_id"] = serde_json::json!(id);
+                bindings["bindings"][0]["target"] = serde_json::json!(target);
+                assert!(
+                    Credentials::parse(&manifest, &serde_json::to_vec(&bindings).unwrap()).is_err()
+                );
+                let schema=archive_sift_scraper_api::settings_schema::SettingsSchema::compile(serde_json::json!({"type":"object","properties":{"token_ref":{"type":"string","format":"secret-reference","const":target,"default":target}}})).unwrap();
+                assert!(schema.validate_plugin_identity(id).is_err());
+            }
+            let mut bindings = configuration();
+            bindings["bindings"][0]["plugin_id"] = serde_json::json!(id);
+            bindings["bindings"][0]["target"] = serde_json::json!(format!("ArchiveSift/{id}/api"));
+            assert!(Credentials::parse(&manifest, &serde_json::to_vec(&bindings).unwrap()).is_ok());
+        }
+    }
 
     #[test]
     fn account_sessions_are_bound_to_declared_exact_paths() {

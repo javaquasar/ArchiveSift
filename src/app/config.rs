@@ -251,6 +251,10 @@ impl AppConfig {
     }
 
     pub fn load_from(path: &Path) -> AppResult<Self> {
+        crate::scraper::extensions::manager::recover_for_config(
+            &crate::scraper::extensions::default_plugin_directory(),
+            path,
+        )?;
         let path = path.to_path_buf();
         if !path.exists() {
             return Ok(Self::default());

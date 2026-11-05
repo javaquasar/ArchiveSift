@@ -9,7 +9,7 @@ default-run = "archive-sift"
 build = "build.rs"
 
 [workspace]
-members = ["crates/scraper-api", "plugins/demo-parser", "tools/plugin-packager"]
+members = ["crates/scraper-api", "crates/extension-package", "plugins/demo-parser", "tools/plugin-packager"]
 resolver = "2"
 
 [lib]
@@ -39,6 +39,8 @@ zeroize = "1"
 getrandom = "0.3.4"
 subtle = "2.6.1"
 semver = "1"
+ring = "0.17.14"
+archive-sift-extension-package = { path = "crates/extension-package" }
 image = "0.25.9"
 #tokio = "1.43.0"
 arboard = "3"

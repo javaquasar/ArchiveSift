@@ -13,9 +13,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install native UI build dependencies
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Build extension fixtures and verify the signed package manager on Linux
+        run: |
+          python scripts/test_extensions.py --prepare-only
+          cargo test --locked -p archive-sift-extension-package --jobs 1
+          cargo test --locked --test extension_manager --jobs 1
+          cargo test --locked --lib disk_cache --jobs 1
+          cargo test --locked --lib manager::tests --jobs 1
       - name: Torrent library integration tests on Linux
         run: cargo test --locked --test torrent_library
       - name: Torrent metadata export and attachment integration tests

@@ -10,6 +10,8 @@ sha2 = "0.10"
 serde_json = "1"
 url = "2"
 archive-sift-scraper-api = { path = "../../crates/scraper-api" }
+archive-sift-extension-package = { path = "../../crates/extension-package" }
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

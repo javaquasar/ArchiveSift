@@ -2,6 +2,13 @@
 use std::fmt;
 use zeroize::Zeroizing;
 
+// '@' cannot occur in a valid plugin ID. Host secrets must never share a
+// plugin-owned prefix accepted by settings schemas or HTTP credential bindings.
+pub(crate) const HOST_SECRET_NAMESPACE: &str = "ArchiveSift/@host/";
+pub(crate) fn host_secret_target(suffix: &str) -> String {
+    format!("{HOST_SECRET_NAMESPACE}{suffix}")
+}
+
 #[derive(Clone)]
 pub struct Secret(pub(crate) Zeroizing<Vec<u8>>);
 

@@ -4,6 +4,12 @@ use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.as_str(), "bundle" | "keygen" | "verify"))
+    {
+        return package_command(&args).map_err(|e| e.to_string().into());
+    }
     if !matches!(args.len(), 4 | 5)
         || !matches!(args[0].as_str(), "wasm" | "process")
         || (args.len() == 5 && args[3] != "--manifest")
@@ -95,11 +101,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if schema_path.exists() {
         std::fs::remove_file(schema_path)?;
     }
+    let self_test = if args.len() == 5 {
+        std::path::Path::new(&args[4])
+            .parent()
+            .map(|p| p.join("self-test.json"))
+            .filter(|p| p.is_file())
+            .map(std::fs::read)
+            .transpose()?
+    } else {
+        Some(include_bytes!("../../../plugins/demo-parser/self-test.json").to_vec())
+    };
+    if let Some(bytes) = self_test {
+        std::fs::write(directory.join("self-test.json"), bytes)?;
+    } else if directory.join("self-test.json").exists() {
+        std::fs::remove_file(directory.join("self-test.json"))?;
+    }
     println!(
         "Created disabled extension package: {}",
         directory.display()
     );
     Ok(())
+}
+
+fn package_command(args: &[String]) -> archive_sift_extension_package::Result<()> {
+    use archive_sift_extension_package::{encode, generate_key, Package};
+    use std::{collections::BTreeMap, fs::OpenOptions, io::Write};
+    match args.first().map(String::as_str) {
+        Some("keygen") if args.len()==2 => {
+            let key=zeroize::Zeroizing::new(generate_key()?);
+            let mut options=OpenOptions::new(); options.write(true).create_new(true);
+            #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
+            let mut file=options.open(&args[1])?; file.write_all(&key)?;
+            println!("Publisher key created. Keep this file private and outside the repository."); Ok(())
+        },
+        Some("verify") if args.len()==2 => {
+            let p=Package::read(std::path::Path::new(&args[1]))?;
+            println!("SHA-256: {}\nPublisher: {}",p.artifact_digest,p.signer.as_deref().unwrap_or("unsigned")); Ok(())
+        },
+        Some("bundle") if matches!(args.len(),3|5) => {
+            if args.len()==5 && args[3]!="--signing-key" {return Err("expected --signing-key <private PKCS8 file>".into());}
+            let directory=std::path::Path::new(&args[1]);
+            let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(directory.join("plugin.json"))?)?;
+            let entry=manifest["entry"].as_str().ok_or("missing entry")?;
+            if entry.contains(['\\',':']) || std::path::Path::new(entry).components().any(|c|!matches!(c,std::path::Component::Normal(_))) {return Err("invalid module entry path".into());}
+            let mut files=BTreeMap::new();
+            for name in ["plugin.json",entry,"settings.schema.json","account.json","credential-bindings.json","release.json","self-test.json"] {
+                let path=directory.join(name);if path.is_file(){
+                    if path.metadata()?.len()>archive_sift_extension_package::MAX_PACKAGE as u64 {return Err("file exceeds size limit".into());}
+                    files.insert(name.to_owned(),std::fs::read(path)?);
+                }
+            }
+            let key=if args.len()==5 {Some(zeroize::Zeroizing::new(std::fs::read(&args[4])?))}
+                else if let Ok(value)=std::env::var("ARCHIVESIFT_SIGNING_KEY") {let value=zeroize::Zeroizing::new(value);Some(zeroize::Zeroizing::new(archive_sift_extension_package::unhex(value.trim())?))}else{None};
+            let bytes=encode(&files,key.as_deref().map(|k|k.as_slice()))?;
+            std::fs::write(&args[2],bytes)?;
+            println!("Created {} .asift-plugin package",if key.is_some(){"signed"}else{"unsigned local"});Ok(())
+        },
+        _=>Err("usage: bundle <directory> <output.asift-plugin> [--signing-key <private-key>] | keygen <private-key> | verify <package>".into()),
+    }
 }
 
 fn manifest_from_template(

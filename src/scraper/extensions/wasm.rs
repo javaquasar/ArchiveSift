@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use archive_sift_scraper_api::{Action, Request};
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::Linker;
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use super::compilation_cache::CompilationCache;
@@ -69,7 +69,7 @@ impl WasmBackend {
         static CACHE: CompilationCache<PreparedComponent> = CompilationCache::new(4);
         let prepared = CACHE.get_or_compile(module.digest(), || {
             let component =
-                Component::new(&engine, module.bytes()).map_err(|error| error.to_string())?;
+                super::disk_cache::compile(&engine, module).map_err(|error| error.to_string())?;
             // Type-check and resolve imports/exports once, without invoking the guest.
             let linker = Linker::<StoreLimits>::new(&engine);
             let instance = linker
@@ -89,6 +89,45 @@ impl WasmBackend {
         let deadline = Instant::now() + Duration::from_millis(self.limits.timeout_ms);
         tokio::task::spawn_blocking(move || backend.execute_sync(input, cancelled, deadline))
             .await?
+    }
+
+    /// Executes a publisher-supplied response without network or credentials.
+    /// Loading a package with a failing check cannot activate it.
+    pub(super) fn check_offline_test(&self, directory: &std::path::Path) -> AppResult<bool> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Sample {
+            request: Request,
+            expected: Action,
+        }
+        let path = directory.join("self-test.json");
+        if !path.exists() {
+            return Ok(false);
+        }
+        let sample: Sample =
+            serde_json::from_slice(&super::manager::bounded_read(&path, 1024 * 1024)?)?;
+        if sample.request.api_version != 1
+            || sample
+                .request
+                .response
+                .as_ref()
+                .is_none_or(|r| r.body.len() > self.limits.max_response_bytes)
+            || matches!(sample.expected, Action::Fetch(_))
+        {
+            return Err(
+                "self-test must parse a supplied bounded response into content or a listing".into(),
+            );
+        }
+        let result = self.execute_sync(
+            sample.request,
+            Arc::new(AtomicBool::new(false)),
+            Instant::now() + Duration::from_millis(self.limits.timeout_ms.min(3000)),
+        )?;
+        archive_sift_scraper_api::check_json_size(&result, self.limits.max_output_bytes)?;
+        if result != sample.expected {
+            return Err("offline parser self-test returned an unexpected result".into());
+        }
+        Ok(true)
     }
 
     fn execute_sync(

@@ -219,6 +219,11 @@ pub enum SearchRefresh {
 /// Commands emitted by the UI and consumed by the app orchestration layer.
 #[derive(Clone, Debug)]
 pub enum UiCommand {
+    SwitchExtensionVersion {
+        id: String,
+        version: String,
+        expected: serde_json::Value,
+    },
     SetAgentAccess {
         enabled: bool,
         allow_downloads: bool,

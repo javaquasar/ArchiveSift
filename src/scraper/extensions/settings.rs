@@ -160,9 +160,8 @@ impl SettingsCatalog {
     }
     pub fn discover(directory: &Path) -> Self {
         let mut catalog = Self::default();
-        let entries = match std::fs::read_dir(directory) {
+        let entries = match super::manager::package_entries(directory) {
             Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return catalog,
             Err(_) => {
                 catalog
                     .errors
@@ -170,15 +169,9 @@ impl SettingsCatalog {
                 return catalog;
             }
         };
-        let mut paths = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && p.join("plugin.json").is_file())
-            .collect::<Vec<_>>();
-        paths.sort();
-        for directory in paths {
+        for (directory, manifest) in entries {
             let result = (|| -> AppResult<PluginSettings> {
-                let manifest = super::read_manifest(&directory)?;
+                let manifest = manifest?;
                 PluginSettings::from_directory(&directory, &manifest)
             })();
             match result {

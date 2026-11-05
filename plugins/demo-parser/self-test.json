@@ -1,0 +1,21 @@
+{
+  "request": {
+    "api_version": 1,
+    "operation": "Content",
+    "url": "https://example.test/galleries/check/",
+    "response": {
+      "url": "https://example.test/galleries/check/",
+      "status": 200,
+      "content_type": "text/html",
+      "body": "<main data-demo-title=\"Parser check\"><img data-demo-full=\"/media/check.png\" alt=\"Check image\"></main>"
+    },
+    "state": null
+  },
+  "expected": {
+    "Content": {
+      "title": "Parser check",
+      "images": [{"url":"https://example.test/media/check.png","preview_url":null,"alt_text":"Check image","width":null,"height":null}],
+      "attributes": []
+    }
+  }
+}

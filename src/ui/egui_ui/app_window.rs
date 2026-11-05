@@ -161,6 +161,7 @@ pub struct AppWindow {
     settings_json_mode: bool,
     raw_settings: Option<super::raw_settings::RawSettingsEditor>,
     account_settings: Option<AccountSettingsEditor>,
+    extensions_manager: super::extensions_manager::ExtensionsManagerUi,
     search_form: SearchForm,
     torrent_mode: bool,
     torrent_library: super::torrent_library::TorrentLibraryUi,
@@ -304,6 +305,7 @@ impl AppWindow {
             settings_json_mode: false,
             raw_settings: None,
             account_settings: None,
+            extensions_manager: Default::default(),
             search_form: SearchForm::default(),
             torrent_mode: false,
             torrent_library: Default::default(),
@@ -383,6 +385,11 @@ impl AppWindow {
         self.pending_command
             .take()
             .or_else(|| self.torrent_library.take_command())
+    }
+    pub(super) fn review_extension(&mut self, ctx: &egui::Context, path: std::path::PathBuf) {
+        self.active_tab = Tab::Extensions;
+        self.extensions_manager
+            .preview(ctx, path, &self.config, false);
     }
 
     /// Returns the appropriate refresh mode for the current search state.
@@ -658,6 +665,13 @@ impl AppWindow {
     }
 
     pub fn render(&mut self, ctx: &egui::Context) {
+        self.extensions_manager.poll(ctx, &self.config);
+        if std::mem::take(&mut self.extensions_manager.changed) {
+            self.account_settings = None;
+            if let Some(editor) = &mut self.raw_settings {
+                editor.refresh_catalog();
+            }
+        }
         if self.torrent_library.poll() {
             self.torrent_card_saved();
         }
@@ -772,6 +786,7 @@ impl AppWindow {
             || self.sql_export_running
             || self.date_browse_loading
             || self.storage_settings.applying
+            || self.extensions_manager.blocks_settings()
             || self
                 .account_settings
                 .as_ref()
@@ -780,6 +795,19 @@ impl AppWindow {
 
     pub(super) fn recover_torrent_operations(&mut self, ctx: &egui::Context) {
         self.torrent_library.recover_on_start(ctx, &self.config);
+    }
+    pub(super) fn extension_manager_busy(&self) -> bool {
+        self.extensions_manager.busy()
+            || self.account_settings.as_ref().is_some_and(|e| e.busy())
+            || self.raw_settings.as_ref().is_some_and(|e| e.busy())
+    }
+    pub(super) fn extension_version_switched(&mut self) {
+        self.storage_settings_saved();
+        self.extensions_manager.invalidate();
+        self.account_settings = None;
+        if let Some(editor) = &mut self.raw_settings {
+            editor.refresh_catalog();
+        }
     }
 
     fn torrent_card_saved(&mut self) {
@@ -846,6 +874,9 @@ impl AppWindow {
             replacement.raw_settings = Some(editor);
         }
         replacement.sql_query = std::mem::take(&mut self.sql_query);
+        replacement.extensions_manager = std::mem::take(&mut self.extensions_manager);
+        replacement.extensions_manager.invalidate();
+        replacement.active_tab = self.active_tab;
         replacement.storage_settings_saved();
         *self = replacement;
     }
@@ -857,24 +888,23 @@ impl AppWindow {
     }
 
     fn render_extensions_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Extensions");
-        ui.label("Install a package in the plugins folder and restart ArchiveSift to load it.");
-        ui.label("Enable a package in plugin.json. Native process extensions also require trusted=true and run with your account permissions.");
-        let directory = crate::scraper::extensions::default_plugin_directory();
-        ui.horizontal_wrapped(|ui| {
-            ui.add(egui::Label::new(directory.to_string_lossy()).wrap());
-            if ui.button("Copy folder path").clicked() {
-                ui.ctx().copy_text(directory.to_string_lossy().into_owned());
-            }
-        });
-        ui.separator();
-        let registry = ScraperRegistry::with_all_scrapers();
-        if registry.extension_statuses().is_empty() {
-            ui.label(
-                "No external extension packages found. The built-in demo parser is available.",
-            );
-        }
-        render_extension_packages(ui, registry.extension_statuses());
+        let blocked = self.storage_settings.applying
+            || self
+                .account_settings
+                .as_ref()
+                .is_some_and(|editor| editor.busy())
+            || self
+                .raw_settings
+                .as_ref()
+                .is_some_and(|editor| editor.busy());
+        egui::ScrollArea::vertical()
+            .id_salt("extensions_page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(command) = self.extensions_manager.render(ui, &self.config, blocked) {
+                    self.pending_command = Some(command);
+                }
+            });
     }
 
     fn render_description_popup(&mut self, ctx: &egui::Context) {
@@ -4817,6 +4847,7 @@ impl AppWindow {
     }
 }
 
+#[cfg(test)]
 fn render_extension_packages(
     ui: &mut egui::Ui,
     extensions: &[crate::scraper::extensions::ExtensionStatus],
@@ -4832,32 +4863,24 @@ fn render_extension_packages(
         })
 }
 
+#[cfg(test)]
 fn render_extension_card(
     ui: &mut egui::Ui,
     extension: &crate::scraper::extensions::ExtensionStatus,
 ) -> egui::Response {
-    let frame = egui::Frame::group(ui.style());
-    let content_width = (ui.available_width() - frame.total_margin().sum().x).max(0.0);
-    frame
-        .show(ui, |ui| {
-            ui.set_width(content_width);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!("{} {}", extension.id, extension.version)).strong(),
-                )
+    super::extensions_manager::extension_frame(ui, |ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("{} {}", extension.id, extension.version)).strong(),
+            )
+            .wrap(),
+        );
+        ui.add(egui::Label::new(format!("{:?}: {}", extension.runtime, extension.message)).wrap());
+        ui.add(
+            egui::Label::new(egui::RichText::new(extension.directory.to_string_lossy()).small())
                 .wrap(),
-            );
-            ui.add(
-                egui::Label::new(format!("{:?}: {}", extension.runtime, extension.message)).wrap(),
-            );
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(extension.directory.to_string_lossy()).small(),
-                )
-                .wrap(),
-            );
-        })
-        .response
+        );
+    })
 }
 
 // ── Attribute context-menu command builders ───────────────────────────────────

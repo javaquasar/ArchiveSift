@@ -33,6 +33,24 @@ struct SecretInput {
     status: Option<String>,
 }
 impl RawSettingsEditor {
+    pub(super) fn refresh_catalog(&mut self) {
+        self.catalog = SettingsCatalog::installed();
+        self.schema = configuration::schema(&self.catalog).ok();
+        let targets = self.catalog.secret_targets();
+        self.secrets.retain(|target, _| targets.contains(target));
+        for target in targets {
+            self.secrets.entry(target).or_insert_with(|| SecretInput {
+                text: Zeroizing::new(String::new()),
+                pending: false,
+                status: None,
+            });
+        }
+        self.validate();
+        self.status = Some(
+            "Extension settings schema updated. Review and validate your draft before saving."
+                .into(),
+        );
+    }
     pub(super) fn installed(config: &AppConfig) -> Self {
         Self::new(config, SettingsCatalog::installed())
     }

@@ -3,7 +3,7 @@ pub mod extensions;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::error::ScraperError;
 use crate::models::{ListingPage, PageKind, ScrapedItem, ScraperCapabilities};
@@ -150,13 +150,10 @@ impl ScraperRegistry {
 
     /// Creates a registry containing the scrapers shipped with this build.
     pub fn with_all_scrapers() -> Self {
-        static REGISTRY: OnceLock<ScraperRegistry> = OnceLock::new();
-        REGISTRY
-            .get_or_init(|| Self::with_extensions_from(&extensions::default_plugin_directory()))
-            .clone()
+        global_registry().snapshot()
     }
 
-    /// Creates a deterministic startup snapshot. Restart to apply package changes.
+    /// Creates an immutable snapshot. A running job retains its loaded components.
     pub fn with_extensions_from(directory: &std::path::Path) -> Self {
         let mut registry = Self::with_public_scrapers();
         registry.extension_statuses = Arc::new(extensions::discover(&mut registry, directory));
@@ -213,6 +210,64 @@ impl ScraperRegistry {
         self.scraper_for_url(url)
             .map(|scraper| scraper.capabilities())
     }
+}
+
+/// Readers only hold the lock while cloning an immutable snapshot. Compilation,
+/// network requests and existing jobs never hold the publication lock.
+#[derive(Clone)]
+pub struct RegistryProvider(Arc<RwLock<RegistryState>>);
+struct RegistryState {
+    registry: ScraperRegistry,
+    settings: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+impl RegistryProvider {
+    pub fn new(registry: ScraperRegistry) -> Self {
+        Self(Arc::new(RwLock::new(RegistryState {
+            registry,
+            settings: None,
+        })))
+    }
+    pub fn snapshot(&self) -> ScraperRegistry {
+        self.0
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .registry
+            .clone()
+    }
+    pub(crate) fn publish(&self, registry: ScraperRegistry) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).registry = registry;
+    }
+    pub fn configure_settings(
+        &self,
+        settings: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).settings = Some(settings);
+    }
+    pub fn for_job(&self, config: &mut crate::app::AppConfig) -> ScraperRegistry {
+        let state = self.0.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(settings) = &state.settings {
+            config.extension_settings = settings.clone();
+        }
+        state.registry.clone()
+    }
+    pub(crate) fn publish_with_settings(
+        &self,
+        registry: ScraperRegistry,
+        settings: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = RegistryState {
+            registry,
+            settings: Some(settings),
+        };
+    }
+}
+pub fn global_registry() -> &'static RegistryProvider {
+    static REGISTRY: OnceLock<RegistryProvider> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        RegistryProvider::new(ScraperRegistry::with_extensions_from(
+            &extensions::default_plugin_directory(),
+        ))
+    })
 }
 
 /// Registers the public scrapers that are safe to ship in the open-source build.
