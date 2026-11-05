@@ -22,6 +22,8 @@ jobs:
         run: cargo test --locked --test torrent_description --test attachments --test preview_upgrade
       - name: Source-filtered date browsing
         run: cargo test --locked --test date_browse && cargo test --locked --lib date_browse
+      - name: Shared director and author search with autocomplete
+        run: cargo test --locked --test creator_search && cargo test --locked --lib creator
       - name: Recovery, path validation and headless card editor tests
         run: cargo test --locked --lib torrent
       - name: Configuration validation and completion integration tests

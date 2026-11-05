@@ -2,6 +2,7 @@ mod account_settings;
 mod app_window;
 mod background_executor;
 mod coalescing_worker;
+mod creator_filter;
 mod icon;
 mod preview_loader;
 mod raw_settings;
@@ -73,6 +74,7 @@ enum SuggestionKind {
     Actor,
     Category,
     Studio,
+    Creator,
 }
 
 impl SuggestionKind {
@@ -82,6 +84,7 @@ impl SuggestionKind {
             Self::Actor => "actor",
             Self::Category => "category",
             Self::Studio => "studio",
+            Self::Creator => "creator",
         }
     }
 }
@@ -187,6 +190,7 @@ fn suggestion_worker(
 ) -> CoalescingWorker<SuggestionKind, SuggestionJob> {
     let suggestion_tx = state_tx.clone();
     CoalescingWorker::new(move |job: SuggestionJob| {
+        let database_path = job.database_path.clone();
         let results = run_suggestions(
             job.database_path,
             job.kind.database_kind(),
@@ -207,6 +211,11 @@ fn suggestion_worker(
                 results,
             },
             SuggestionKind::Studio => WorkerState::StudioSuggestions {
+                query: job.query,
+                results,
+            },
+            SuggestionKind::Creator => WorkerState::CreatorSuggestions {
+                database_path,
                 query: job.query,
                 results,
             },
@@ -668,6 +677,17 @@ impl DesktopApp {
         );
     }
 
+    fn start_creator_suggestions(&mut self, database_path: String, query: String) {
+        self.suggestion_worker.submit(
+            SuggestionKind::Creator,
+            SuggestionJob {
+                database_path,
+                query,
+                kind: SuggestionKind::Creator,
+            },
+        );
+    }
+
     fn start_search_metadata(&self, database_path: String, image_ids: Vec<i64>) {
         let state_tx = self.state_tx.clone();
         spawn_background(move || {
@@ -981,6 +1001,14 @@ impl DesktopApp {
                     let w = &mut self.window;
                     w.set_studio_suggestions(&query, results);
                 }
+                WorkerState::CreatorSuggestions {
+                    database_path,
+                    query,
+                    results,
+                } => {
+                    self.window
+                        .set_creator_suggestions(&database_path, &query, results);
+                }
                 WorkerState::MetadataUpdated { message, results } => {
                     let w = &mut self.window;
                     w.running = false;
@@ -1196,6 +1224,10 @@ impl DesktopApp {
                     database_path,
                     query,
                 } => self.start_studio_suggestions(database_path, query),
+                UiCommand::SuggestCreators {
+                    database_path,
+                    query,
+                } => self.start_creator_suggestions(database_path, query),
                 UiCommand::AddTagsToImages {
                     database_path,
                     image_ids,
@@ -1505,6 +1537,11 @@ enum WorkerState {
         query: String,
         results: Vec<String>,
     },
+    CreatorSuggestions {
+        database_path: String,
+        query: String,
+        results: Vec<String>,
+    },
     MetadataUpdated {
         message: String,
         results: Result<SearchMutationResult, String>,
@@ -1718,7 +1755,11 @@ fn run_search_recent_pages(
 fn run_suggestions(database_path: String, kind: &str, query: String) -> AppResult<Vec<String>> {
     let database = Database::new(database_path);
     database.initialize()?;
-    database.suggest_attribute_values(kind, &query, 8)
+    if kind == "creator" {
+        database.suggest_creators(&query, 8)
+    } else {
+        database.suggest_attribute_values(kind, &query, 8)
+    }
 }
 
 fn run_add_attributes(
@@ -1818,6 +1859,7 @@ fn attribute_mutation_affects_filter(kind: &str, refresh: &SearchRefresh) -> boo
             "category" => !query.categories.is_empty(),
             "studio" => !query.studios.is_empty(),
             "channel" => !query.channels.is_empty(),
+            "director" | "author" | "photographer" | "creator" => !query.creators.is_empty(),
             _ => false,
         }
 }

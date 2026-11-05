@@ -117,6 +117,13 @@ impl SearchService {
             .map_err(|source| self.query_failed("suggest_studios", source))
     }
 
+    pub fn suggest_creators(&self, query: &str) -> AppResult<Vec<String>> {
+        self.ensure_database_initialized()?;
+        self.database
+            .suggest_creators(query, 8)
+            .map_err(|source| self.query_failed("suggest_creators", source))
+    }
+
     pub fn add_tags_to_images(&self, image_ids: &[i64], values: &[String]) -> AppResult<()> {
         self.ensure_database_initialized()?;
         self.database

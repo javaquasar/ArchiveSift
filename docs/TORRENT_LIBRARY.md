@@ -8,7 +8,7 @@ New torrent pages use the following layout, relative to the configured effective
 download folder (including its optional subfolder):
 
 ```text
-torrents/<source>/<primary studio>/<content title> [topic ID-URL hash]/
+torrents/<source>/<primary studio>/<content title> (<production year>) [topic ID-URL hash]/
     <attachment>.torrent
     <reference>.magnet.txt
     description.txt
@@ -29,10 +29,17 @@ preserved and reported instead of being overwritten. The export appears under Fi
 on the card and moves with its images, torrent and magnet. Existing cards receive it
 when processed again; there is no automatic library-wide backfill.
 
-There is no year directory. Dates and years remain searchable metadata. The URL
+The production year is part of the movie folder name, rather than a separate directory.
+It comes from production/date/year metadata, with release-date metadata as a fallback;
+missing or invalid years are omitted. Dates and years remain searchable metadata. The URL
 hash distinguishes topics with the same visible identifier; portable components
 handle Unicode, forbidden characters, Windows device names and trailing dots.
 All generated paths use the platform's native separators.
+
+Torrent cards display the parser's `content_title`, with the full original heading
+available under Full page title and in `description.txt`. Existing folders keep their
+current paths during reprocessing. Organize files and its confirmation apply the current
+title/year layout to an existing card, moving images and all sidecars together.
 
 ## Editing
 

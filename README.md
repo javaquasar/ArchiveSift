@@ -66,6 +66,17 @@ downloads. Search and SQL remain available without a download folder.
 ordering and previous/next wraparound. Changing Site while browsing restarts at the
 first matching group; All sites restores browsing across sources.
 
+**Search → Images / Torrents → Director / Author** uses one shared attribution
+filter for `director`, `author`, `photographer` and `creator` metadata. Select a
+suggested name or enter its full name, then Run Search / Find torrents. Multiple
+comma-separated names match any selected person; source, tags and other filters
+still apply. Completion combines the whole library, removes duplicate names across
+roles and supports case-insensitive Latin and Cyrillic input.
+Names containing commas are quoted automatically when selected; manual input can
+use double quotes around a name, for example `"Example, Author"`.
+The original roles remain separate in metadata. Page-level credits apply to its
+images; image-specific credits match that image and its parent torrent card.
+
 Open **Settings → Storage** to select the download folder, open an existing
 SQLite library or create a new one, and optionally choose a separate thumbnail
 folder. **Save and apply** validates and saves the selection without restarting.

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::Database;
-use crate::fs::torrent::{safe_component, torrent_directory};
+use crate::fs::torrent::{production_year, safe_component, torrent_directory_with_year};
 use crate::models::{TorrentCard, TorrentEdit};
 use crate::AppResult;
 
@@ -80,12 +80,13 @@ impl TorrentLibrary {
         let organize = organize || edit.primary_studio != card.primary_studio;
         let target = if organize {
             Some(
-                torrent_directory(
+                torrent_directory_with_year(
                     &card.site_key,
                     &edit.primary_studio,
                     card.content_title(),
                     &card.page_url,
                     card.page_id,
+                    production_year(&card.attributes),
                 )
                 .to_string_lossy()
                 .into_owned(),

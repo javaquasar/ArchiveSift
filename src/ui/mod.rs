@@ -271,6 +271,10 @@ pub enum UiCommand {
         database_path: String,
         query: String,
     },
+    SuggestCreators {
+        database_path: String,
+        query: String,
+    },
     AddTagsToImages {
         database_path: String,
         image_ids: Vec<i64>,

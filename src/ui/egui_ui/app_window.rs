@@ -6,6 +6,7 @@ use eframe::egui;
 use eframe::egui::TextureHandle;
 
 use super::account_settings::AccountSettingsEditor;
+use super::creator_filter::CreatorFilter;
 use super::icon::application_viewport;
 use super::preview_loader::{
     ImageLoadMode, ImageLoadTimings, OriginalLoader, PreviewLoader, PreviewSource,
@@ -64,6 +65,7 @@ struct SearchForm {
     site_key: String,
     tags: String,
     actors: String,
+    creators: CreatorFilter,
     categories: String,
     studios: String,
     channels: String,
@@ -82,6 +84,7 @@ impl SearchForm {
             site_key: self.site_filter(),
             tags: split_filter_values(&self.tags),
             actors: split_filter_values(&self.actors),
+            creators: self.creators.values(),
             categories: split_filter_values(&self.categories),
             studios: split_filter_values(&self.studios),
             channels: split_filter_values(&self.channels),
@@ -375,7 +378,9 @@ impl AppWindow {
     }
 
     pub fn take_command(&mut self) -> Option<UiCommand> {
-        self.pending_command.take()
+        self.pending_command
+            .take()
+            .or_else(|| self.torrent_library.take_command())
     }
 
     /// Returns the appropriate refresh mode for the current search state.
@@ -569,6 +574,16 @@ impl AppWindow {
         }
         if last_comma_token(&self.edit_studio_input) == query {
             self.edit_studio_suggestions = suggestions;
+        }
+    }
+
+    pub fn set_creator_suggestions(&mut self, database: &str, query: &str, values: Vec<String>) {
+        if database == self.config.database_path {
+            self.search_form
+                .creators
+                .set_suggestions(database, query, values.clone());
+            self.torrent_library
+                .set_creator_suggestions(database, query, values);
         }
     }
 
@@ -2347,6 +2362,7 @@ impl AppWindow {
                 || !self.search_form.site_key.is_empty()
                 || !self.search_form.tags.is_empty()
                 || !self.search_form.actors.is_empty()
+                || !self.search_form.creators.text.is_empty()
                 || !self.search_form.categories.is_empty()
                 || !self.search_form.studios.is_empty()
                 || !self.search_form.channels.is_empty()
@@ -3061,7 +3077,7 @@ impl AppWindow {
     // ── Search filters ────────────────────────────────────────────────────────
 
     fn render_search_filters(&mut self, ui: &mut egui::Ui) {
-        let label_width = 72.0;
+        let label_width = 112.0;
         let row_height = ui.spacing().interact_size.y;
         let field_width = search_filter_field_width(
             ui.available_width(),
@@ -3215,6 +3231,21 @@ impl AppWindow {
                         &mut self.search_form.studios,
                         &mut self.studio_suggestions,
                     );
+                    ui.end_row();
+                }
+
+                search_filter_label(ui, "Director / Author", label_width, row_height);
+                if let Some(command) =
+                    self.search_form
+                        .creators
+                        .input(ui, field_size, &self.config.database_path)
+                {
+                    self.pending_command = Some(command);
+                }
+                ui.end_row();
+                if self.search_form.creators.has_suggestions() {
+                    search_filter_label(ui, "", label_width, row_height);
+                    self.search_form.creators.render_suggestions(ui);
                     ui.end_row();
                 }
 
@@ -4909,6 +4940,10 @@ fn kind_display_label(kind: &str) -> &str {
         "date" => "Date",
         "resource" => "Resource",
         "content_title" => "Title",
+        "director" => "Director",
+        "author" => "Author",
+        "photographer" => "Photographer",
+        "creator" => "Creator",
         other => other,
     }
 }
@@ -5708,6 +5743,19 @@ mod tests {
 
         assert!(Arc::ptr_eq(&snapshot, &render_snapshot));
         assert_eq!(Arc::strong_count(&snapshot), 2);
+    }
+
+    #[test]
+    fn creator_search_form_keeps_other_filters_and_resets_with_the_form() {
+        let mut form = SearchForm::default();
+        form.creators.text = "Alice Creator, Bob Photographer".into();
+        form.site_key = "example-source".into();
+        form.tags = "Outdoor".into();
+        let query = form.to_query();
+        assert_eq!(query.creators, ["Alice Creator", "Bob Photographer"]);
+        assert_eq!(query.site_key.as_deref(), Some("example-source"));
+        assert_eq!(query.tags, ["Outdoor"]);
+        assert!(SearchForm::default().to_query().creators.is_empty());
     }
 
     #[test]

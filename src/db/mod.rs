@@ -1,3 +1,4 @@
+mod creators;
 mod torrents;
 
 use std::collections::{HashMap, HashSet};
@@ -1736,6 +1737,14 @@ impl Database {
         append_attribute_filter(&mut sql, &mut params, "category", &query.categories);
         append_attribute_filter(&mut sql, &mut params, "studio", &query.studios);
         append_attribute_filter(&mut sql, &mut params, "channel", &query.channels);
+        creators::append_filter(
+            &connection,
+            &mut sql,
+            &mut params,
+            "source_pages.id",
+            Some("images.id"),
+            &query.creators,
+        )?;
 
         if let Some(page_id) = query.page_id {
             sql.push_str(" AND source_pages.id = ?");

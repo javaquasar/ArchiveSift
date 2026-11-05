@@ -1,6 +1,7 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
 
 use super::background_executor::spawn_background;
+use super::creator_filter::CreatorFilter;
 use super::preview_loader::{ImageLoadMode, PreviewLoader, PreviewSource};
 use super::texture_cache::SizedLruCache;
 use crate::app::AppConfig;
@@ -14,6 +15,7 @@ struct Filters {
     text: String,
     site: String,
     studio: String,
+    creators: CreatorFilter,
     tags: String,
     categories: String,
     year: String,
@@ -32,6 +34,7 @@ impl Filters {
             text: self.text.clone(),
             site_key: self.site.clone(),
             studio: self.studio.clone(),
+            creators: self.creators.values(),
             tags: values(&self.tags),
             categories: values(&self.categories),
             year: self.year.trim().into(),
@@ -58,6 +61,7 @@ enum Message {
 }
 
 pub(super) struct TorrentLibraryUi {
+    pending_command: Option<crate::ui::UiCommand>,
     filters: Filters,
     page: TorrentPage,
     selected: Option<TorrentCard>,
@@ -83,6 +87,7 @@ pub(super) struct TorrentLibraryUi {
 impl Default for TorrentLibraryUi {
     fn default() -> Self {
         Self {
+            pending_command: None,
             filters: Filters::default(),
             page: TorrentPage {
                 cards: vec![],
@@ -111,6 +116,21 @@ impl Default for TorrentLibraryUi {
 }
 
 impl TorrentLibraryUi {
+    pub(super) fn take_command(&mut self) -> Option<crate::ui::UiCommand> {
+        self.pending_command.take()
+    }
+
+    pub(super) fn set_creator_suggestions(
+        &mut self,
+        database: &str,
+        query: &str,
+        values: Vec<String>,
+    ) {
+        self.filters
+            .creators
+            .set_suggestions(database, query, values);
+    }
+
     pub(super) fn recover_on_start(&mut self, ctx: &egui::Context, config: &AppConfig) {
         self.recovering = true;
         let library = TorrentLibrary::new(
@@ -259,6 +279,20 @@ impl TorrentLibraryUi {
                             ui.end_row();
                         }
                     }
+                    ui.label("Director / Author");
+                    if let Some(command) = self.filters.creators.input(
+                        ui,
+                        [180.0, ui.spacing().interact_size.y],
+                        &config.database_path,
+                    ) {
+                        self.pending_command = Some(command);
+                    }
+                    ui.end_row();
+                    if self.filters.creators.has_suggestions() {
+                        ui.label("");
+                        self.filters.creators.render_suggestions(ui);
+                        ui.end_row();
+                    }
                 });
             if ui.button("Find torrents / Refresh").clicked() {
                 self.filters.offset = 0;
@@ -317,7 +351,7 @@ impl TorrentLibraryUi {
                             if ui
                                 .add_enabled(
                                     !self.busy && self.plan.is_none(),
-                                    egui::Button::new(&card.title).wrap().selected(
+                                    egui::Button::new(card.content_title()).wrap().selected(
                                         self.selected
                                             .as_ref()
                                             .is_some_and(|c| c.page_id == card.page_id),
@@ -365,7 +399,16 @@ impl TorrentLibraryUi {
         let Some(card) = self.selected.clone() else {
             return;
         };
-        ui.add(egui::Label::new(&card.title).wrap().selectable(true));
+        ui.add(
+            egui::Label::new(card.content_title())
+                .wrap()
+                .selectable(true),
+        );
+        if card.content_title() != card.title {
+            ui.collapsing("Full page title", |ui| {
+                ui.add(egui::Label::new(&card.title).wrap().selectable(true));
+            });
+        }
         ui.hyperlink_to("Open source page", &card.page_url);
         let primary = self
             .edit
@@ -390,7 +433,17 @@ impl TorrentLibraryUi {
                 });
             }
         });
-        for kind in ["date", "year", "release_date", "duration", "actor"] {
+        for kind in [
+            "date",
+            "year",
+            "release_date",
+            "duration",
+            "actor",
+            "director",
+            "author",
+            "photographer",
+            "creator",
+        ] {
             let values = card.values(kind);
             if !values.is_empty() {
                 ui.label(format!("{}: {}", kind, values.join(", ")));
@@ -754,6 +807,18 @@ fn values_editor(
 mod tests {
     use super::*;
     use crate::models::{MetadataAttribute, ScrapedItem};
+
+    #[test]
+    fn torrent_filters_reuse_creator_names_across_pagination() {
+        let mut filters = Filters::default();
+        filters.creators.text = "Alice Creator, Bob Author".into();
+        filters.offset = 40;
+        filters.site = "example-source".into();
+        let query = filters.query();
+        assert_eq!(query.creators, ["Alice Creator", "Bob Author"]);
+        assert_eq!(query.offset, 40);
+        assert_eq!(query.site_key, "example-source");
+    }
 
     fn fixture() -> (
         tempfile::TempDir,

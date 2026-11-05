@@ -428,6 +428,72 @@ fn primary_image_must_belong_to_card_and_deletion_restores_a_safe_fallback() {
 }
 
 #[test]
+fn reparsed_movie_name_and_year_move_only_after_explicit_organization() {
+    let library = Library::new(false);
+    let old = library.db.torrent_card(library.id).unwrap();
+    let directory = old.directory.clone().unwrap();
+    assert!(directory.contains("Example release (2025) ["));
+    let mut reparsed = page();
+    reparsed.title =
+        "Complete source heading with translation and technical suffixes [2026]".into();
+    reparsed
+        .attributes
+        .iter_mut()
+        .find(|a| a.kind == "content_title")
+        .unwrap()
+        .value = "English Example".into();
+    reparsed
+        .attributes
+        .iter_mut()
+        .find(|a| a.kind == "date")
+        .unwrap()
+        .value = "2026-06-23".into();
+    library.db.upsert_scraped_item(&reparsed).unwrap();
+    let updated = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(updated.content_title(), "English Example");
+    assert_eq!(updated.title, reparsed.title);
+    assert_eq!(updated.directory.as_deref(), Some(directory.as_str()));
+    let files = updated
+        .images
+        .iter()
+        .filter_map(|image| image.local_file_path.as_ref())
+        .chain(updated.attachments.iter().map(|a| &a.local_file_path))
+        .map(|relative| std::fs::read(library.base.join(relative)).unwrap())
+        .collect::<Vec<_>>();
+    let plan = library
+        .service()
+        .prepare(
+            library.id,
+            updated.revision,
+            TorrentEdit::from(&updated),
+            true,
+        )
+        .unwrap();
+    assert!(plan
+        .to_directory
+        .as_ref()
+        .unwrap()
+        .contains("English Example (2026) ["));
+    assert!(library.base.join(&directory).is_dir());
+    let moved = library.service().apply(plan, |_| {}).unwrap();
+    assert!(!library.base.join(&directory).exists());
+    assert_eq!(moved.title, reparsed.title);
+    let moved_files = moved
+        .images
+        .iter()
+        .filter_map(|image| image.local_file_path.as_ref())
+        .chain(moved.attachments.iter().map(|a| &a.local_file_path))
+        .map(|relative| std::fs::read(library.base.join(relative)).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(files, moved_files);
+    let reopened = Database::new(library.root.path().join("archive.sqlite3"))
+        .torrent_card(library.id)
+        .unwrap();
+    assert_eq!(reopened.directory, moved.directory);
+    assert_eq!(reopened.values("date"), ["2026-06-23"]);
+}
+
+#[test]
 fn studio_move_keeps_complete_card_sidecars_and_search_paths_consistent() {
     let library = Library::new(false);
     let old = library.db.torrent_card(library.id).unwrap();
@@ -435,7 +501,10 @@ fn studio_move_keeps_complete_card_sidecars_and_search_paths_consistent() {
     std::fs::write(old_folder.join("notes.txt"), b"User notes").unwrap();
     let plan = library.plan("Studio Second");
     assert_eq!(plan.files.len(), 4);
-    assert!(!plan.to_directory.as_ref().unwrap().contains("2025"));
+    assert!(plan.to_directory.as_ref().unwrap().contains(" (2025) ["));
+    assert!(!Path::new(plan.to_directory.as_ref().unwrap())
+        .components()
+        .any(|component| component.as_os_str() == "2025"));
     assert!(old_folder.is_dir(), "preview must not move files");
     let mut edit = plan.edit.clone();
     edit.tags.push("Custom".into());

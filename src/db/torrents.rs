@@ -69,12 +69,13 @@ pub(super) fn after_scrape(
             .attribute_values("content_title")
             .find(|s| !s.trim().is_empty())
             .unwrap_or(&page.title);
-        let directory = crate::fs::torrent::torrent_directory(
+        let directory = crate::fs::torrent::torrent_directory_with_year(
             &page.site_key,
             studio,
             title,
             &page.page_url,
             page_id,
+            crate::fs::torrent::production_year(&page.attributes),
         );
         tx.execute("INSERT OR IGNORE INTO torrent_cards(page_id,primary_studio,directory) VALUES(?1,?2,?3)", params![page_id,studio,directory.to_string_lossy()])?;
     }
@@ -260,6 +261,14 @@ impl Database {
             sql.push_str(" AND (lower(tc.primary_studio)=lower(?) OR EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id WHERE pa.page_id=sp.id AND a.kind='studio' AND a.normalized_value=lower(?)))");
             values.extend([query.studio.trim().into(), query.studio.trim().into()]);
         }
+        super::creators::append_filter(
+            &connection,
+            &mut sql,
+            &mut values,
+            "sp.id",
+            None,
+            &query.creators,
+        )?;
         for (kind, entries) in [("tag", &query.tags), ("category", &query.categories)] {
             for entry in entries.iter().filter(|s| !s.trim().is_empty()) {
                 sql.push_str(" AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id WHERE pa.page_id=sp.id AND a.kind=? AND a.normalized_value=?)");

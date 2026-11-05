@@ -5,6 +5,7 @@ pub struct TorrentQuery {
     pub text: String,
     pub site_key: String,
     pub studio: String,
+    pub creators: Vec<String>,
     pub tags: Vec<String>,
     pub categories: Vec<String>,
     pub year: String,
