@@ -13,6 +13,7 @@ pub struct PeerLumeConfig {
     pub profile: String,
     pub destination: String,
     pub start: bool,
+    pub download_mode: super::ModeConfig,
 }
 
 impl Default for PeerLumeConfig {
@@ -23,6 +24,7 @@ impl Default for PeerLumeConfig {
             profile: String::new(),
             destination: "incoming".into(),
             start: false,
+            download_mode: Default::default(),
         }
     }
 }
@@ -30,6 +32,7 @@ impl Default for PeerLumeConfig {
 impl PeerLumeConfig {
     /// Pure validation, also used by the JSON editor. No filesystem or network IO.
     pub fn validate(&self) -> Result<()> {
+        self.download_mode.validate()?;
         if !self.enabled {
             return Ok(());
         }

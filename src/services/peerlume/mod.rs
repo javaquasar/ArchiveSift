@@ -3,6 +3,8 @@ pub mod client;
 mod config;
 mod files;
 mod journal;
+mod mode;
+mod setup;
 
 use std::fmt;
 use std::path::Path;
@@ -16,6 +18,7 @@ use crate::db::Database;
 use client::{call, discover, ControlTransport};
 pub use config::{relative_destination, PeerLumeConfig};
 use journal::Journal;
+pub use mode::{DownloadMode, ModeConfig, ModeSetup, SetupState, UploadRatio};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -40,6 +43,11 @@ pub enum Error {
     Persistence,
     ReconciliationRequired,
     Remote,
+    ModeConfiguration,
+    ReportingPermission,
+    ModeMetadata,
+    SetupExpired,
+    ModeChanged,
 }
 impl Error {
     fn remote(code: &str) -> Self {
@@ -77,6 +85,11 @@ impl fmt::Display for Error {
             Self::Persistence => "Cannot read or save the ArchiveSift handoff journal.",
             Self::ReconciliationRequired => "Delivery is uncertain. Refresh to reconcile; no automatic add retry will be sent.",
             Self::Remote => "PeerLume rejected the operation. Inspect its local application for details.",
+            Self::ModeConfiguration => "Choose a nonzero freeze threshold up to 9223372036854775807 bytes and a positive upload multiplier range with minimum no greater than maximum.",
+            Self::ReportingPermission => "Custom PeerLume modes require both manage and reporting permission. The torrent will not start in a fallback mode.",
+            Self::ModeMetadata => "Custom PeerLume modes require a v1 or hybrid torrent with a nonzero total size.",
+            Self::SetupExpired => "The confirmed setup expired. The torrent will not be started automatically; review it in PeerLume.",
+            Self::ModeChanged => "The torrent mode changed outside this handoff. It will not be started automatically; review it in PeerLume.",
         })
     }
 }
@@ -201,6 +214,19 @@ pub struct Handoff {
     pub total_bytes: u64,
     pub missing: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub download_mode: ModeConfig,
+    #[serde(default)]
+    pub mode_setup: Option<ModeSetup>,
+    #[serde(default)]
+    pub observed_mode: Option<DownloadMode>,
+}
+impl Handoff {
+    pub fn pending_setup(&self) -> bool {
+        self.mode_setup
+            .as_ref()
+            .is_some_and(|setup| setup.state.pending())
+    }
 }
 
 #[derive(Deserialize)]
@@ -226,6 +252,16 @@ struct Observation {
     id: String,
     state: TransferState,
     downloaded_bytes: u64,
+    #[serde(default)]
+    command_revision: u64,
+    #[serde(default)]
+    active_mode: Option<DownloadMode>,
+    #[serde(default)]
+    mode_state: Option<String>,
+    #[serde(default)]
+    active_freeze_after_bytes: Option<u64>,
+    #[serde(default)]
+    active_upload_ratio: Option<UploadRatio>,
 }
 #[derive(Deserialize)]
 struct Page {
@@ -268,7 +304,7 @@ impl<T: ControlTransport> HandoffService<T> {
     }
 
     pub fn test_connection(&self) -> Result<String> {
-        discover(&self.transport)
+        client::discover_for_mode(&self.transport, &self.config.peerlume.download_mode)
     }
 
     pub fn prepare(&self, page_ids: &[i64]) -> Result<Preparation> {
@@ -353,7 +389,13 @@ impl<T: ControlTransport> HandoffService<T> {
         destination: &str,
         start: bool,
     ) -> Result<Handoff> {
-        self.submit_reviewed(prepared, destination, start, false)
+        self.submit_reviewed(
+            prepared,
+            destination,
+            start,
+            false,
+            self.config.peerlume.download_mode,
+        )
     }
 
     /// A new user confirmation may retry a *confirmed* failed operation. Never
@@ -364,7 +406,24 @@ impl<T: ControlTransport> HandoffService<T> {
         destination: &str,
         start: bool,
     ) -> Result<Handoff> {
-        self.submit_reviewed(prepared, destination, start, true)
+        self.submit_reviewed(
+            prepared,
+            destination,
+            start,
+            true,
+            self.config.peerlume.download_mode,
+        )
+    }
+
+    pub fn submit_with_mode(
+        &self,
+        prepared: &PreparedTorrent,
+        destination: &str,
+        start: bool,
+        retry_failed: bool,
+        mode: ModeConfig,
+    ) -> Result<Handoff> {
+        self.submit_reviewed(prepared, destination, start, retry_failed, mode)
     }
 
     fn submit_reviewed(
@@ -373,9 +432,15 @@ impl<T: ControlTransport> HandoffService<T> {
         destination: &str,
         start: bool,
         retry_failed: bool,
+        mode: ModeConfig,
     ) -> Result<Handoff> {
         let destination = relative_destination(destination)?;
-        let instance = discover(&self.transport)?;
+        let instance = client::discover_for_mode(&self.transport, &mode)?;
+        if mode.custom()
+            && (prepared.preview.info_hash_v1.is_none() || prepared.preview.total_bytes == 0)
+        {
+            return Err(Error::ModeMetadata);
+        }
         if prepared.profile != self.profile
             || prepared.instance != instance
             || now_ms().saturating_sub(prepared.reviewed_at) > 15 * 60 * 1000
@@ -416,7 +481,11 @@ impl<T: ControlTransport> HandoffService<T> {
             total_bytes: prepared.preview.total_bytes,
             missing: false,
             error: None,
+            download_mode: mode,
+            mode_setup: (mode.custom() && existing.is_none()).then(ModeSetup::default),
+            observed_mode: existing.and_then(|row| row.active_mode),
         };
+        let _lease = self.record_lease(&record.id)?.ok_or(Error::Busy)?;
         let (mut record, reserved) = self.journal.reserve(record, retry_failed)?;
         if !reserved || existing.is_some() {
             return Ok(record);
@@ -425,7 +494,7 @@ impl<T: ControlTransport> HandoffService<T> {
             &self.transport,
             Some(&instance),
             json!({"name":"add","args":{
-                "source":record.source,"destination":record.destination,"start":record.start,
+                "source":record.source,"destination":record.destination,"start":record.start && !record.download_mode.custom(),
                 "idempotency_key":record.idempotency_key,"deadline_unix_ms":record.deadline_unix_ms
             }}),
         );
@@ -460,6 +529,10 @@ impl<T: ControlTransport> HandoffService<T> {
             Vec::new()
         };
         for record in &mut records {
+            let Some(_lease) = self.record_lease(&record.id)? else {
+                continue;
+            };
+            *record = self.journal.get(&record.id)?;
             if record.instance == instance
                 && matches!(
                     record.state,
@@ -484,6 +557,7 @@ impl<T: ControlTransport> HandoffService<T> {
             if let Some(row) = snapshot.iter().find(|row| record.hashes.matches(&row.id)) {
                 record.torrent_id = Some(row.id.clone());
                 record.transfer = Some(row.state);
+                record.observed_mode = row.active_mode;
                 record.downloaded_bytes = row.downloaded_bytes;
                 record.missing = false;
                 if matches!(
@@ -496,6 +570,7 @@ impl<T: ControlTransport> HandoffService<T> {
                 }
             } else {
                 record.transfer = None;
+                record.observed_mode = None;
                 record.missing = record.torrent_id.is_some();
                 if let Some(operation) = operations
                     .iter()

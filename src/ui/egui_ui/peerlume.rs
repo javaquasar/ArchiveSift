@@ -8,8 +8,8 @@ use super::background_executor::spawn_background;
 use crate::app::AppConfig;
 use crate::secure_store::{Secret, SecretStore, SystemSecretStore};
 use crate::services::peerlume::{
-    self, client::CliTransport, Handoff, HandoffService, HandoffState, PeerLumeConfig, Preparation,
-    PreparedTorrent,
+    self, client::CliTransport, DownloadMode, Handoff, HandoffService, HandoffState, ModeConfig,
+    PeerLumeConfig, Preparation, PreparedTorrent,
 };
 use crate::ui::UiCommand;
 
@@ -33,9 +33,11 @@ pub(super) struct PeerLumeUi {
     review_errors: Vec<(i64, String)>,
     destination: String,
     start: bool,
+    mode: ModeConfig,
     retry_failed: bool,
     history: Vec<Handoff>,
     last_refresh: Option<Instant>,
+    history_loaded: bool,
 }
 
 fn service(config: AppConfig) -> peerlume::Result<HandoffService<CliTransport>> {
@@ -86,6 +88,8 @@ impl PeerLumeUi {
             self.review_errors.clear();
             self.destination = config.peerlume.destination.clone();
             self.start = config.peerlume.start;
+            self.mode = config.peerlume.download_mode;
+            self.history_loaded = false;
             self.status = None;
             self.error = None;
         }
@@ -144,6 +148,7 @@ impl PeerLumeUi {
         self.review_errors.clear();
         self.destination = config.peerlume.destination.clone();
         self.start = config.peerlume.start;
+        self.mode = config.peerlume.download_mode;
         self.retry_failed = false;
         let config = config.clone();
         self.job(ctx, move || {
@@ -155,14 +160,50 @@ impl PeerLumeUi {
     }
 
     fn history(&mut self, ctx: &egui::Context, config: &AppConfig, refresh: bool) {
-        self.open = true;
+        self.update_history(ctx, config, refresh, true);
+    }
+
+    fn update_history(
+        &mut self,
+        ctx: &egui::Context,
+        config: &AppConfig,
+        refresh: bool,
+        show: bool,
+    ) {
+        self.open |= show;
+        self.history_loaded = true;
         let config = config.clone();
         self.job(ctx, move || {
             service(config)
-                .and_then(|s| if refresh { s.refresh() } else { s.history() })
+                .and_then(|s| {
+                    if refresh {
+                        s.advance_setups()
+                    } else {
+                        s.history()
+                    }
+                })
                 .map(Outcome::History)
                 .map_err(|e| e.to_string())
         });
+    }
+
+    /// Continue confirmed setup steps even while the review window is closed.
+    /// No network call is made on startup merely to load the local journal.
+    pub fn tick(&mut self, ctx: &egui::Context, config: &AppConfig, storage_busy: bool) {
+        if !config.peerlume.enabled || self.busy() || storage_busy || !self.review.is_empty() {
+            return;
+        }
+        if !self.history_loaded && self.error.is_none() {
+            self.update_history(ctx, config, false, false);
+        } else if self.history.iter().any(Handoff::pending_setup) && self.error.is_none() {
+            if self
+                .last_refresh
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
+            {
+                self.update_history(ctx, config, true, false);
+            }
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 
     pub fn settings(
@@ -185,6 +226,8 @@ impl PeerLumeUi {
                 ui.text_edit_singleline(&mut draft.destination);
             });
             ui.checkbox(&mut draft.start, "Start downloading after confirmation");
+            ui.label("Default download mode");
+            mode_editor(ui, &mut draft.download_mode, "default_peerlume_mode");
             ui.weak("Destination must already exist inside PeerLume's granted download root. Payload files are separate from card artwork and metadata.");
             ui.horizontal(|ui| {
                 ui.label("Control token");
@@ -224,8 +267,8 @@ impl PeerLumeUi {
             } else if test {
                 self.job(ui.ctx(), move || {
                     let transport = CliTransport::connect(&target).map_err(|e| e.to_string())?;
-                    peerlume::client::discover(&transport).map_err(|e| e.to_string())?;
-                    Ok(Outcome::Message("Connected: protocol 1, preview/add capabilities and manage permission verified.".into()))
+                    peerlume::client::discover_for_mode(&transport, &target.download_mode).map_err(|e| e.to_string())?;
+                    Ok(Outcome::Message("Connected: protocol 1 and permissions for the selected default mode verified.".into()))
                 });
             }
         });
@@ -283,9 +326,16 @@ impl PeerLumeUi {
                     ui.add_enabled_ui(!busy && !storage_busy, |ui| {
                         ui.horizontal(|ui| { ui.label("Existing relative destination"); ui.text_edit_singleline(&mut self.destination); });
                         ui.horizontal(|ui| { ui.radio_value(&mut self.start, false, "Add paused"); ui.radio_value(&mut self.start, true, "Start now"); });
+                        ui.label("Download mode for this batch");
+                        mode_editor(ui, &mut self.mode, "review_peerlume_mode");
+                        if self.mode.custom() {
+                            ui.weak("Adds paused, applies the mode with reporting permission, then starts only after engine confirmation. Setup continues in the background while ArchiveSift is open.");
+                        }
                         ui.checkbox(&mut self.retry_failed, "Retry confirmed failed handoffs with a new request");
                         ui.weak("Confirming can start network transfers in PeerLume. Existing torrents are linked without changing their destination or state.");
-                        let valid = peerlume::relative_destination(&self.destination).is_ok() && self.review.iter().any(|(on,_)| *on);
+                        let supported = !self.mode.custom() || self.review.iter().filter(|(on,_)| *on).all(|(_,item)| item.preview.info_hash_v1.is_some() && item.preview.total_bytes > 0);
+                        if !supported { ui.colored_label(egui::Color32::RED,peerlume::Error::ModeMetadata.to_string()); }
+                        let valid = peerlume::relative_destination(&self.destination).is_ok() && self.review.iter().any(|(on,_)| *on) && self.mode.validate().is_ok() && supported;
                         submit = ui.add_enabled(valid, egui::Button::new("Confirm and send selected torrents")).clicked();
                         if ui.button("Discard review").clicked() { self.review.clear(); self.review_errors.clear(); }
                     });
@@ -294,7 +344,7 @@ impl PeerLumeUi {
                 refresh = ui.add_enabled(!busy && self.review.is_empty() && !storage_busy, egui::Button::new("Refresh handoff and transfer status")).clicked();
                 ui.label("Recent handoffs for the selected profile (up to 1,000). Acknowledged add operations and current transfer observations are shown separately.");
                 if let Some(at) = self.last_refresh { ui.weak(format!("Last loaded {} seconds ago. Refresh verifies the current owner state.", at.elapsed().as_secs())); }
-                egui::ScrollArea::vertical().id_salt("peerlume_history_scroll").max_height(350.0).show_rows(ui, 144.0, self.history.len(), |ui, rows| {
+                egui::ScrollArea::vertical().id_salt("peerlume_history_scroll").max_height(350.0).show_rows(ui, 176.0, self.history.len(), |ui, rows| {
                     for index in rows {
                         history_card(ui, &self.history[index]);
                     }
@@ -313,17 +363,15 @@ impl PeerLumeUi {
             let config = config.clone();
             let destination = self.destination.clone();
             let start = self.start;
+            let mode = self.mode;
             let retry_failed = self.retry_failed;
             self.job(ctx, move || {
                 let service = service(config).map_err(|e| e.to_string())?;
                 let mut errors = Vec::new();
                 let mut chosen = Vec::new();
                 for item in selected {
-                    let result = if retry_failed {
-                        service.retry_failed(&item, &destination, start)
-                    } else {
-                        service.submit(&item, &destination, start)
-                    };
+                    let result =
+                        service.submit_with_mode(&item, &destination, start, retry_failed, mode);
                     match result {
                         Ok(record) => chosen.push(record),
                         Err(error) => errors.push(format!("Card {}: {error}", item.page_id)),
@@ -364,6 +412,10 @@ fn history_card(ui: &mut egui::Ui, record: &Handoff) {
         ui.add(egui::Label::new(&record.title).truncate()).on_hover_text(&record.title);
         let transfer = record.transfer.map_or("Not observed".into(), |s| format!("{s:?}"));
         ui.add(egui::Label::new(format!("Handoff: {:?} · Transfer: {transfer}", record.state)).truncate());
+        let setup = record.mode_setup.as_ref().map_or("".into(), |s| format!(" · Setup: {:?}",s.state));
+        let observed = record.observed_mode.map_or("Not observed", |mode| mode.label());
+        let label = format!("Requested: {} · PeerLume: {observed}{setup}",record.download_mode.mode.label());
+        ui.add(egui::Label::new(&label).truncate()).on_hover_text(label);
         ui.add(egui::Label::new(format!("{} / {} bytes · Destination: {}", record.downloaded_bytes, record.total_bytes, record.destination)).truncate())
             .on_hover_text(&record.destination);
         if let Some(id) = &record.operation_id {
@@ -377,6 +429,54 @@ fn history_card(ui: &mut egui::Ui, record: &Handoff) {
             ui.add(egui::Label::new(egui::RichText::new(error).color(egui::Color32::RED)).truncate()).on_hover_text(error);
         }
     });
+}
+
+fn mode_editor(ui: &mut egui::Ui, config: &mut ModeConfig, id: &str) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(config.mode.label())
+        .show_ui(ui, |ui| {
+            for mode in DownloadMode::ALL {
+                ui.selectable_value(&mut config.mode, mode, mode.label())
+                    .on_hover_text(mode.description());
+            }
+        });
+    ui.label(config.mode.description());
+    if config.mode == DownloadMode::FreezeAfter {
+        ui.horizontal(|ui| {
+            ui.label("Freeze after received bytes");
+            ui.add(
+                egui::DragValue::new(&mut config.freeze_after_bytes)
+                    .range(1..=i64::MAX as u64)
+                    .speed(1024 * 1024),
+            );
+        });
+    }
+    if config.mode == DownloadMode::UploadRatio {
+        for (label, value) in [
+            ("Minimum multiplier", &mut config.upload_ratio.min_milli),
+            ("Maximum multiplier", &mut config.upload_ratio.max_milli),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                let mut ratio = *value as f64 / 1000.0;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut ratio)
+                            .range(0.001..=u32::MAX as f64 / 1000.0)
+                            .speed(0.1)
+                            .max_decimals(3)
+                            .prefix("× "),
+                    )
+                    .changed()
+                {
+                    *value = (ratio * 1000.0).round() as u32;
+                }
+            });
+        }
+    }
+    if let Err(error) = config.validate() {
+        ui.colored_label(egui::Color32::RED, error.to_string());
+    }
 }
 
 fn path_field(ui: &mut egui::Ui, label: &str, value: &mut String, folder: bool) {
@@ -514,6 +614,83 @@ mod tests {
             true
         )
         .is_none());
+    }
+
+    #[test]
+    fn peerlume_default_mode_picker_is_saved_as_typed_configuration() {
+        let config = AppConfig::default();
+        let ctx = egui::Context::default();
+        let mut panel = PeerLumeUi::default();
+        panel.poll(&config);
+        click(&mut panel, &config, &ctx, "Normal", true, false);
+        click(
+            &mut panel,
+            &config,
+            &ctx,
+            "No progress reporting",
+            true,
+            false,
+        );
+        assert_eq!(
+            panel.draft.as_ref().unwrap().download_mode.mode,
+            DownloadMode::NoProgress
+        );
+        let command = click(
+            &mut panel,
+            &config,
+            &ctx,
+            "Save PeerLume settings",
+            true,
+            false,
+        )
+        .unwrap();
+        let UiCommand::ApplyConfiguration { document, expected } = command else {
+            panic!("Unexpected command");
+        };
+        assert_eq!(document["peerlume"]["download_mode"]["mode"], "no_progress");
+        assert_eq!(expected["peerlume"]["download_mode"]["mode"], "normal");
+        assert_eq!(config.peerlume.download_mode.mode, DownloadMode::Normal);
+    }
+
+    #[test]
+    fn peerlume_review_mode_override_does_not_replace_the_saved_default() {
+        let config = AppConfig {
+            peerlume: PeerLumeConfig {
+                download_mode: ModeConfig {
+                    mode: DownloadMode::HideDownloaded,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut panel = PeerLumeUi::default();
+        panel.poll(&config);
+        assert_eq!(panel.mode.mode, DownloadMode::HideDownloaded);
+        panel.open = true;
+        panel.review = vec![(
+            true,
+            crate::services::peerlume::tests::prepared_for_ui_test(),
+        )];
+        click(
+            &mut panel,
+            &config,
+            &ctx,
+            "Hide downloaded bytes",
+            false,
+            false,
+        );
+        click(&mut panel, &config, &ctx, "Normal", false, false);
+        assert_eq!(panel.mode.mode, DownloadMode::Normal);
+        assert_eq!(
+            panel.draft.as_ref().unwrap().download_mode.mode,
+            DownloadMode::HideDownloaded
+        );
+        click(&mut panel, &config, &ctx, "Discard review", false, false);
+        assert!(!panel.busy());
+        panel.prepare(&ctx, &config, vec![1]); // Disabled integration: no credentials or real owner used.
+        assert_eq!(panel.mode.mode, DownloadMode::HideDownloaded);
     }
 
     #[test]

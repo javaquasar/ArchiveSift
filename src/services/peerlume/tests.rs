@@ -10,6 +10,9 @@ pub(crate) fn prepared_for_ui_test() -> PreparedTorrent {
     Fixture::new().prepare()
 }
 
+#[path = "mode_tests.rs"]
+mod mode_tests;
+
 #[derive(Clone)]
 struct Fake {
     state: Arc<Mutex<FakeState>>,
@@ -19,11 +22,13 @@ struct Fake {
 struct FakeState {
     instance: String,
     manage: bool,
+    reporting: bool,
     protocol: u32,
     methods: Vec<Value>,
     torrents: Vec<Value>,
     operations: Vec<Value>,
     add_error: Option<Error>,
+    mutation_error: Option<Error>,
     page_error_once: bool,
     pages: bool,
     fail_preview: bool,
@@ -38,7 +43,7 @@ impl ControlTransport for Fake {
         let args = &method["args"];
         let result = match method["name"].as_str().unwrap() {
             "discover" => {
-                json!({"protocol_version":state.protocol,"capabilities":["preview","add","operations","list"],"grants":{"manage":state.manage}})
+                json!({"protocol_version":state.protocol,"capabilities":["preview","add","operations","list","mutate"],"grants":{"manage":state.manage,"reporting":state.reporting}})
             }
             "preview" => {
                 if state.fail_preview {
@@ -91,6 +96,41 @@ impl ControlTransport for Fake {
                 .find(|op| op["operation_id"] == args["operation_id"])
                 .cloned()
                 .ok_or(Error::ReconciliationRequired)?,
+            "mutate" => {
+                if !state.reporting {
+                    return Err(Error::PermissionDenied);
+                }
+                let index = state
+                    .torrents
+                    .iter()
+                    .position(|row| row["id"] == args["torrent_id"])
+                    .unwrap();
+                assert_eq!(
+                    args["expected_revision"].as_u64().unwrap(),
+                    state.torrents[index]["command_revision"]
+                        .as_u64()
+                        .unwrap_or(0)
+                );
+                // A mutation intent must already be durable before delivery.
+                let conn = rusqlite::Connection::open(&self.database).unwrap();
+                let json: String = conn
+                    .query_row(
+                        "SELECT record FROM peerlume_handoffs ORDER BY rowid DESC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(json.contains(args["idempotency_key"].as_str().unwrap()));
+                let command = args["command"]["kind"].as_str().unwrap();
+                let op = json!({"operation_id":format!("op-{}",state.operations.len()),"torrent_id":args["torrent_id"],"command":command,"state":"queued","error":null});
+                state.operations.push(op.clone());
+                state.torrents[index]["command_revision"] =
+                    (args["expected_revision"].as_u64().unwrap() + 1).into();
+                if let Some(error) = state.mutation_error.take() {
+                    return Err(error);
+                }
+                op
+            }
             "operations" => json!({"operations":state.operations,"next_offset":null}),
             _ => panic!("Unexpected request"),
         };
@@ -157,11 +197,13 @@ impl Fixture {
             state: Arc::new(Mutex::new(FakeState {
                 instance: "owner-1".into(),
                 manage: true,
+                reporting: true,
                 protocol: 1,
                 methods: vec![],
                 torrents: vec![],
                 operations: vec![],
                 add_error: None,
+                mutation_error: None,
                 pages: false,
                 page_error_once: false,
                 fail_preview: false,

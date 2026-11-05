@@ -16,8 +16,11 @@ a local `.torrent` attachment can use it without a parser API change.
 
 - A PeerLume section in Settings, with an enable switch, absolute control-CLI
   path, absolute profile directory, existing relative payload destination and
-  default start mode. The same non-secret settings are editable in the JSON
+  default initial state. The same non-secret settings are editable in the JSON
   editor, with completion and validation.
+- A default PeerLume download/reporting mode, with a per-batch override in the
+  review window. All five protocol-1 modes are supported, including freeze
+  thresholds and upload multiplier bounds. Defaults affect future handoffs only.
 - A separate control token in the operating system credential store, scoped to
   the canonical profile and reserved for the host. Tokens are not configuration
   values and are never passed to parsers, command-line arguments or logs.
@@ -45,10 +48,11 @@ a local `.torrent` attachment can use it without a parser API change.
 ## Setup and first download
 
 1. Start PeerLume with the intended profile. Enable its restricted control API
-   and create a dedicated client token with the `manage` grant. That existing
+   and create a dedicated client token with the `manage` grant. Custom modes also
+   require the separate `reporting` grant. That existing management
    grant is broader than add-only; ArchiveSift uses only discover, preview, add,
-   operation, operations and list. It does not request export, removal or
-   reporting grants. Access must be enabled again when the PeerLume owner
+   operation, operations, list and the confirmed mode/start mutations. It does
+   not request export or removal grants. Access must be enabled again when the PeerLume owner
    restarts; closing a frontend alone may leave its owner running.
 2. In ArchiveSift Settings, enable PeerLume, choose `peerlume-control` (or
    `peerlume-control.exe`) and the corresponding profile. Save the token using
@@ -80,7 +84,12 @@ does not override them or provide a per-file selection editor.
     "executable": "",
     "profile": "",
     "destination": "incoming",
-    "start": false
+    "start": false,
+    "download_mode": {
+      "mode": "normal",
+      "freeze_after_bytes": 1073741824,
+      "upload_ratio": { "min_milli": 1500, "max_milli": 2500 }
+    }
   }
 }
 ```
@@ -92,6 +101,67 @@ destination is a portable relative path with normal components only: no parent
 traversal, drive prefixes, network roots, alternate streams or reserved names.
 Use `/` between destination components on either OS; native executable/profile
 paths are displayed and selected using the current platform's conventions.
+
+## Default download modes
+
+Choose **Default download mode** in Settings → Integrations · PeerLume, then save
+PeerLume settings. Every new review starts with that saved choice. Changing the
+mode in a review affects that batch only. Existing torrents and previously
+confirmed handoffs retain their own modes.
+
+| JSON mode | Behavior in PeerLume |
+| --- | --- |
+| `normal` | Download and announce actual transfer metrics. |
+| `no_progress` | Download normally; announce zero uploaded/downloaded and the full size remaining, without a completed event. |
+| `upload_ratio_1_5` | Report uploaded bytes using a random multiplier from the configured range for each announce. |
+| `hide_downloaded` | Report zero downloaded bytes; upload and remaining bytes stay actual. |
+| `freeze_after` | Report actual metrics until the received-byte threshold, then preserve that metrics snapshot. |
+
+Custom modes require v1/hybrid metainfo with a nonzero total size, and a client
+token with both `manage` and `reporting` grants. Missing permissions or unsupported
+metadata prevent submission; the host never silently switches to Normal. The
+upload multiplier uses integer thousandths: `1500` means ×1.5. Its minimum must
+be positive and no greater than its maximum. The freeze threshold is in bytes,
+from 1 through 9223372036854775807. The default parameter values match PeerLume.
+The JSON editor completes mode IDs and validates these parameters.
+
+Protocol 1 does not accept a mode in Add. For custom modes ArchiveSift therefore
+adds **paused**, waits for a confirmed Add operation, applies the chosen mode,
+and waits for engine acknowledgement and a matching observed configuration.
+Only then does it request Resume when **Start now** was selected. **Add paused**
+finishes mode setup without a Resume request. Normal mode keeps the existing
+single-Add flow and does not require a reporting grant.
+
+Each mode/start command has its own persisted revision, idempotency key,
+deadline and operation ID. Background setup continues while ArchiveSift is open,
+including when the review window is closed. After restarting ArchiveSift, known
+acknowledged setup steps can continue for the same owner within the original
+15-minute confirmation window. An owner change, an unacknowledged mutation, an
+expired setup or a mode changed in another client blocks automatic startup and
+is reported for review in PeerLume. Neither Add nor an ambiguous mutation is
+automatically replayed.
+
+Initial file checking is treated as a transient state: setup waits for it rather
+than failing or resuming during verification. Per-record process leases protect
+the command intent and receipt while multiple ArchiveSift instances use the same
+library.
+
+```mermaid
+stateDiagram-v2
+    [*] --> AwaitingAdd: confirmed custom mode
+    AwaitingAdd --> ApplyingMode: Add succeeded and torrent paused
+    ApplyingMode --> Starting: mode acknowledged and observed, Start now
+    ApplyingMode --> Complete: mode acknowledged and observed, Add paused
+    Starting --> Complete: Resume acknowledged
+    AwaitingAdd --> Failed: expired or Add failed
+    ApplyingMode --> Failed: mode rejected or changed
+    Starting --> ReconciliationRequired: acknowledgement lost
+    ApplyingMode --> ReconciliationRequired: acknowledgement lost
+```
+
+The handoff list distinguishes the requested mode, the last mode observed in
+PeerLume and setup state. Linking an existing torrent never changes its mode or
+start state. Setting a different application default does not edit old tasks.
 
 ## Architecture
 
@@ -174,8 +244,9 @@ stateDiagram-v2
     Linked --> TransferObserved: current list snapshot
 ```
 
-Refresh is read-only. It polls operations and a revision-consistent paginated
-torrent snapshot. Unacknowledged submissions are reconciled by their info hashes
+Status refresh polls operations and a revision-consistent paginated torrent
+snapshot. It can also finish mode/start steps already confirmed in a review;
+it never issues another Add automatically. Unacknowledged submissions are reconciled by their info hashes
 and identifiable add operations where possible. An inconclusive result remains
 **Reconciliation required**; it is not retried automatically. This conservative
 rule prevents a crash or timeout from causing a second uncontrolled add. User
@@ -210,8 +281,8 @@ ambiguous delivery, revision-aware pagination and partial batch failures.
 Headless UI tests cover the settings/review flow and confirmation boundary.
 Existing unit/integration tests and the public privacy audit must pass.
 
-Local verification includes 473 passing workspace tests, including 28 integration-specific
-tests: 24 service/configuration/headless UI tests and four native subprocess
+Local verification covers 490 passing workspace tests, including 45 integration-specific
+checks: 41 service/configuration/headless UI tests plus four native subprocess
 contract tests. The existing OS credential-store roundtrip test remains opt-in
 because it needs an interactive desktop credential store. CI is configured to run
 the new tests on both Windows and Linux. Linux execution is delegated to CI;

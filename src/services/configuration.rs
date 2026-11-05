@@ -87,6 +87,7 @@ pub fn schema(catalog: &SettingsCatalog) -> Result<SettingsSchema, String> {
     );
     let properties = root["properties"].as_object_mut().unwrap();
     properties.get_mut("peerlume").unwrap()["description"] = json!("PeerLume local control integration; tokens are stored separately in the OS credential store");
+    properties.get_mut("peerlume").unwrap()["properties"]["download_mode"]["properties"]["mode"] = json!({"type":"string","enum":["normal","no_progress","upload_ratio_1_5","hide_downloaded","freeze_after"],"default":"normal","description":"Default PeerLume mode, overridable during review. Custom modes require reporting permission."});
     properties.insert("extension_accounts".into(),json!({"type":"object","additionalProperties":{"type":"object","properties":{"username":{"type":"string","maxLength":512,"default":""},"remember_password":{"type":"boolean","default":false}},"required":["username"],"additionalProperties":false},"properties":{}}));
     properties.insert("extension_settings".into(),json!({"type":"object","properties":{},"additionalProperties":{"type":"object","additionalProperties":true},"required":[]}));
     for (id, plugin) in &catalog.plugins {

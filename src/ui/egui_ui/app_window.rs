@@ -784,6 +784,9 @@ impl AppWindow {
             }
         }
         let storage_busy = self.storage_settings.applying || self.torrent_library.busy;
+        if self.pending_command.is_none() {
+            self.peerlume.tick(ctx, &self.config, storage_busy);
+        }
         self.peerlume.render(ctx, &self.config, storage_busy);
         if !self.storage_settings.applying {
             self.render_viewer(ctx);

@@ -197,9 +197,15 @@ pub struct Discovery {
 #[derive(Deserialize)]
 pub struct Grants {
     pub manage: bool,
+    #[serde(default)]
+    pub reporting: bool,
 }
 
 pub fn discover(transport: &dyn ControlTransport) -> Result<String> {
+    discover_session(transport).map(|(id, _)| id)
+}
+
+pub(super) fn discover_session(transport: &dyn ControlTransport) -> Result<(String, Discovery)> {
     let (id, discovery): (_, Discovery) = call(transport, None, json!({"name":"discover"}))?;
     if discovery.protocol_version != 1 {
         return Err(Error::Protocol);
@@ -212,5 +218,26 @@ pub fn discover(transport: &dyn ControlTransport) -> Result<String> {
             return Err(Error::Protocol);
         }
     }
+    Ok((id, discovery))
+}
+
+pub fn discover_for_mode(
+    transport: &dyn ControlTransport,
+    mode: &super::ModeConfig,
+) -> Result<String> {
+    mode.validate()?;
+    let (id, discovery) = discover_session(transport)?;
+    require_mode_grant(&discovery, mode)?;
     Ok(id)
+}
+pub(super) fn require_mode_grant(discovery: &Discovery, mode: &super::ModeConfig) -> Result<()> {
+    if mode.custom() {
+        if !discovery.grants.reporting {
+            return Err(Error::ReportingPermission);
+        }
+        if !discovery.capabilities.iter().any(|cap| cap == "mutate") {
+            return Err(Error::Protocol);
+        }
+    }
+    Ok(())
 }

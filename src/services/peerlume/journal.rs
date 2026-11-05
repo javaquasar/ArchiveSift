@@ -100,6 +100,17 @@ impl Journal {
             .map_err(|_| Error::Persistence)?;
         Ok(())
     }
+    pub fn get(&self, id: &str) -> Result<Handoff> {
+        let json: String = self
+            .connection
+            .query_row(
+                "SELECT record FROM peerlume_handoffs WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|_| Error::Persistence)?;
+        serde_json::from_str(&json).map_err(|_| Error::Persistence)
+    }
     pub fn list(&self, profile: &str) -> Result<Vec<Handoff>> {
         let mut query = self.connection.prepare("SELECT record FROM peerlume_handoffs WHERE profile=?1 ORDER BY rowid DESC LIMIT 1000").map_err(|_| Error::Persistence)?;
         let rows = query

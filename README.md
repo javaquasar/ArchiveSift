@@ -18,6 +18,7 @@ without rebuilding the application. See [extension architecture and UML](docs/EX
 - Static demo target for development and tests
 - Signed extension packages, live updates, side-by-side versions and rollback in Extensions
 - Reviewed single-card and batch torrent handoff to PeerLume, with a durable delivery journal and transfer status
+- Default PeerLume download modes with per-batch overrides and confirmed mode setup before startup
 - Embedded application icon shared by the main window, image viewer and auxiliary windows
 
 ## Demo download fixture
