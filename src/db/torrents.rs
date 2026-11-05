@@ -1,6 +1,7 @@
 use super::*;
 use crate::models::{
     TorrentAttachment, TorrentCard, TorrentEdit, TorrentImage, TorrentPage, TorrentQuery,
+    TorrentSummary, TorrentSummaryPage,
 };
 
 pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
@@ -152,6 +153,83 @@ fn apply_overrides(tx: &Transaction<'_>, page_id: i64) -> AppResult<()> {
     Ok(())
 }
 
+fn read_cards(connection: &Connection, ids: &[i64]) -> AppResult<Vec<TorrentCard>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let mut statement = connection.prepare(&format!("SELECT sp.id,sp.site_key,sp.page_url,sp.title,tc.primary_studio,tc.directory,tc.revision,tc.primary_image_id,tc.folder_name FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE tc.page_id IN ({placeholders})"))?;
+    let headers = statement
+        .query_map(params_from_iter(ids), |r| {
+            Ok(TorrentCard {
+                page_id: r.get(0)?,
+                site_key: r.get(1)?,
+                page_url: r.get(2)?,
+                title: r.get(3)?,
+                primary_studio: r.get(4)?,
+                directory: r.get(5)?,
+                revision: r.get(6)?,
+                primary_image_id: r.get(7)?,
+                folder_name: r.get(8)?,
+                attributes: vec![],
+                images: vec![],
+                attachments: vec![],
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut cards = headers
+        .into_iter()
+        .map(|card| (card.page_id, card))
+        .collect::<HashMap<_, _>>();
+    for (id, attributes) in batch_load_page_attributes(connection, ids)? {
+        if let Some(card) = cards.get_mut(&id) {
+            card.attributes = attributes;
+        }
+    }
+    let mut statement = connection.prepare(&format!("SELECT pi.page_id,pi.image_id,i.source_url,pi.local_file_path,pi.thumbnail_path FROM page_images pi JOIN images i ON i.id=pi.image_id WHERE pi.page_id IN ({placeholders}) ORDER BY pi.page_id,pi.sort_order,pi.image_id"))?;
+    let rows = statement.query_map(params_from_iter(ids), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            TorrentImage {
+                image_id: r.get(1)?,
+                source_url: r.get(2)?,
+                local_file_path: r.get(3)?,
+                thumbnail_path: r.get(4)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, image) = row?;
+        if let Some(card) = cards.get_mut(&id) {
+            card.images.push(image);
+        }
+    }
+    let mut statement = connection.prepare(&format!("SELECT page_id,source_url,filename,local_file_path FROM page_attachments WHERE page_id IN ({placeholders}) ORDER BY page_id,filename,source_url"))?;
+    let rows = statement.query_map(params_from_iter(ids), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            TorrentAttachment {
+                source_url: r.get(1)?,
+                filename: r.get(2)?,
+                local_file_path: r.get(3)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, attachment) = row?;
+        if let Some(card) = cards.get_mut(&id) {
+            card.attachments.push(attachment);
+        }
+    }
+    ids.iter()
+        .map(|id| {
+            cards
+                .remove(id)
+                .ok_or_else(|| "card changed; reload results".into())
+        })
+        .collect()
+}
+
 fn read_card(connection: &Connection, page_id: i64) -> AppResult<TorrentCard> {
     let mut card = connection.query_row("SELECT sp.id,sp.site_key,sp.page_url,sp.title,tc.primary_studio,tc.directory,tc.revision,tc.primary_image_id,tc.folder_name FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE tc.page_id=?1", [page_id], |r| Ok(TorrentCard {
         page_id:r.get(0)?,site_key:r.get(1)?,page_url:r.get(2)?,title:r.get(3)?,primary_studio:r.get(4)?,directory:r.get(5)?,revision:r.get(6)?,primary_image_id:r.get(7)?,folder_name:r.get(8)?,attributes:vec![],images:vec![],attachments:vec![]
@@ -254,6 +332,46 @@ impl Database {
     }
 
     pub fn search_torrents(&self, query: &TorrentQuery) -> AppResult<TorrentPage> {
+        let (ids, total) = self.torrent_search_ids(query)?;
+        let connection = self.connect()?;
+        let cards = read_cards(&connection, &ids)?;
+        Ok(TorrentPage { cards, total })
+    }
+
+    pub fn search_torrent_summaries(&self, query: &TorrentQuery) -> AppResult<TorrentSummaryPage> {
+        let (ids, total) = self.torrent_search_ids(query)?;
+        if ids.is_empty() {
+            return Ok(TorrentSummaryPage {
+                cards: vec![],
+                total,
+            });
+        }
+        let connection = self.connect()?;
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let mut statement = connection.prepare(&format!(
+            "SELECT sp.id,sp.site_key,tc.primary_studio,
+             COALESCE((SELECT a.value FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+               WHERE pa.page_id=sp.id AND a.kind='content_title' AND trim(a.value)<>'' ORDER BY a.id LIMIT 1),sp.title),
+             (SELECT COUNT(*) FROM page_images pi WHERE pi.page_id=sp.id),
+             (SELECT COUNT(*) FROM page_attachments f WHERE f.page_id=sp.id)
+             FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE sp.id IN ({placeholders})
+             ORDER BY sp.scraped_at DESC,sp.id DESC"))?;
+        let cards = statement
+            .query_map(params_from_iter(&ids), |r| {
+                Ok(TorrentSummary {
+                    page_id: r.get(0)?,
+                    site_key: r.get(1)?,
+                    primary_studio: r.get(2)?,
+                    content_title: r.get(3)?,
+                    image_count: r.get(4)?,
+                    attachment_count: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(TorrentSummaryPage { cards, total })
+    }
+
+    fn torrent_search_ids(&self, query: &TorrentQuery) -> AppResult<(Vec<i64>, usize)> {
         let connection = self.connect()?;
         let mut sql = String::from(
             " FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE 1=1",
@@ -273,7 +391,7 @@ impl Database {
             values.extend([query.studio.trim().into(), query.studio.trim().into()]);
         }
         super::creators::append_filter(
-            &connection,
+            self,
             &mut sql,
             &mut values,
             "sp.id",
@@ -305,11 +423,7 @@ impl Database {
         let ids = q
             .query_map(params_from_iter(&values), |r| r.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let cards = ids
-            .into_iter()
-            .map(|id| read_card(&connection, id))
-            .collect::<AppResult<Vec<_>>>()?;
-        Ok(TorrentPage { cards, total })
+        Ok((ids, total))
     }
 
     pub(crate) fn torrent_directory(&self, page_id: i64) -> AppResult<Option<PathBuf>> {

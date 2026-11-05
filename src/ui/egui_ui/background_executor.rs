@@ -25,12 +25,13 @@ impl BackgroundExecutor {
         Self { sender }
     }
 
-    fn execute(&self, job: BackgroundJob) {
-        // A bounded channel applies backpressure instead of allowing UI actions
-        // to create an unbounded number of operating-system threads.
-        self.sender
-            .send(job)
-            .expect("background worker pool remains available");
+    fn execute(&self, job: BackgroundJob) -> Result<(), String> {
+        self.sender.try_send(job).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => {
+                "Background queue is full. Retry after current operations finish.".into()
+            }
+            mpsc::TrySendError::Disconnected(_) => "Background workers are unavailable.".into(),
+        })
     }
 }
 
@@ -47,11 +48,11 @@ fn run_worker(receiver: Arc<Mutex<Receiver<BackgroundJob>>>) {
     }
 }
 
-pub(super) fn spawn_background(job: impl FnOnce() + Send + 'static) {
+pub(super) fn spawn_background(job: impl FnOnce() + Send + 'static) -> Result<(), String> {
     static EXECUTOR: OnceLock<BackgroundExecutor> = OnceLock::new();
     EXECUTOR
         .get_or_init(|| BackgroundExecutor::new(BACKGROUND_WORKERS, BACKGROUND_QUEUE_CAPACITY))
-        .execute(Box::new(job));
+        .execute(Box::new(job))
 }
 
 pub(super) fn shared_async_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
@@ -90,19 +91,48 @@ mod tests {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             let done_tx = done_tx.clone();
-            executor.execute(Box::new(move || {
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                thread::sleep(Duration::from_millis(10));
-                active.fetch_sub(1, Ordering::SeqCst);
-                done_tx.send(()).unwrap();
-            }));
+            executor
+                .execute(Box::new(move || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(10));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    done_tx.send(()).unwrap();
+                }))
+                .unwrap();
         }
         for _ in 0..6 {
             done_rx.recv().unwrap();
         }
 
         assert!(peak.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn a_full_queue_rejects_immediately_without_losing_accepted_work() {
+        let executor = BackgroundExecutor::new(1, 1);
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (done, done_rx) = mpsc::channel();
+        executor
+            .execute(Box::new(move || {
+                started.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }))
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        executor
+            .execute(Box::new(move || {
+                done.send(()).unwrap();
+            }))
+            .unwrap();
+        // The worker remains blocked until after this call returns. A blocking
+        // send would deadlock here, rather than relying on a timing threshold.
+        assert!(executor
+            .execute(Box::new(|| panic!("rejected job ran")))
+            .is_err());
+        release.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 
     #[test]

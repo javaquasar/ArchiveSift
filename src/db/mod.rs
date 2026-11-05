@@ -243,6 +243,7 @@ struct DatabaseRuntime {
     path: PathBuf,
     readers: Arc<ReadConnectionPool>,
     writer: Mutex<Option<Connection>>,
+    creator_catalog: Mutex<creators::CatalogCache>,
 }
 
 struct ReadConnectionPool {
@@ -290,6 +291,13 @@ struct QueryCancellationState {
 }
 
 impl QueryCancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancelled
+    }
+
     pub fn cancel(&self) {
         let mut state = self
             .state
@@ -513,6 +521,7 @@ impl Database {
                     path: path.clone(),
                     readers: Arc::new(ReadConnectionPool::new(path.clone(), READ_POOL_SIZE)),
                     writer: Mutex::new(None),
+                    creator_catalog: Mutex::new(creators::CatalogCache::default()),
                 });
                 runtimes.insert(path.clone(), Arc::clone(&runtime));
                 runtime
@@ -1645,6 +1654,28 @@ impl Database {
             .transpose()?;
         let page_size = page_size.clamp(1, 500);
 
+        let normalized = query.text.trim().to_ascii_lowercase();
+        let candidates = if normalized.chars().count() >= 3 {
+            selective_fts_candidates(&connection, &fts_literal(&normalized))?
+        } else {
+            None
+        };
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(SearchResultPage {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut params = Vec::<String>::new();
+        let candidate_join = if let Some(pairs) = &candidates {
+            for (page, image) in pairs {
+                params.extend([page.to_string(), image.to_string()]);
+            }
+            format!(" INNER JOIN (VALUES {}) AS candidates ON candidates.column1=source_pages.id AND candidates.column2=images.id ", vec!["(?,?)"; pairs.len()].join(","))
+        } else {
+            String::new()
+        };
+
         let mut sql = String::from(
             r#"
             SELECT
@@ -1666,7 +1697,9 @@ impl Database {
             "#,
         );
 
-        let mut params = Vec::<String>::new();
+        if !candidate_join.is_empty() {
+            sql = sql.replace("WHERE 1 = 1", &format!("{candidate_join} WHERE 1 = 1"));
+        }
 
         if query.favorites_only {
             sql.push_str(" AND images.is_favorite = 1");
@@ -1681,7 +1714,7 @@ impl Database {
             params.push(site_key.trim().to_string());
         }
 
-        if !query.text.trim().is_empty() {
+        if !query.text.trim().is_empty() && candidates.is_none() {
             let normalized = query.text.trim().to_ascii_lowercase();
             if normalized.chars().count() >= 3 {
                 sql.push_str(
@@ -1738,7 +1771,7 @@ impl Database {
         append_attribute_filter(&mut sql, &mut params, "studio", &query.studios);
         append_attribute_filter(&mut sql, &mut params, "channel", &query.channels);
         creators::append_filter(
-            &connection,
+            self,
             &mut sql,
             &mut params,
             "source_pages.id",
@@ -1996,11 +2029,30 @@ impl Database {
     /// Loads complete metadata only for the image cards that are visible or
     /// were just mutated. This keeps the initial paged search lightweight.
     pub fn search_images_by_ids(&self, image_ids: &[i64]) -> AppResult<Vec<SearchImageResult>> {
+        self.search_images_by_ids_internal(image_ids, None)
+    }
+
+    pub fn search_images_by_ids_cancellable(
+        &self,
+        image_ids: &[i64],
+        cancellation: &QueryCancellation,
+    ) -> AppResult<Vec<SearchImageResult>> {
+        self.search_images_by_ids_internal(image_ids, Some(cancellation))
+    }
+
+    fn search_images_by_ids_internal(
+        &self,
+        image_ids: &[i64],
+        cancellation: Option<&QueryCancellation>,
+    ) -> AppResult<Vec<SearchImageResult>> {
         if image_ids.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.connect()?;
         let image_ids = unique_ids(image_ids.iter().copied());
+        let _cancellation_guard = cancellation
+            .map(|token| token.register(&connection))
+            .transpose()?;
         let mut raw_rows = Vec::with_capacity(image_ids.len());
         for image_batch in image_ids.chunks(SQLITE_ID_BATCH_SIZE) {
             let placeholders = sql_placeholders(image_batch.len());
@@ -2417,6 +2469,35 @@ fn push_value_placeholders(sql: &mut String, params: &mut Vec<String>, values: &
         sql.push('?');
         params.push(value.trim().to_ascii_lowercase());
     }
+}
+
+const FTS_CANDIDATE_LIMIT: usize = 128;
+
+fn selective_fts_candidates(
+    connection: &Connection,
+    text: &str,
+) -> AppResult<Option<Vec<(i64, i64)>>> {
+    // UNION ALL and LIMIT keep this probe bounded for common terms. Materialize
+    // only small match sets; broad searches retain their ordered LIMIT plan.
+    let mut statement = connection.prepare_cached(
+        "SELECT pi.page_id,pi.image_id FROM page_search_fts
+         JOIN page_images pi ON pi.page_id=page_search_fts.rowid WHERE page_search_fts MATCH ?1
+         UNION ALL
+         SELECT pi.page_id,pi.image_id FROM image_search_fts
+         JOIN page_images pi ON pi.image_id=image_search_fts.rowid WHERE image_search_fts MATCH ?1
+         LIMIT ?2",
+    )?;
+    let mut pairs = statement
+        .query_map(params![text, (FTS_CANDIDATE_LIMIT + 1) as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+    if pairs.len() > FTS_CANDIDATE_LIMIT {
+        return Ok(None);
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    Ok(Some(pairs))
 }
 
 fn fts_literal(value: &str) -> String {
@@ -3093,6 +3174,53 @@ mod database_performance_tests {
 
     use std::sync::{Arc, Barrier};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn fts_candidate_probe_distinguishes_empty_selective_and_broad_searches() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::new(root.path().join("library.sqlite3"));
+        db.initialize().unwrap();
+        let connection = db.connect().unwrap();
+        connection.execute("INSERT INTO source_pages(id,site_key,page_url,title,raw_html) VALUES(1,'example','https://example.test/1','Common','')", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO page_search_fts(rowid,title,metadata) VALUES(1,'Common','')",
+                [],
+            )
+            .unwrap();
+        for id in 1..=FTS_CANDIDATE_LIMIT + 1 {
+            connection
+                .execute(
+                    "INSERT INTO images(id,source_url) VALUES(?1,?2)",
+                    params![id, format!("https://example.test/{id}.jpg")],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO page_images(page_id,image_id) VALUES(1,?1)",
+                    [id],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO image_search_fts(rowid,metadata) VALUES(1,'Selective')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            selective_fts_candidates(&connection, &fts_literal("absent")).unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(
+            selective_fts_candidates(&connection, &fts_literal("selective")).unwrap(),
+            Some(vec![(1, 1)])
+        );
+        assert_eq!(
+            selective_fts_candidates(&connection, &fts_literal("common")).unwrap(),
+            None
+        );
+    }
 
     fn unique_test_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()

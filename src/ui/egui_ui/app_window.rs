@@ -168,7 +168,7 @@ pub struct AppWindow {
     /// every result (including all metadata attributes) on every frame.
     search_results: Arc<Vec<SearchImageResult>>,
     search_next_cursor: Option<SearchCursor>,
-    hydrated_image_ids: HashSet<i64>,
+    hydrated_image_ids: HashSet<(i64, i64)>,
     metadata_requested_ids: HashSet<i64>,
     selected_result: Option<usize>,
     description_popup: Option<DescriptionPopup>,
@@ -406,7 +406,10 @@ impl AppWindow {
         self.original_loader.advance_generation();
         self.preview_cache.clear();
         self.viewer_original_cache.clear();
-        self.hydrated_image_ids = results.iter().map(|result| result.image_id).collect();
+        self.hydrated_image_ids = results
+            .iter()
+            .map(|result| (result.page_id(), result.image_id))
+            .collect();
         self.metadata_requested_ids.clear();
         self.search_next_cursor = None;
         self.search_results = Arc::new(results);
@@ -442,16 +445,40 @@ impl AppWindow {
             .retain(|image_id| !requested_ids.contains(image_id));
         let mut hydrated_by_id = hydrated
             .into_iter()
-            .map(|result| (result.image_id, result))
+            .map(|result| ((result.page_id(), result.image_id), result))
             .collect::<std::collections::HashMap<_, _>>();
         if hydrated_by_id.is_empty() {
             return;
         }
         let results = Arc::make_mut(&mut self.search_results);
         for result in results {
-            if let Some(hydrated) = hydrated_by_id.remove(&result.image_id) {
+            if let Some(hydrated) = hydrated_by_id.remove(&(result.page_id(), result.image_id)) {
                 *result = hydrated;
-                self.hydrated_image_ids.insert(result.image_id);
+                self.hydrated_image_ids
+                    .insert((result.page_id(), result.image_id));
+            }
+        }
+    }
+
+    pub(super) fn release_metadata_requests(&mut self) {
+        self.metadata_requested_ids.clear();
+    }
+
+    pub(super) fn apply_search_metadata(
+        &mut self,
+        database_path: &str,
+        seq: u64,
+        requested_ids: &[i64],
+        result: Result<Vec<SearchImageResult>, String>,
+    ) {
+        if self.search_seq != seq || self.config.database_path != database_path {
+            return;
+        }
+        match result {
+            Ok(results) => self.apply_hydrated_results(requested_ids, results),
+            Err(error) => {
+                self.apply_hydrated_results(requested_ids, Vec::new());
+                self.log.push(format!("Metadata load failed: {error}"));
             }
         }
     }
@@ -479,7 +506,7 @@ impl AppWindow {
         self.selected_image_ids
             .retain(|image_id| !removed.contains(image_id));
         self.hydrated_image_ids
-            .retain(|image_id| !removed.contains(image_id));
+            .retain(|(_, image_id)| !removed.contains(image_id));
         self.selected_result = selected_id
             .filter(|image_id| !removed.contains(image_id))
             .and_then(|image_id| {
@@ -529,7 +556,7 @@ impl AppWindow {
         let hydrated_ids = page
             .items
             .iter()
-            .map(|result| result.image_id)
+            .map(|result| (result.page_id(), result.image_id))
             .collect::<HashSet<_>>();
         let next_cursor = page.next_cursor.clone();
         self.refresh_search_results(page.items);
@@ -2548,7 +2575,7 @@ impl AppWindow {
                                         ui.allocate_space(egui::vec2(cell_w, ROW_H));
                                         continue;
                                     };
-                                    if !self.hydrated_image_ids.contains(&result.image_id)
+                                    if !self.hydrated_image_ids.contains(&(result.page_id(), result.image_id))
                                         && !self.metadata_requested_ids.contains(&result.image_id)
                                     {
                                         metadata_to_request.insert(result.image_id);
@@ -2696,7 +2723,7 @@ impl AppWindow {
                 .show(ui, |ui| {
                     if let Some(index) = self.selected_result {
                         if let Some(result) = self.search_results.get(index) {
-                            if !self.hydrated_image_ids.contains(&result.image_id)
+                            if !self.hydrated_image_ids.contains(&(result.page_id(), result.image_id))
                                 && !self.metadata_requested_ids.contains(&result.image_id)
                             {
                                 metadata_to_request.insert(result.image_id);
@@ -3070,6 +3097,7 @@ impl AppWindow {
             self.pending_command = Some(UiCommand::HydrateSearchMetadata {
                 database_path: self.config.database_path.clone(),
                 image_ids,
+                seq: self.search_seq,
             });
         }
     }
@@ -5407,6 +5435,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metadata_responses_preserve_shared_image_pages_and_ignore_old_searches() {
+        let mut window = AppWindow::new(
+            AppConfig::default(),
+            UiLog::default(),
+            Arc::new(RwLock::new(LivePresets::default())),
+        );
+        let first = search_result(7, Vec::new());
+        let mut second = first.clone();
+        Arc::make_mut(&mut second.page).page_id = 2;
+        window.set_search_page(
+            SearchResultPage {
+                items: vec![first.clone(), second.clone()],
+                next_cursor: None,
+            },
+            false,
+        );
+        window.search_seq = 3;
+        window.metadata_requested_ids.insert(7);
+        let database = window.config.database_path.clone();
+        window.apply_search_metadata(&database, 2, &[7], Ok(vec![]));
+        window.apply_search_metadata("other.sqlite3", 3, &[7], Err("stale".into()));
+        assert!(window.metadata_requested_ids.contains(&7));
+        let mut first = first;
+        Arc::make_mut(&mut first.page).title = "First page".into();
+        Arc::make_mut(&mut second.page).title = "Second page".into();
+        window.apply_search_metadata(&database, 3, &[7], Ok(vec![second, first]));
+        assert_eq!(window.search_results[0].page.title, "First page");
+        assert_eq!(window.search_results[1].page.title, "Second page");
+        assert!(window.hydrated_image_ids.contains(&(1, 7)));
+        assert!(window.hydrated_image_ids.contains(&(2, 7)));
+        assert!(!window.metadata_requested_ids.contains(&7));
+        window.metadata_requested_ids.insert(7);
+        window.release_metadata_requests();
+        assert!(
+            window.metadata_requested_ids.is_empty(),
+            "cancelled pagination requests must be retryable"
+        );
+    }
+
     fn pressed_key(key: egui::Key) -> egui::Event {
         egui::Event::Key {
             key,
@@ -5680,7 +5748,7 @@ mod tests {
 
         assert_eq!(window.search_next_cursor, Some(fresh_cursor));
         assert_eq!(window.search_results[0].image_id, 2);
-        assert!(window.hydrated_image_ids.contains(&2));
+        assert!(window.hydrated_image_ids.iter().any(|(_, id)| *id == 2));
     }
 
     #[test]

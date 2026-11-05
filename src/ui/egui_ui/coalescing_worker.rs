@@ -70,6 +70,19 @@ where
     K: Clone + Eq + Hash + Send + 'static,
     J: Send + 'static,
 {
+    pub(super) fn submit_update<R>(&self, key: K, update: impl FnOnce(Option<J>) -> (J, R)) -> R {
+        let (lock, wakeup) = &*self.state;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = state.pending.jobs.remove(&key);
+        if previous.is_none() {
+            state.pending.order.push_back(key.clone());
+        }
+        let (job, result) = update(previous);
+        state.pending.jobs.insert(key, job);
+        wakeup.notify_one();
+        result
+    }
+
     pub(super) fn new(handler: impl Fn(J) + Send + 'static) -> Self {
         let state = Arc::new((Mutex::new(WorkerState::default()), Condvar::new()));
         let worker_state = Arc::clone(&state);
@@ -145,6 +158,41 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending.pop_front(), Some("new tag query"));
         assert_eq!(pending.pop_front(), Some("actor query"));
+    }
+
+    #[test]
+    fn merged_jobs_keep_one_pending_entry_and_preserve_all_accepted_values() {
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let (done, done_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let worker = CoalescingWorker::new(move |values: Vec<usize>| {
+            if values == [0] {
+                started.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            done.send(values).unwrap();
+        });
+        worker.submit((), vec![0]);
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for id in 1..=1000 {
+            worker.submit_update((), |previous| {
+                let mut values = previous.unwrap_or_default();
+                values.push(id);
+                (values, ())
+            });
+        }
+        {
+            let state = worker.state.0.lock().unwrap();
+            assert_eq!(state.pending.order.len(), 1);
+            assert_eq!(state.pending.jobs.len(), 1);
+        }
+        release.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(), [0]);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (1..=1000).collect::<Vec<_>>()
+        );
     }
 
     #[test]

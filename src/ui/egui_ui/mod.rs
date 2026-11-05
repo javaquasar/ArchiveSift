@@ -101,6 +101,56 @@ struct SearchMutationResult {
     replace: bool,
 }
 
+const METADATA_PENDING_LIMIT: usize = 512;
+
+struct MetadataJob {
+    database_path: String,
+    seq: u64,
+    image_ids: Vec<i64>,
+    cancellation: QueryCancellation,
+}
+
+fn coalesce_metadata(
+    previous: Option<MetadataJob>,
+    mut job: MetadataJob,
+) -> (MetadataJob, Vec<i64>) {
+    if let Some(previous) = previous {
+        if previous.seq == job.seq && previous.database_path == job.database_path {
+            job.image_ids.extend(previous.image_ids);
+        }
+    }
+    let mut unique = std::collections::HashSet::new();
+    job.image_ids.retain(|id| unique.insert(*id));
+    let rejected = if job.image_ids.len() > METADATA_PENDING_LIMIT {
+        job.image_ids.split_off(METADATA_PENDING_LIMIT)
+    } else {
+        Vec::new()
+    };
+    (job, rejected)
+}
+
+fn metadata_worker(tx: &RepaintingSender<WorkerState>) -> CoalescingWorker<(), MetadataJob> {
+    let tx = tx.clone();
+    CoalescingWorker::new(move |job: MetadataJob| {
+        if job.cancellation.is_cancelled() {
+            return;
+        }
+        let result = Database::new(&job.database_path)
+            .search_images_by_ids_cancellable(&job.image_ids, &job.cancellation)
+            .map_err(|error| error.to_string());
+        if job.cancellation.is_cancelled() {
+            return;
+        }
+        let _ = tx.send(WorkerState::SearchMetadataLoaded {
+            cancellation: job.cancellation,
+            database_path: job.database_path,
+            seq: job.seq,
+            requested_ids: job.image_ids,
+            result,
+        });
+    })
+}
+
 // ── DesktopApp (eframe::App implementation) ───────────────────────────────────
 
 struct DesktopApp {
@@ -111,6 +161,8 @@ struct DesktopApp {
     state_tx: RepaintingSender<WorkerState>,
     suggestion_worker: CoalescingWorker<SuggestionKind, SuggestionJob>,
     search_cancellation: Option<QueryCancellation>,
+    metadata_worker: CoalescingWorker<(), MetadataJob>,
+    metadata_generation: Option<(String, u64, QueryCancellation)>,
     repaint_context: egui::Context,
     /// Created on demand when clipboard monitoring is enabled.
     clipboard_rx: Option<mpsc::Receiver<ClipboardEvent>>,
@@ -244,6 +296,7 @@ impl DesktopApp {
             config.has_download_folder() && std::path::Path::new(&config.database_path).is_file();
         let window = AppWindow::new(config, UiLog::default(), Arc::clone(&live_presets));
 
+        let metadata_worker = metadata_worker(&state_tx);
         let mut app = Self {
             window,
             queue_service,
@@ -251,6 +304,8 @@ impl DesktopApp {
             state_rx,
             state_tx,
             suggestion_worker,
+            metadata_worker,
+            metadata_generation: None,
             search_cancellation: None,
             repaint_context,
             clipboard_rx,
@@ -359,12 +414,14 @@ impl DesktopApp {
         self.window.begin_storage_settings();
         let config = self.window.config.clone();
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = SettingsService::new()
                 .apply_storage_settings(&config, &settings, &config_path)
                 .map_err(|error| error.to_string());
             let _ = state_tx.send(WorkerState::StorageSettingsApplied(result));
-        });
+        }) {
+            self.window.storage_settings_failed(error);
+        }
     }
 
     fn finish_storage_settings(&mut self, result: Result<AppConfig, String>) {
@@ -388,6 +445,8 @@ impl DesktopApp {
                 let (state_tx, state_rx) =
                     repainting_channel(&self.repaint_context, UI_RESULT_CHANNEL_CAPACITY);
                 self.suggestion_worker = suggestion_worker(&state_tx);
+                self.cancel_metadata();
+                self.metadata_worker = metadata_worker(&state_tx);
                 self.state_tx = state_tx;
                 self.state_rx = state_rx;
                 let log = self.window.log.clone();
@@ -465,7 +524,7 @@ impl DesktopApp {
         self.window.begin_storage_settings();
         let current = self.window.config.clone();
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = (|| -> AppResult<AppConfig> {
                 let catalog = load_catalog();
                 let (current, value) = if let Some((value, _)) = document {
@@ -488,7 +547,9 @@ impl DesktopApp {
             })()
             .map_err(|e| e.to_string());
             let _ = state_tx.send(WorkerState::StorageSettingsApplied(result));
-        });
+        }) {
+            self.window.storage_settings_failed(error);
+        }
     }
 
     fn handle_clipboard_events(&mut self) {
@@ -569,6 +630,7 @@ impl DesktopApp {
         cursor: Option<SearchCursor>,
         append: bool,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         window.running = true;
         window.error = None;
@@ -579,7 +641,7 @@ impl DesktopApp {
         let cancellation = QueryCancellation::default();
         self.search_cancellation = Some(cancellation.clone());
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = run_search_page_job(database_path, query, cursor, &cancellation);
             let worker_state = match result {
                 Ok(results) => WorkerState::SearchFinished {
@@ -594,7 +656,10 @@ impl DesktopApp {
                 },
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_search_recent_pages(
@@ -605,6 +670,7 @@ impl DesktopApp {
         cursor: Option<SearchCursor>,
         append: bool,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         window.running = true;
         window.error = None;
@@ -615,7 +681,7 @@ impl DesktopApp {
         self.search_cancellation = Some(cancellation.clone());
 
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = run_search_recent_pages(database_path, page_limit, cursor, &cancellation);
             let worker_state = match result {
                 Ok(page) => WorkerState::SearchFinished {
@@ -630,7 +696,10 @@ impl DesktopApp {
                 },
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_tag_suggestions(&mut self, database_path: String, query: String) {
@@ -688,17 +757,38 @@ impl DesktopApp {
         );
     }
 
-    fn start_search_metadata(&self, database_path: String, image_ids: Vec<i64>) {
-        let state_tx = self.state_tx.clone();
-        spawn_background(move || {
-            let result = SearchService::new(Database::new(database_path))
-                .load_images_by_ids(&image_ids)
-                .map_err(|error| error.to_string());
-            let _ = state_tx.send(WorkerState::SearchMetadataLoaded {
-                requested_ids: image_ids,
-                result,
-            });
-        });
+    fn cancel_metadata(&mut self) {
+        if let Some((_, _, cancellation)) = self.metadata_generation.take() {
+            cancellation.cancel();
+        }
+        self.window.release_metadata_requests();
+    }
+
+    fn start_search_metadata(&mut self, database_path: String, seq: u64, image_ids: Vec<i64>) {
+        if seq != self.window.search_seq || database_path != self.window.config.database_path {
+            return;
+        }
+        if !self
+            .metadata_generation
+            .as_ref()
+            .is_some_and(|(db, generation, _)| db == &database_path && *generation == seq)
+        {
+            self.cancel_metadata();
+            self.metadata_generation =
+                Some((database_path.clone(), seq, QueryCancellation::default()));
+        }
+        let cancellation = self.metadata_generation.as_ref().unwrap().2.clone();
+        let job = MetadataJob {
+            database_path,
+            seq,
+            image_ids,
+            cancellation,
+        };
+        let rejected = self
+            .metadata_worker
+            .submit_update((), |previous| coalesce_metadata(previous, job));
+        // Dropped requests can be retried as soon as their images are visible.
+        self.window.apply_hydrated_results(&rejected, Vec::new());
     }
 
     fn start_metadata_job(
@@ -706,6 +796,7 @@ impl DesktopApp {
         message: impl Into<String>,
         job: impl FnOnce() -> AppResult<SearchMutationResult> + Send + 'static,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         window.running = true;
         window.error = None;
@@ -713,7 +804,7 @@ impl DesktopApp {
         let message = message.into();
         let state_tx = self.state_tx.clone();
         let success_msg = message.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = job();
             let worker_state = match result {
                 Ok(results) => WorkerState::MetadataUpdated {
@@ -726,7 +817,10 @@ impl DesktopApp {
                 },
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_set_favorite(
@@ -736,15 +830,19 @@ impl DesktopApp {
         is_favorite: bool,
         refresh: SearchRefresh,
     ) {
+        self.cancel_metadata();
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = run_set_favorite(database_path, image_id, is_favorite, refresh);
             let worker_state = match result {
                 Ok(results) => WorkerState::FavoriteUpdated(Ok(results)),
                 Err(error) => WorkerState::FavoriteUpdated(Err(error.to_string())),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_set_actor_gender(
@@ -755,12 +853,13 @@ impl DesktopApp {
         image_ids: Vec<i64>,
         refresh: SearchRefresh,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         window.running = true;
         window.error = None;
 
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result =
                 run_set_actor_gender(database_path, actor_name, is_female, image_ids, refresh);
             let worker_state = match result {
@@ -768,7 +867,10 @@ impl DesktopApp {
                 Err(error) => WorkerState::ActorGenderUpdated(Err(error.to_string())),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_set_primary_actor(
@@ -779,12 +881,13 @@ impl DesktopApp {
         actor_name: String,
         refresh: SearchRefresh,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         window.running = true;
         window.error = None;
 
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result =
                 run_set_primary_actor(database_path, download_folder, page_id, actor_name, refresh);
             let worker_state = match result {
@@ -792,7 +895,10 @@ impl DesktopApp {
                 Err(error) => WorkerState::PrimaryActorUpdated(Err(error.to_string())),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_delete_images(
@@ -803,12 +909,13 @@ impl DesktopApp {
         mode: DeleteMode,
         refresh: SearchRefresh,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         window.running = true;
         window.error = None;
 
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let removed_ids = image_ids.clone();
             let result = run_delete_images(database_path, base_dir, image_ids, mode, refresh)
                 .map_err(|error| error.to_string());
@@ -823,7 +930,10 @@ impl DesktopApp {
                 },
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_rescrape(
@@ -833,6 +943,7 @@ impl DesktopApp {
         url: String,
         max_concurrent_downloads: usize,
     ) {
+        self.cancel_metadata();
         let window = &mut self.window;
         if download_dir.trim().is_empty() {
             window.error = Some("Select a download directory to enable scraping.".to_string());
@@ -843,7 +954,7 @@ impl DesktopApp {
 
         let state_tx = self.state_tx.clone();
         let log = window.log.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = run_rescrape(
                 database_path,
                 download_dir,
@@ -856,7 +967,10 @@ impl DesktopApp {
                 Err(error) => WorkerState::QueueFinished(Err(error.to_string())),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 
     fn start_processor_if_needed(&mut self, config: AppConfig) {
@@ -878,7 +992,7 @@ impl DesktopApp {
         let max_parallel = config.effective_parallel_downloads();
         let live_presets = Arc::clone(&self.live_presets);
 
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result =
                 run_queue_processor(config, queue_service, log, max_parallel, live_presets);
             let worker_state = match result {
@@ -886,12 +1000,25 @@ impl DesktopApp {
                 Err(error) => WorkerState::QueueFinished(Err(error.to_string())),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.worker_running = false;
+            self.window.running = false;
+            self.window.error = Some(error);
+        }
     }
 }
 
 impl DesktopApp {
     fn update_ui(&mut self, ctx: &egui::Context) {
+        if self
+            .metadata_generation
+            .as_ref()
+            .is_some_and(|(db, seq, _)| {
+                db != &self.window.config.database_path || *seq != self.window.search_seq
+            })
+        {
+            self.cancel_metadata();
+        }
         self.handle_clipboard_events();
 
         while let Ok(state) = self.state_rx.try_recv() {
@@ -973,16 +1100,19 @@ impl DesktopApp {
                     }
                 }
                 WorkerState::SearchMetadataLoaded {
+                    cancellation,
+                    database_path,
+                    seq,
                     requested_ids,
                     result,
                 } => {
-                    let w = &mut self.window;
-                    match result {
-                        Ok(results) => w.apply_hydrated_results(&requested_ids, results),
-                        Err(error) => {
-                            w.apply_hydrated_results(&requested_ids, Vec::new());
-                            w.log.push(format!("Metadata load failed: {error}"));
-                        }
+                    if !cancellation.is_cancelled() {
+                        self.window.apply_search_metadata(
+                            &database_path,
+                            seq,
+                            &requested_ids,
+                            result,
+                        );
                     }
                 }
                 WorkerState::TagSuggestions { query, results } => {
@@ -1010,6 +1140,7 @@ impl DesktopApp {
                         .set_creator_suggestions(&database_path, &query, results);
                 }
                 WorkerState::MetadataUpdated { message, results } => {
+                    self.cancel_metadata();
                     let w = &mut self.window;
                     w.running = false;
                     match results {
@@ -1031,6 +1162,7 @@ impl DesktopApp {
                     }
                 }
                 WorkerState::FavoriteUpdated(result) => {
+                    self.cancel_metadata();
                     let w = &mut self.window;
                     w.running = false;
                     match result {
@@ -1051,6 +1183,7 @@ impl DesktopApp {
                     }
                 }
                 WorkerState::ActorGenderUpdated(result) => {
+                    self.cancel_metadata();
                     let w = &mut self.window;
                     w.running = false;
                     match result {
@@ -1066,6 +1199,7 @@ impl DesktopApp {
                     }
                 }
                 WorkerState::PrimaryActorUpdated(result) => {
+                    self.cancel_metadata();
                     let w = &mut self.window;
                     w.running = false;
                     match result {
@@ -1097,6 +1231,7 @@ impl DesktopApp {
                     w.apply_date_groups_loaded(seq, result);
                 }
                 WorkerState::DeleteFinished { image_ids, result } => {
+                    self.cancel_metadata();
                     let w = &mut self.window;
                     w.running = false;
                     match result {
@@ -1147,7 +1282,8 @@ impl DesktopApp {
                 }
                 UiCommand::StoreSettingSecret { target, value } => {
                     let tx = self.state_tx.clone();
-                    spawn_background(move || {
+                    let rejected_target = target.clone();
+                    if let Err(error) = spawn_background(move || {
                         let result =
                             crate::scraper::extensions::settings::SettingsCatalog::installed()
                                 .store_secret(
@@ -1157,12 +1293,16 @@ impl DesktopApp {
                                 )
                                 .map_err(|e| e.to_string());
                         let _ = tx.send(WorkerState::SettingSecretStored { target, result });
-                    });
+                    }) {
+                        self.window
+                            .setting_secret_finished(&rejected_target, Err(error));
+                    }
                 }
                 UiCommand::Account(command) => {
                     let id = command.id().to_string();
                     let tx = self.state_tx.clone();
-                    spawn_background(move || {
+                    let rejected_id = id.clone();
+                    if let Err(error) = spawn_background(move || {
                         let result = match shared_async_runtime() {
                             Ok(runtime) => runtime.block_on(async {
                                 tokio::time::timeout(
@@ -1179,7 +1319,13 @@ impl DesktopApp {
                             }
                         };
                         let _ = tx.send(WorkerState::AccountFinished { id, result });
-                    });
+                    }) {
+                        self.window.error = Some(error);
+                        self.window.account_finished(
+                            rejected_id,
+                            Err(crate::scraper::extensions::accounts::AccountError::Network),
+                        );
+                    }
                 }
                 UiCommand::QueueUrl(config) => self.enqueue_manual_url(config),
                 UiCommand::ImportFile { file_path } => self.start_import_url_file(file_path),
@@ -1200,7 +1346,8 @@ impl DesktopApp {
                 UiCommand::HydrateSearchMetadata {
                     database_path,
                     image_ids,
-                } => self.start_search_metadata(database_path, image_ids),
+                    seq,
+                } => self.start_search_metadata(database_path, seq, image_ids),
                 UiCommand::SearchRecentPages {
                     database_path,
                     page_limit,
@@ -1437,28 +1584,34 @@ impl eframe::App for DesktopApp {
 }
 
 impl DesktopApp {
-    fn start_sql_query(&self, database_path: String, query: String) {
+    fn start_sql_query(&mut self, database_path: String, query: String) {
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = run_sql_query(database_path, query);
             let worker_state = match result {
                 Ok(r) => WorkerState::SqlQueryFinished(Ok(r)),
                 Err(e) => WorkerState::SqlQueryFinished(Err(e.to_string())),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.apply_sql_result(Err(error));
+        }
     }
 
-    fn start_sql_export(&self, database_path: String, query: String, output_path: String) {
+    fn start_sql_export(&mut self, database_path: String, query: String, output_path: String) {
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        let rejected_output = output_path.clone();
+        if let Err(error) = spawn_background(move || {
             let result = run_sql_export(&database_path, &query, &output_path)
                 .map_err(|error| error.to_string());
             let _ = state_tx.send(WorkerState::SqlExportFinished {
                 output_path,
                 result,
             });
-        });
+        }) {
+            self.window
+                .apply_sql_export_result(&rejected_output, Err(error));
+        }
     }
 
     fn start_browse_date_groups(
@@ -1471,11 +1624,12 @@ impl DesktopApp {
         ascending: bool,
         max_favorites_exclusive: Option<usize>,
     ) {
+        self.cancel_metadata();
         if let Some(cancellation) = self.search_cancellation.take() {
             cancellation.cancel();
         }
         let state_tx = self.state_tx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = Database::new(database_path).get_date_group_page_for_site(
                 cursor.as_ref(),
                 direction,
@@ -1488,7 +1642,9 @@ impl DesktopApp {
                 result: result.map_err(|error| error.to_string()),
             };
             let _ = state_tx.send(worker_state);
-        });
+        }) {
+            self.window.apply_date_groups_loaded(seq, Err(error));
+        }
     }
 }
 
@@ -1518,6 +1674,9 @@ enum WorkerState {
         result: Result<SearchResultPage, String>,
     },
     SearchMetadataLoaded {
+        cancellation: QueryCancellation,
+        database_path: String,
+        seq: u64,
         requested_ids: Vec<i64>,
         result: Result<Vec<SearchImageResult>, String>,
     },
@@ -2323,6 +2482,34 @@ mod startup_ui_tests {
         };
         let context = egui::Context::default();
         (DesktopApp::new(config, context.clone()), root, context)
+    }
+
+    #[test]
+    fn metadata_batches_are_bounded_deduplicated_and_isolated_by_generation_and_library() {
+        let job = |db: &str, seq, ids| MetadataJob {
+            database_path: db.into(),
+            seq,
+            image_ids: ids,
+            cancellation: QueryCancellation::default(),
+        };
+        let (old, rejected) = coalesce_metadata(None, job("first", 1, (0..1000).collect()));
+        assert_eq!(old.image_ids.len(), METADATA_PENDING_LIMIT);
+        assert_eq!(rejected.len(), 1000 - METADATA_PENDING_LIMIT);
+        let (merged, rejected) = coalesce_metadata(Some(old), job("first", 1, vec![0, 0, 5000]));
+        assert_eq!(&merged.image_ids[..2], &[0, 5000]);
+        assert_eq!(merged.image_ids.len(), METADATA_PENDING_LIMIT);
+        assert_eq!(rejected.len(), 1);
+        let (new, rejected) = coalesce_metadata(Some(merged), job("first", 2, vec![7]));
+        assert_eq!(new.image_ids, [7]);
+        assert!(rejected.is_empty());
+        let (other, _) = coalesce_metadata(Some(new), job("second", 2, vec![8]));
+        assert_eq!(other.image_ids, [8]);
+        let (mut app, _root, _ctx) = test_app(false);
+        let token = QueryCancellation::default();
+        app.metadata_generation = Some(("first".into(), 1, token.clone()));
+        app.cancel_metadata();
+        assert!(token.is_cancelled());
+        assert!(app.metadata_generation.is_none());
     }
 
     #[test]

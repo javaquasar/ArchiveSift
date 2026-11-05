@@ -246,6 +246,7 @@ pub enum UiCommand {
     HydrateSearchMetadata {
         database_path: String,
         image_ids: Vec<i64>,
+        seq: u64,
     },
     SearchRecentPages {
         database_path: String,

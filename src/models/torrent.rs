@@ -102,3 +102,19 @@ pub struct TorrentPage {
     pub cards: Vec<TorrentCard>,
     pub total: usize,
 }
+
+#[derive(Clone, Debug)]
+pub struct TorrentSummary {
+    pub page_id: i64,
+    pub site_key: String,
+    pub primary_studio: String,
+    pub content_title: String,
+    pub image_count: usize,
+    pub attachment_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct TorrentSummaryPage {
+    pub cards: Vec<TorrentSummary>,
+    pub total: usize,
+}

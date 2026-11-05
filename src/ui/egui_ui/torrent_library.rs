@@ -1,4 +1,5 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 
 use super::background_executor::spawn_background;
 use super::creator_filter::CreatorFilter;
@@ -6,7 +7,7 @@ use super::preview_loader::{ImageLoadMode, PreviewLoader, PreviewSource};
 use super::texture_cache::SizedLruCache;
 use crate::app::AppConfig;
 use crate::db::Database;
-use crate::models::{TorrentCard, TorrentEdit, TorrentImage, TorrentPage, TorrentQuery};
+use crate::models::{TorrentCard, TorrentEdit, TorrentImage, TorrentQuery, TorrentSummaryPage};
 use crate::services::torrent_library::{MoveProgress, TorrentLibrary, TorrentMovePlan};
 use eframe::egui;
 
@@ -43,7 +44,7 @@ impl Filters {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Suggestions {
     studios: Vec<String>,
     tags: Vec<String>,
@@ -51,7 +52,8 @@ struct Suggestions {
 }
 enum Outcome {
     Recovered,
-    Loaded(TorrentPage, Suggestions),
+    Loaded(TorrentSummaryPage, Suggestions, Option<TorrentCard>),
+    Selected(TorrentCard),
     Planned(TorrentMovePlan),
     Saved(TorrentCard),
 }
@@ -63,12 +65,13 @@ enum Message {
 pub(super) struct TorrentLibraryUi {
     pending_command: Option<crate::ui::UiCommand>,
     filters: Filters,
-    page: TorrentPage,
-    selected: Option<TorrentCard>,
+    page: TorrentSummaryPage,
+    selected: Option<Arc<TorrentCard>>,
     edit: TorrentEdit,
     folder_name: String,
     inputs: [String; 3],
     suggestions: Suggestions,
+    refresh_suggestions: bool,
     organize: bool,
     plan: Option<TorrentMovePlan>,
     receiver: Option<Receiver<Message>>,
@@ -90,7 +93,7 @@ impl Default for TorrentLibraryUi {
         Self {
             pending_command: None,
             filters: Filters::default(),
-            page: TorrentPage {
+            page: TorrentSummaryPage {
                 cards: vec![],
                 total: 0,
             },
@@ -99,6 +102,7 @@ impl Default for TorrentLibraryUi {
             folder_name: String::new(),
             inputs: Default::default(),
             suggestions: Suggestions::default(),
+            refresh_suggestions: true,
             organize: false,
             plan: None,
             receiver: None,
@@ -167,23 +171,20 @@ impl TorrentLibraryUi {
                             self.plan = None;
                             self.status = None;
                         }
-                        Ok(Outcome::Loaded(page, suggestions)) => {
-                            let selected = self.selected.as_ref().map(|c| c.page_id);
+                        Ok(Outcome::Loaded(page, suggestions, card)) => {
                             self.page = page;
                             self.suggestions = suggestions;
+                            self.refresh_suggestions = false;
                             self.loaded = true;
-                            let card = self
-                                .page
-                                .cards
-                                .iter()
-                                .find(|c| Some(c.page_id) == selected)
-                                .or(self.page.cards.first())
-                                .cloned();
                             if let Some(card) = card {
                                 self.select(card);
                             } else {
                                 self.selected = None;
                             }
+                        }
+                        Ok(Outcome::Selected(card)) => {
+                            self.select(card);
+                            self.status = None;
                         }
                         Ok(Outcome::Planned(plan)) => {
                             self.plan = Some(plan);
@@ -194,6 +195,7 @@ impl TorrentLibraryUi {
                             self.plan = None;
                             self.changed = true;
                             self.reload = true;
+                            self.refresh_suggestions = true;
                             self.status = Some("Card saved. File paths updated.".into());
                             self.textures.clear();
                             if let Some(loader) = &mut self.loader {
@@ -208,8 +210,9 @@ impl TorrentLibraryUi {
         std::mem::take(&mut self.changed)
     }
 
-    fn select(&mut self, card: TorrentCard) {
-        self.edit = TorrentEdit::from(&card);
+    fn select(&mut self, card: impl Into<Arc<TorrentCard>>) {
+        let card = card.into();
+        self.edit = TorrentEdit::from(card.as_ref());
         self.folder_name = card.directory_name().unwrap_or("").to_owned();
         self.selected = Some(card);
         self.inputs = Default::default();
@@ -238,11 +241,20 @@ impl TorrentLibraryUi {
         self.busy = true;
         self.error = None;
         let ctx = ctx.clone();
-        spawn_background(move || {
+        if let Err(error) = spawn_background(move || {
             let result = work(tx.clone(), ctx.clone());
             let _ = tx.send(Message::Finished(result));
             ctx.request_repaint();
-        });
+        }) {
+            self.busy = false;
+            self.receiver = None;
+            if self.recovering {
+                self.startup_error = Some(error.clone());
+            }
+            self.recovering = false;
+            self.error = Some(error);
+            self.status = None;
+        }
     }
 
     fn load(&mut self, ctx: &egui::Context, config: &AppConfig) {
@@ -250,18 +262,31 @@ impl TorrentLibraryUi {
         let database = Database::new(&config.database_path);
         let root = config.effective_download_dir();
         let query = self.filters.query();
+        let selected = self.selected.as_ref().map(|card| card.page_id);
+        let cached_suggestions = (!self.refresh_suggestions).then(|| self.suggestions.clone());
         self.reload = false;
         self.job(ctx, move |_, _| {
             let run = || -> crate::AppResult<Outcome> {
                 database.initialize()?;
                 TorrentLibrary::new(database.clone(), root).recover()?;
-                let page = database.search_torrents(&query)?;
-                let suggestions = Suggestions {
-                    studios: database.suggest_attribute_values("studio", "", 500)?,
-                    tags: database.suggest_attribute_values("tag", "", 500)?,
-                    categories: database.suggest_attribute_values("category", "", 500)?,
+                let page = database.search_torrent_summaries(&query)?;
+                let card = page
+                    .cards
+                    .iter()
+                    .find(|card| Some(card.page_id) == selected)
+                    .or_else(|| page.cards.first())
+                    .map(|card| database.torrent_card(card.page_id))
+                    .transpose()?;
+                let suggestions = if let Some(cached) = cached_suggestions {
+                    cached
+                } else {
+                    Suggestions {
+                        studios: database.suggest_attribute_values("studio", "", 500)?,
+                        tags: database.suggest_attribute_values("tag", "", 500)?,
+                        categories: database.suggest_attribute_values("category", "", 500)?,
+                    }
                 };
-                Ok(Outcome::Loaded(page, suggestions))
+                Ok(Outcome::Loaded(page, suggestions, card))
             };
             run().map_err(|e| e.to_string())
         });
@@ -307,6 +332,7 @@ impl TorrentLibraryUi {
                 });
             if ui.button("Find torrents / Refresh").clicked() {
                 self.filters.offset = 0;
+                self.refresh_suggestions = true;
                 self.load(ui.ctx(), config);
             }
         });
@@ -362,7 +388,7 @@ impl TorrentLibraryUi {
                             if ui
                                 .add_enabled(
                                     !self.busy && self.plan.is_none(),
-                                    egui::Button::new(card.content_title()).wrap().selected(
+                                    egui::Button::new(&card.content_title).wrap().selected(
                                         self.selected
                                             .as_ref()
                                             .is_some_and(|c| c.page_id == card.page_id),
@@ -370,7 +396,7 @@ impl TorrentLibraryUi {
                                 )
                                 .clicked()
                             {
-                                choose = Some(card.clone());
+                                choose = Some(card.page_id);
                             }
                             ui.label(format!(
                                 "{} · {}",
@@ -383,13 +409,18 @@ impl TorrentLibraryUi {
                             ));
                             ui.label(format!(
                                 "{} attachments · {} images",
-                                card.attachments.len(),
-                                card.images.len()
+                                card.attachment_count, card.image_count
                             ));
                         });
                     }
-                    if let Some(card) = choose {
-                        self.select(card);
+                    if let Some(id) = choose {
+                        let database = Database::new(&config.database_path);
+                        self.job(ui.ctx(), move |_, _| {
+                            database
+                                .torrent_card(id)
+                                .map(Outcome::Selected)
+                                .map_err(|e| e.to_string())
+                        });
                     }
                     if self.page.total == 0 {
                         ui.label(
@@ -431,19 +462,34 @@ impl TorrentLibraryUi {
             self.primary_image_checkbox(ui, image.image_id);
             ui.weak("Choose one main image, then Review and save. With no selection, the first image is used.");
         }
-        ui.horizontal_wrapped(|ui| {
-            for image in card
-                .images
+        let columns = (ui.available_width() / 118.0).floor().max(1.0) as usize;
+        let primary_index = primary.and_then(|image| {
+            card.images
                 .iter()
-                .filter(|image| Some(image.image_id) != primary.map(|image| image.image_id))
-            {
-                ui.vertical(|ui| {
-                    ui.set_max_width(110.0);
-                    self.preview(ui, config, image, egui::vec2(70.0, 60.0));
-                    self.primary_image_checkbox(ui, image.image_id);
-                });
-            }
+                .position(|entry| entry.image_id == image.image_id)
         });
+        let count = card
+            .images
+            .len()
+            .saturating_sub(usize::from(primary_index.is_some()));
+        egui::ScrollArea::vertical()
+            .id_salt(("torrent_thumbnails", card.page_id))
+            .max_height(280.0)
+            .show_rows(ui, 92.0, count.div_ceil(columns), |ui, rows| {
+                for row in rows {
+                    ui.horizontal(|ui| {
+                        for slot in row * columns..((row + 1) * columns).min(count) {
+                            let index = slot
+                                + usize::from(primary_index.is_some_and(|index| slot >= index));
+                            let image = &card.images[index];
+                            ui.allocate_ui(egui::vec2(110.0, 92.0), |ui| {
+                                self.preview(ui, config, image, egui::vec2(70.0, 60.0));
+                                self.primary_image_checkbox(ui, image.image_id);
+                            });
+                        }
+                    });
+                }
+            });
         for kind in [
             "date",
             "year",
@@ -886,7 +932,9 @@ mod tests {
             loaded: true,
             ..Default::default()
         };
-        editor.page = db.search_torrents(&TorrentQuery::default()).unwrap();
+        editor.page = db
+            .search_torrent_summaries(&TorrentQuery::default())
+            .unwrap();
         editor.select(card);
         (root, config, db, editor, egui::Context::default())
     }
@@ -1062,7 +1110,9 @@ mod tests {
         let card = db.torrent_card(card.page_id).unwrap();
         let first = card.images[0].image_id;
         let second = card.images[1].image_id;
-        editor.page = db.search_torrents(&TorrentQuery::default()).unwrap();
+        editor.page = db
+            .search_torrent_summaries(&TorrentQuery::default())
+            .unwrap();
         editor.select(card.clone());
         click_main_image(&mut editor, &config, &ctx, 1);
         assert_eq!(editor.edit.primary_image_id, Some(second));
@@ -1150,6 +1200,73 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_summary_loads_only_the_chosen_full_card_in_the_background() {
+        let (_root, config, db, mut editor, ctx) = fixture();
+        let previous = Arc::clone(editor.selected.as_ref().unwrap());
+        let page = ScrapedItem {
+            site_key: "example".into(),
+            page_url: "https://example.test/second".into(),
+            title: "Another card".into(),
+            raw_html: String::new(),
+            images: vec![],
+            attributes: previous.attributes.clone(),
+        };
+        let id = db.upsert_scraped_item(&page).unwrap().page_id;
+        editor.page = db
+            .search_torrent_summaries(&TorrentQuery::default())
+            .unwrap();
+        click(&mut editor, &config, &ctx, "Another card");
+        assert!(editor.busy);
+        assert!(Arc::ptr_eq(&previous, editor.selected.as_ref().unwrap()));
+        finish(&mut editor);
+        assert_eq!(editor.selected.as_ref().unwrap().page_id, id);
+        assert_eq!(editor.selected.as_ref().unwrap().title, "Another card");
+    }
+
+    #[test]
+    fn large_cards_share_their_snapshot_and_only_render_visible_thumbnail_rows() {
+        let (_root, config, db, mut editor, ctx) = fixture();
+        let card = editor.selected.as_ref().unwrap();
+        let mut page = ScrapedItem {
+            site_key: card.site_key.clone(),
+            page_url: card.page_url.clone(),
+            title: card.title.clone(),
+            raw_html: String::new(),
+            attributes: card.attributes.clone(),
+            images: vec![],
+        };
+        page.images = (0..200)
+            .map(|id| crate::models::ScrapedImage {
+                source_url: format!("https://example.test/large/{id}.jpg"),
+                preview_url: None,
+                alt_text: None,
+                width: None,
+                height: None,
+                sort_order: id,
+                local_file_path: None,
+            })
+            .collect();
+        let id = db.upsert_scraped_item(&page).unwrap().page_id;
+        editor.page = db
+            .search_torrent_summaries(&TorrentQuery::default())
+            .unwrap();
+        editor.select(db.torrent_card(id).unwrap());
+        let snapshot = Arc::clone(editor.selected.as_ref().unwrap());
+        let _ = render(&mut editor, &config, &ctx, vec![]);
+        let output = render(&mut editor, &config, &ctx, vec![]);
+        let count = texts(&output)
+            .iter()
+            .filter(|(text, _)| text.as_str() == "Main image")
+            .count();
+        assert!(
+            count > 0 && count < 30,
+            "rendered {count} checkboxes for 200 images"
+        );
+        assert!(Arc::ptr_eq(&snapshot, editor.selected.as_ref().unwrap()));
+        assert_eq!(snapshot.images.len(), 200);
+    }
+
+    #[test]
     fn folder_rename_is_drafted_cancelled_and_confirmed_through_the_ui() {
         let (_root, config, db, mut editor, ctx) = fixture();
         let old = editor.selected.clone().unwrap();
@@ -1181,7 +1298,7 @@ mod tests {
         assert!(destination.is_dir());
         assert!(!config
             .effective_download_dir()
-            .join(old.directory.unwrap())
+            .join(old.directory.as_ref().unwrap())
             .exists());
         assert!(config
             .effective_download_dir()

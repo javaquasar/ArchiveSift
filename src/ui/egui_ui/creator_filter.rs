@@ -1,12 +1,16 @@
 //! Shared asynchronous attribution filter for images and torrent cards.
 use crate::ui::UiCommand;
 use eframe::egui;
+use std::time::{Duration, Instant};
+
+const COMPLETION_DELAY: Duration = Duration::from_millis(180);
 
 #[derive(Default, Clone)]
 pub(super) struct CreatorFilter {
     pub text: String,
     suggestions: Vec<String>,
     requested: Option<(String, String)>,
+    pending: Option<(String, Instant)>,
 }
 
 fn parts(value: &str) -> Vec<(usize, &str)> {
@@ -42,6 +46,25 @@ fn last_token(value: &str) -> String {
 }
 
 impl CreatorFilter {
+    fn schedule(&mut self, database: &str, now: Instant) {
+        self.pending = Some((database.to_owned(), now + COMPLETION_DELAY));
+        self.requested = None;
+        self.suggestions.clear();
+    }
+
+    fn due(&mut self, database: &str, now: Instant) -> Option<UiCommand> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(db, deadline)| db == database && now >= *deadline)
+        {
+            self.pending = None;
+            self.request(database)
+        } else {
+            None
+        }
+    }
+
     pub fn values(&self) -> Vec<String> {
         parts(&self.text)
             .into_iter()
@@ -76,14 +99,26 @@ impl CreatorFilter {
                 .hint_text("Director, author or photographer")
                 .char_limit(2048),
         );
-        if response.gained_focus() {
-            self.requested = None;
+        let now = Instant::now();
+        if response.changed()
+            || response.gained_focus()
+            || (response.has_focus()
+                && (self
+                    .requested
+                    .as_ref()
+                    .is_some_and(|(db, _)| db != database)
+                    || self.pending.as_ref().is_some_and(|(db, _)| db != database)))
+        {
+            self.schedule(database, now);
         }
-        if response.changed() || response.gained_focus() {
-            self.request(database)
-        } else {
-            None
+        if !response.has_focus() {
+            self.pending = None;
         }
+        if let Some((_, deadline)) = &self.pending {
+            ui.ctx()
+                .request_repaint_after(deadline.saturating_duration_since(now));
+        }
+        self.due(database, now)
     }
 
     pub fn set_suggestions(&mut self, database: &str, query: &str, values: Vec<String>) {
@@ -128,6 +163,7 @@ impl CreatorFilter {
         };
         self.suggestions.clear();
         self.requested = None;
+        self.pending = None;
     }
 
     pub fn render_suggestions(&mut self, ui: &mut egui::Ui) {
@@ -145,6 +181,32 @@ impl CreatorFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_is_debounced_and_stale_suggestions_are_rejected_during_the_delay() {
+        let now = Instant::now();
+        let mut filter = CreatorFilter::default();
+        filter.text = "A".into();
+        filter.schedule("library", now);
+        assert!(filter
+            .due("library", now + Duration::from_millis(179))
+            .is_none());
+        filter.text = "Alice".into();
+        filter.schedule("library", now + Duration::from_millis(100));
+        filter.set_suggestions("library", "A", vec!["Wrong".into()]);
+        assert!(!filter.has_suggestions());
+        assert!(filter.due("library", now + COMPLETION_DELAY).is_none());
+        assert!(
+            matches!(filter.due("library", now + Duration::from_millis(280)), Some(UiCommand::SuggestCreators { query, .. }) if query == "Alice")
+        );
+        assert!(filter
+            .due("library", now + Duration::from_secs(1))
+            .is_none());
+        filter.schedule("other", now);
+        assert!(filter
+            .due("library", now + Duration::from_secs(1))
+            .is_none());
+    }
 
     #[test]
     fn stale_queries_databases_and_cleared_filters_cannot_restore_suggestions() {

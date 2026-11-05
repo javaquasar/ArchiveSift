@@ -139,6 +139,22 @@ Path traversal and symbolic links outside the archive are rejected.
 
 ## Validation
 
+The list uses `search_torrent_summaries`: count, ordered IDs and a summary batch
+are three SQL queries, independent of the number of cards returned. Descriptions,
+image paths and attachment details are loaded only for the selected card in a
+background job. The full `search_torrents` API batches headers, page attributes,
+images and attachments into four queries after selecting IDs, rather than four
+queries per card. Pagination reuses studio/tag/category suggestions; Refresh or
+a saved edit reloads them. Selected cards share an `Arc` snapshot between frames,
+and their thumbnail grid renders only visible rows with a bounded preview cache.
+
+`cargo test --locked --test search_optimizations` compares adaptive image search
+against the previous SQL for empty, selective and common terms, including shared
+images, literal text, filters and keyset pagination. It also compares lightweight
+and batched torrent pages against individually loaded cards. Headless UI tests
+cover asynchronous selection and a 200-image card; worker tests exercise queue
+saturation, request coalescing, cancellation and stale-generation protection.
+
 `cargo test --locked --test torrent_library` covers layouts, legacy organization,
 manual metadata, filters, stale plans, collisions, failed commits and shared files.
 `cargo test --locked --lib torrent` includes interrupted renames/copies, cleanup,

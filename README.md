@@ -77,6 +77,15 @@ use double quotes around a name, for example `"Example, Author"`.
 The original roles remain separate in metadata. Page-level credits apply to its
 images; image-specific credits match that image and its parent torrent card.
 
+Image search probes a bounded set of full-text matches before loading results:
+empty and selective queries avoid scanning the whole archive, while common terms
+keep the ordered pagination plan. Creator completion waits 180 ms after typing
+and caches the folded name catalog, refreshing it when SQLite reports a commit.
+Background metadata requests are merged, bounded and cancelled when the search
+changes. Responses match both the source page and image, preserving shared images.
+If the general background queue is full, the UI reports a retryable error instead
+of waiting for space in the queue.
+
 Open **Settings → Storage** to select the download folder, open an existing
 SQLite library or create a new one, and optionally choose a separate thumbnail
 folder. **Save and apply** validates and saves the selection without restarting.
