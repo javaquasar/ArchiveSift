@@ -156,6 +156,7 @@ pub struct AppWindow {
     pub search_seq: u64,
 
     active_tab: Tab,
+    pub(super) agent_access: super::agent_access::AgentAccessPanel,
     storage_settings: StorageSettingsEditor,
     settings_json_mode: bool,
     raw_settings: Option<super::raw_settings::RawSettingsEditor>,
@@ -298,6 +299,7 @@ impl AppWindow {
             queue_status: None,
             search_seq: 0,
             active_tab: Tab::Scrape,
+            agent_access: Default::default(),
             storage_settings,
             settings_json_mode: false,
             raw_settings: None,
@@ -692,6 +694,13 @@ impl AppWindow {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Revocation remains available even while storage settings apply.
+            if self.active_tab == Tab::Settings {
+                if let Some(command) = self.agent_access.render(ui) {
+                    self.pending_command = Some(command);
+                }
+                ui.add_space(8.0);
+            }
             ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
                 match self.active_tab {
                     Tab::Scrape => self.render_scrape_tab(ui),

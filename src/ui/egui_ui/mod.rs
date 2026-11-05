@@ -1,4 +1,5 @@
 mod account_settings;
+mod agent_access;
 mod app_window;
 mod background_executor;
 mod coalescing_worker;
@@ -21,6 +22,7 @@ use std::thread;
 use eframe::egui;
 use futures::StreamExt;
 
+use crate::agent_control::{wire::ErrorCode as AgentError, AgentSession};
 use crate::app::AppConfig;
 use crate::clipboard_listener::{spawn_clipboard_watcher, ClipboardEvent};
 use crate::db::{Database, FileDownloadStore, ImageLocalPathUpdate, QueryCancellation};
@@ -169,6 +171,38 @@ struct DesktopApp {
     /// Live preset tags/categories shared with the running queue processor.
     /// Updated by the UI whenever the user changes the preset fields.
     live_presets: Arc<RwLock<LivePresets>>,
+    agent_session: Option<AgentSession>,
+    agent_epoch: u64,
+    agent_starting: bool,
+    agent_profile: PathBuf,
+    agent_result_tx: RepaintingSender<AgentStartResult>,
+    agent_result_rx: mpsc::Receiver<AgentStartResult>,
+}
+
+fn mcp_connection_config(profile: &std::path::Path) -> String {
+    let adapter = std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent().map(|parent| {
+                parent.join(if cfg!(windows) {
+                    "archive-sift-mcp.exe"
+                } else {
+                    "archive-sift-mcp"
+                })
+            })
+        })
+        .unwrap_or_else(|| PathBuf::from("archive-sift-mcp"));
+    let profile = if profile.is_absolute() {
+        profile.to_owned()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(profile)
+    };
+    serde_json::to_string_pretty(&serde_json::json!({"mcpServers":{"archivesift":{"command":adapter,"args":["--config",profile]}}})).unwrap()
+}
+
+struct AgentStartResult {
+    epoch: u64,
+    result: Result<(AgentSession, zeroize::Zeroizing<String>), AgentError>,
 }
 
 struct RepaintingSender<T> {
@@ -278,6 +312,7 @@ fn suggestion_worker(
 
 impl DesktopApp {
     fn new(config: AppConfig, repaint_context: egui::Context) -> Self {
+        let (agent_result_tx, agent_result_rx) = repainting_channel(&repaint_context, 1);
         let (state_tx, state_rx) = repainting_channel(&repaint_context, UI_RESULT_CHANNEL_CAPACITY);
         let suggestion_worker = suggestion_worker(&state_tx);
         let queue_service = Arc::new(UrlQueueService::new());
@@ -310,6 +345,12 @@ impl DesktopApp {
             repaint_context,
             clipboard_rx,
             live_presets,
+            agent_session: None,
+            agent_epoch: 0,
+            agent_starting: false,
+            agent_profile: AppConfig::config_path().to_owned(),
+            agent_result_tx,
+            agent_result_rx,
         };
 
         // The SQLite-backed queue restores interrupted work itself. Remove
@@ -322,6 +363,109 @@ impl DesktopApp {
         }
 
         app
+    }
+
+    fn set_agent_access(&mut self, enabled: bool, allow_downloads: bool, rotate: bool) {
+        self.agent_epoch = self.agent_epoch.wrapping_add(1);
+        if enabled && self.window.storage_settings_applying() {
+            self.agent_session = None;
+            self.window.agent_access.failed(
+                "Wait for storage settings to finish applying before enabling agent access.",
+            );
+            return;
+        }
+        self.window.agent_access.enabled = enabled;
+        self.window.agent_access.downloads = enabled && allow_downloads;
+        if !enabled {
+            self.agent_session = None;
+            self.window.agent_access.disabled();
+            return;
+        }
+        if rotate {
+            self.agent_session = None;
+        }
+        if let Some(session) = &self.agent_session {
+            session.service().set_download_permission(allow_downloads);
+            self.window.agent_access.busy = false;
+            return;
+        }
+        self.window.agent_access.busy = true;
+        if self.agent_starting {
+            return;
+        }
+        self.agent_starting = true;
+        let epoch = self.agent_epoch;
+        let tx = self.agent_result_tx.clone();
+        let config = self.window.config.clone();
+        let profile = self.agent_profile.clone();
+        let queue = Arc::clone(&self.queue_service);
+        let log = self.window.log.clone();
+        let context = self.repaint_context.clone();
+        let wake = Arc::new(move || context.request_repaint());
+        if let Err(error) = spawn_background(move || {
+            let result = AgentSession::start(config, queue, &profile, log, wake);
+            let _ = tx.send(AgentStartResult { epoch, result });
+        }) {
+            self.agent_starting = false;
+            self.window.agent_access.failed(&error);
+        }
+    }
+
+    fn poll_agent_access(&mut self) {
+        if self
+            .agent_session
+            .as_ref()
+            .is_some_and(|session| !session.service().enabled())
+        {
+            self.set_agent_access(false, false, false);
+            self.window.agent_access.message =
+                Some("The local agent listener stopped. Enable access again to reconnect.".into());
+        }
+        if self
+            .agent_session
+            .as_ref()
+            .is_some_and(|session| !session.service().bound_to(&self.window.config))
+        {
+            self.set_agent_access(false, false, false);
+            self.window.agent_access.message=Some("Library or destination changed. Enable agent access again to use the new storage settings.".into());
+        }
+        while let Ok(started) = self.agent_result_rx.try_recv() {
+            self.agent_starting = false;
+            if started.epoch != self.agent_epoch || !self.window.agent_access.enabled {
+                drop(started);
+                if self.window.agent_access.enabled {
+                    self.set_agent_access(true, self.window.agent_access.downloads, false);
+                }
+                continue;
+            }
+            match started.result {
+                Ok((session, secret)) if session.service().bound_to(&self.window.config) => {
+                    session
+                        .service()
+                        .activate(self.window.agent_access.downloads);
+                    self.window
+                        .agent_access
+                        .installed(secret, mcp_connection_config(&self.agent_profile));
+                    self.window
+                        .log
+                        .push("Local agent access enabled for this application session.");
+                    self.agent_session = Some(session);
+                }
+                Ok(_) => self.window.agent_access.failed(
+                    "Storage settings changed while agent access was starting. Enable it again.",
+                ),
+                Err(error) => self.window.agent_access.failed(error.message()),
+            }
+        }
+        let process = if let Some(session) = &self.agent_session {
+            self.window.agent_access.requests = session.service().request_count();
+            session.service().take_processor_request()
+        } else {
+            false
+        };
+        if process {
+            self.start_processor_if_needed(self.window.config.clone());
+        }
     }
 
     fn enqueue_manual_url(&mut self, config: AppConfig) {
@@ -411,6 +555,7 @@ impl DesktopApp {
             );
             return;
         }
+        self.set_agent_access(false, false, false);
         self.window.begin_storage_settings();
         let config = self.window.config.clone();
         let state_tx = self.state_tx.clone();
@@ -427,6 +572,7 @@ impl DesktopApp {
     fn finish_storage_settings(&mut self, result: Result<AppConfig, String>) {
         match result {
             Ok(config) => {
+                self.set_agent_access(false, false, false);
                 if let Ok(mut presets) = self.live_presets.write() {
                     presets.tags = config.preset_tags.clone();
                     presets.categories = config.preset_categories.clone();
@@ -521,6 +667,7 @@ impl DesktopApp {
             );
             return;
         }
+        self.set_agent_access(false, false, false);
         self.window.begin_storage_settings();
         let current = self.window.config.clone();
         let state_tx = self.state_tx.clone();
@@ -1010,6 +1157,7 @@ impl DesktopApp {
 
 impl DesktopApp {
     fn update_ui(&mut self, ctx: &egui::Context) {
+        self.poll_agent_access();
         if self
             .metadata_generation
             .as_ref()
@@ -1272,6 +1420,11 @@ impl DesktopApp {
 
         if let Some(command) = self.window.take_command() {
             match command {
+                UiCommand::SetAgentAccess {
+                    enabled,
+                    allow_downloads,
+                    rotate,
+                } => self.set_agent_access(enabled, allow_downloads, rotate),
                 UiCommand::ApplyConfiguration { document, expected } => self
                     .start_full_configuration(
                         Some((document, expected)),
@@ -2481,7 +2634,90 @@ mod startup_ui_tests {
             ..AppConfig::default()
         };
         let context = egui::Context::default();
-        (DesktopApp::new(config, context.clone()), root, context)
+        let mut app = DesktopApp::new(config, context.clone());
+        app.agent_profile = root.path().join("app-config.json");
+        (app, root, context)
+    }
+
+    #[test]
+    fn agent_settings_toggle_grants_access_and_revokes_it_without_persisting_permissions() {
+        let (mut app, _root, context) = test_app(false);
+        assert!(app.agent_session.is_none());
+        assert!(!app.window.agent_access.enabled);
+        let output = render(&mut app, &context, egui::vec2(1900.0, 1400.0), Vec::new());
+        let output = click_label(&mut app, &context, &output, "Settings");
+        assert_labels(
+            &output,
+            &["Agent access · MCP", "Allow agents to use this application"],
+        );
+        let _ = click_label(
+            &mut app,
+            &context,
+            &output,
+            "Allow agents to use this application",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.agent_starting {
+            app.poll_agent_access();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let service = Arc::clone(app.agent_session.as_ref().unwrap().service());
+        assert!(service.enabled());
+        assert!(!service.allow_downloads());
+        let output = render(&mut app, &context, egui::vec2(1900.0, 1400.0), Vec::new());
+        let output = click_label(
+            &mut app,
+            &context,
+            &output,
+            "Allow queue changes and downloads",
+        );
+        assert!(service.allow_downloads());
+        let _ = click_label(
+            &mut app,
+            &context,
+            &output,
+            "Allow agents to use this application",
+        );
+        assert!(!service.enabled());
+        assert!(app.agent_session.is_none());
+        assert!(serde_json::to_value(&app.window.config)
+            .unwrap()
+            .get("agent_access_enabled")
+            .is_none());
+        let mut document = serde_json::to_value(&app.window.config).unwrap();
+        document["agent_access_enabled"] = true.into();
+        assert!(crate::services::configuration::validate(
+            &document,
+            &crate::scraper::extensions::settings::SettingsCatalog::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cancelling_agent_startup_or_changing_storage_cannot_leave_a_live_grant() {
+        let (mut app, _root, _context) = test_app(false);
+        app.set_agent_access(true, false, false);
+        app.set_agent_access(false, false, false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.agent_starting {
+            app.poll_agent_access();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.agent_session.is_none());
+        assert!(!app.window.agent_access.enabled);
+        app.set_agent_access(true, false, false);
+        while app.agent_starting {
+            app.poll_agent_access();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let service = Arc::clone(app.agent_session.as_ref().unwrap().service());
+        app.window.config.database_path = "different-library.sqlite3".into();
+        app.poll_agent_access();
+        assert!(!service.enabled());
+        assert!(app.agent_session.is_none());
     }
 
     #[test]

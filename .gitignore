@@ -11,5 +11,8 @@
 *.sqlite3-*
 *.db
 *.db-*
+*.agent-endpoint.json
+*.agent-endpoint.lock
+*.agent-endpoint.*.tmp
 Thumbs.db
 .DS_Store

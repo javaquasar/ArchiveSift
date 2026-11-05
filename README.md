@@ -86,6 +86,12 @@ changes. Responses match both the source page and image, preserving shared image
 If the general background queue is full, the UI reports a retryable error instead
 of waiting for space in the queue.
 
+**Settings → Agent access · MCP** grants agents access to the running application.
+Access is off on every launch; queue changes and downloads require a separate
+grant. The installed `archive-sift-mcp` stdio adapter uses a session token and does
+not start another application or downloader. See [connection instructions and
+permissions](docs/AGENT_CONTROL.md).
+
 Open **Settings → Storage** to select the download folder, open an existing
 SQLite library or create a new one, and optionally choose a separate thumbnail
 folder. **Save and apply** validates and saves the selection without restarting.

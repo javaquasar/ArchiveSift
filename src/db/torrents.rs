@@ -331,15 +331,41 @@ impl Database {
         read_card(&connection, page_id)
     }
 
+    pub fn torrent_card_cancellable(
+        &self,
+        page_id: i64,
+        cancellation: &QueryCancellation,
+    ) -> AppResult<TorrentCard> {
+        let connection = self.connect()?;
+        let _guard = cancellation.register(&connection)?;
+        read_card(&connection, page_id)
+    }
+
     pub fn search_torrents(&self, query: &TorrentQuery) -> AppResult<TorrentPage> {
-        let (ids, total) = self.torrent_search_ids(query)?;
+        let (ids, total) = self.torrent_search_ids(query, None)?;
         let connection = self.connect()?;
         let cards = read_cards(&connection, &ids)?;
         Ok(TorrentPage { cards, total })
     }
 
     pub fn search_torrent_summaries(&self, query: &TorrentQuery) -> AppResult<TorrentSummaryPage> {
-        let (ids, total) = self.torrent_search_ids(query)?;
+        self.search_torrent_summaries_internal(query, None)
+    }
+
+    pub fn search_torrent_summaries_cancellable(
+        &self,
+        query: &TorrentQuery,
+        cancellation: &QueryCancellation,
+    ) -> AppResult<TorrentSummaryPage> {
+        self.search_torrent_summaries_internal(query, Some(cancellation))
+    }
+
+    fn search_torrent_summaries_internal(
+        &self,
+        query: &TorrentQuery,
+        cancellation: Option<&QueryCancellation>,
+    ) -> AppResult<TorrentSummaryPage> {
+        let (ids, total) = self.torrent_search_ids(query, cancellation)?;
         if ids.is_empty() {
             return Ok(TorrentSummaryPage {
                 cards: vec![],
@@ -347,6 +373,9 @@ impl Database {
             });
         }
         let connection = self.connect()?;
+        let _guard = cancellation
+            .map(|token| token.register(&connection))
+            .transpose()?;
         let placeholders = vec!["?"; ids.len()].join(",");
         let mut statement = connection.prepare(&format!(
             "SELECT sp.id,sp.site_key,tc.primary_studio,
@@ -371,8 +400,15 @@ impl Database {
         Ok(TorrentSummaryPage { cards, total })
     }
 
-    fn torrent_search_ids(&self, query: &TorrentQuery) -> AppResult<(Vec<i64>, usize)> {
+    fn torrent_search_ids(
+        &self,
+        query: &TorrentQuery,
+        cancellation: Option<&QueryCancellation>,
+    ) -> AppResult<(Vec<i64>, usize)> {
         let connection = self.connect()?;
+        let _guard = cancellation
+            .map(|token| token.register(&connection))
+            .transpose()?;
         let mut sql = String::from(
             " FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE 1=1",
         );

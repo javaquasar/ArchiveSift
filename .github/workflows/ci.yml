@@ -26,6 +26,8 @@ jobs:
         run: cargo test --locked --test creator_search && cargo test --locked --lib creator
       - name: Adaptive search and lightweight torrent list regression tests
         run: cargo test --locked --test search_optimizations
+      - name: Local agent access and real MCP stdio adapter tests
+        run: cargo test --locked --test agent_control && cargo test --locked --lib agent
       - name: Recovery, path validation and headless card editor tests
         run: cargo test --locked --lib torrent
       - name: Configuration validation and completion integration tests
@@ -47,12 +49,15 @@ jobs:
       - name: Build fixture plugins and production demo WASM module
         run: python scripts/test_extensions.py --prepare-only
       - name: Workspace tests including installed demo WASM parser
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --jobs 1
       - name: Release build
-        run: cargo build --locked --release
+        run: cargo build --locked --release --bins --jobs 1
       - name: Upload Windows executable
         uses: actions/upload-artifact@v7
         with:
           name: archive-sift-windows
-          path: target/release/archive-sift.exe
+          path: |
+            target/release/archive-sift.exe
+            target/release/archive-sift-mcp.exe
+            docs/AGENT_CONTROL.md
           if-no-files-found: error

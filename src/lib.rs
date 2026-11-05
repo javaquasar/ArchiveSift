@@ -1,3 +1,4 @@
+pub mod agent_control;
 pub mod app;
 pub mod clipboard_listener;
 pub mod db;

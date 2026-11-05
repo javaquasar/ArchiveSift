@@ -54,7 +54,7 @@ impl UrlQueueService {
         service
     }
 
-    fn with_registry_and_queue_path(
+    pub fn with_registry_and_queue_path(
         registry: ScraperRegistry,
         queue_path: impl Into<PathBuf>,
     ) -> Self {
@@ -103,6 +103,10 @@ impl UrlQueueService {
 
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn registry(&self) -> ScraperRegistry {
+        self.registry.clone()
     }
 
     pub fn resume(&self) {
