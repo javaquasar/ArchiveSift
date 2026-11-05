@@ -36,6 +36,7 @@ pub struct TorrentCard {
     pub primary_studio: String,
     pub primary_image_id: Option<i64>,
     pub directory: Option<String>,
+    pub folder_name: Option<String>,
     pub revision: i64,
     pub attributes: Vec<MetadataAttribute>,
     pub images: Vec<TorrentImage>,
@@ -43,6 +44,10 @@ pub struct TorrentCard {
 }
 
 impl TorrentCard {
+    pub fn directory_name(&self) -> Option<&str> {
+        self.directory.as_deref()?.rsplit(['/', '\\']).next()
+    }
+
     pub fn primary_image(&self) -> Option<&TorrentImage> {
         self.images
             .iter()
@@ -71,6 +76,8 @@ impl TorrentCard {
 pub struct TorrentEdit {
     pub primary_studio: String,
     #[serde(default)]
+    pub folder_name: Option<String>,
+    #[serde(default)]
     pub primary_image_id: Option<i64>,
     pub studios: Vec<String>,
     pub tags: Vec<String>,
@@ -81,6 +88,7 @@ impl From<&TorrentCard> for TorrentEdit {
     fn from(card: &TorrentCard) -> Self {
         Self {
             primary_studio: card.primary_studio.clone(),
+            folder_name: card.folder_name.clone(),
             primary_image_id: card.primary_image_id,
             studios: card.values("studio"),
             tags: card.values("tag"),

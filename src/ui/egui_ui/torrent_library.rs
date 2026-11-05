@@ -66,6 +66,7 @@ pub(super) struct TorrentLibraryUi {
     page: TorrentPage,
     selected: Option<TorrentCard>,
     edit: TorrentEdit,
+    folder_name: String,
     inputs: [String; 3],
     suggestions: Suggestions,
     organize: bool,
@@ -95,6 +96,7 @@ impl Default for TorrentLibraryUi {
             },
             selected: None,
             edit: TorrentEdit::default(),
+            folder_name: String::new(),
             inputs: Default::default(),
             suggestions: Suggestions::default(),
             organize: false,
@@ -208,11 +210,20 @@ impl TorrentLibraryUi {
 
     fn select(&mut self, card: TorrentCard) {
         self.edit = TorrentEdit::from(&card);
+        self.folder_name = card.directory_name().unwrap_or("").to_owned();
         self.selected = Some(card);
         self.inputs = Default::default();
         self.organize = false;
         self.plan = None;
         self.image_popup = None;
+    }
+
+    fn draft_edit(&self, card: &TorrentCard) -> TorrentEdit {
+        let mut edit = self.edit.clone();
+        if self.folder_name != card.directory_name().unwrap_or("") {
+            edit.folder_name = Some(self.folder_name.clone());
+        }
+        edit
     }
 
     fn job(
@@ -468,6 +479,16 @@ impl TorrentLibraryUi {
         }
         ui.separator();
         ui.add_enabled_ui(!self.busy && self.plan.is_none(), |ui| {
+            ui.label("Folder name");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.folder_name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Generated from title and year")
+                    .char_limit(120),
+            );
+            ui.weak(
+                "Review and save previews the new folder. Confirm and move transfers all files.",
+            );
             egui::ComboBox::from_label("Primary studio")
                 .selected_text(if self.edit.primary_studio.is_empty() {
                     "Unknown studio"
@@ -521,7 +542,7 @@ impl TorrentLibraryUi {
                     Database::new(&config.database_path),
                     config.effective_download_dir(),
                 );
-                let edit = self.edit.clone();
+                let edit = self.draft_edit(&card);
                 let organize = self.organize;
                 let id = card.page_id;
                 let revision = card.revision;
@@ -980,6 +1001,7 @@ mod tests {
         for expected in [
             "Full torrent heading [2025]",
             "Primary studio",
+            "Folder name",
             "Studios",
             "Tags",
             "Categories",
@@ -1125,6 +1147,47 @@ mod tests {
             .effective_download_dir()
             .join(&saved.attachments[0].local_file_path)
             .is_file());
+    }
+
+    #[test]
+    fn folder_rename_is_drafted_cancelled_and_confirmed_through_the_ui() {
+        let (_root, config, db, mut editor, ctx) = fixture();
+        let old = editor.selected.clone().unwrap();
+        assert_eq!(editor.draft_edit(&old).folder_name, None);
+        editor.folder_name = "Renamed release (2025)".into();
+        click(&mut editor, &config, &ctx, "Review and save");
+        finish(&mut editor);
+        let plan = editor.plan.as_ref().unwrap();
+        let destination = config
+            .effective_download_dir()
+            .join(plan.to_directory.as_ref().unwrap());
+        assert!(!destination.exists());
+        assert_eq!(
+            db.torrent_card(old.page_id).unwrap().directory,
+            old.directory
+        );
+        click(&mut editor, &config, &ctx, "Cancel");
+        assert!(editor.plan.is_none());
+        assert_eq!(editor.folder_name, "Renamed release (2025)");
+        assert_eq!(db.torrent_card(old.page_id).unwrap().folder_name, None);
+        click(&mut editor, &config, &ctx, "Review and save");
+        finish(&mut editor);
+        click(&mut editor, &config, &ctx, "Confirm and move");
+        assert!(finish(&mut editor));
+        let saved = db.torrent_card(old.page_id).unwrap();
+        assert_eq!(saved.directory_name(), Some("Renamed release (2025)"));
+        assert_eq!(saved.folder_name.as_deref(), Some("Renamed release (2025)"));
+        assert_eq!(saved.primary_studio, old.primary_studio);
+        assert!(destination.is_dir());
+        assert!(!config
+            .effective_download_dir()
+            .join(old.directory.unwrap())
+            .exists());
+        assert!(config
+            .effective_download_dir()
+            .join(&saved.attachments[0].local_file_path)
+            .is_file());
+        assert_eq!(editor.folder_name, "Renamed release (2025)");
     }
 
     #[test]

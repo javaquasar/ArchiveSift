@@ -494,6 +494,240 @@ fn reparsed_movie_name_and_year_move_only_after_explicit_organization() {
 }
 
 #[test]
+fn renamed_folder_moves_all_assets_after_confirmation_and_keeps_its_name() {
+    let library = Library::new(false);
+    let old = library.db.torrent_card(library.id).unwrap();
+    let old_folder = library.base.join(old.directory.as_ref().unwrap());
+    std::fs::write(
+        old_folder.join("description.txt"),
+        b"Full heading and description",
+    )
+    .unwrap();
+    std::fs::create_dir(old_folder.join("extras")).unwrap();
+    std::fs::write(old_folder.join("extras/notes.txt"), b"User notes").unwrap();
+    let edit = TorrentEdit {
+        folder_name: Some("My collection — Фильм (2025)".into()),
+        ..TorrentEdit::from(&old)
+    };
+    let prepare = || {
+        library
+            .service()
+            .prepare(library.id, old.revision, edit.clone(), false)
+            .unwrap()
+    };
+    let plan = prepare();
+    let destination = library.base.join(plan.to_directory.as_ref().unwrap());
+    assert_eq!(destination.parent(), old_folder.parent());
+    assert_eq!(plan.files.len(), 5);
+    assert!(old_folder.is_dir());
+    assert!(
+        !destination.exists(),
+        "review must not create or move files"
+    );
+    drop(plan);
+    assert_eq!(
+        library.db.torrent_card(library.id).unwrap().directory,
+        old.directory
+    );
+    assert!(old_folder.join("release.torrent").is_file());
+    let saved = library.service().apply(prepare(), |_| {}).unwrap();
+    assert!(!old_folder.exists());
+    assert_eq!(saved.directory_name(), edit.folder_name.as_deref());
+    assert_eq!(saved.folder_name, edit.folder_name);
+    assert_eq!(saved.title, old.title);
+    let metadata = |card: &archive_sift::models::TorrentCard| {
+        card.attributes
+            .iter()
+            .map(|a| (&a.kind, &a.value))
+            .map(|(kind, value)| (kind.clone(), value.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(metadata(&saved), metadata(&old));
+    assert_eq!(
+        std::fs::read(destination.join("description.txt")).unwrap(),
+        b"Full heading and description"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("extras/notes.txt")).unwrap(),
+        b"User notes"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("images/001.png")).unwrap(),
+        b"image bytes"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("release.torrent")).unwrap(),
+        b"torrent bytes"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("release.magnet.txt")).unwrap(),
+        b"magnet bytes"
+    );
+    for path in saved
+        .images
+        .iter()
+        .filter_map(|i| i.local_file_path.as_ref())
+        .chain(saved.attachments.iter().map(|a| &a.local_file_path))
+    {
+        assert!(Path::new(path).starts_with(saved.directory.as_ref().unwrap()));
+        assert!(library.base.join(path).is_file());
+    }
+    assert_eq!(saved.images[0].thumbnail_path, old.images[0].thumbnail_path);
+    let image = library
+        .db
+        .search_images(&SearchQuery {
+            page_id: Some(library.id),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(image[0].local_file_path, saved.images[0].local_file_path);
+    let reopened = Database::new(library.root.path().join("archive.sqlite3"));
+    reopened.initialize().unwrap();
+    assert_eq!(
+        reopened.torrent_card(library.id).unwrap().folder_name,
+        edit.folder_name
+    );
+    library.db.upsert_scraped_item(&library.page).unwrap();
+    assert_eq!(
+        library.db.torrent_card(library.id).unwrap().directory,
+        saved.directory
+    );
+    let moved = library
+        .service()
+        .apply(library.plan("Studio Second"), |_| {})
+        .unwrap();
+    assert_eq!(moved.directory_name(), edit.folder_name.as_deref());
+    assert_eq!(moved.folder_name, edit.folder_name);
+    assert_eq!(moved.primary_studio, "Studio Second");
+    assert!(library
+        .base
+        .join(moved.directory.unwrap())
+        .join("extras/notes.txt")
+        .is_file());
+}
+
+#[test]
+fn folder_rename_rejects_invalid_names_without_changing_files_or_metadata() {
+    let library = Library::new(false);
+    let old = library.db.torrent_card(library.id).unwrap();
+    let mut names = vec![
+        "",
+        " ",
+        ".",
+        "..",
+        "../escape",
+        "nested/folder",
+        "nested\\folder",
+        "C:\\escape",
+        "CON",
+        "con.txt",
+        "LPT1",
+        "name.",
+        "name ",
+        "bad?name",
+        "bad\0name",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<Vec<_>>();
+    names.extend(["A".repeat(121), "Ж".repeat(121), "💡".repeat(61)]);
+    for name in names {
+        let edit = TorrentEdit {
+            folder_name: Some(name.clone()),
+            ..TorrentEdit::from(&old)
+        };
+        assert!(
+            library
+                .service()
+                .prepare(library.id, old.revision, edit, false)
+                .is_err(),
+            "accepted {name:?}"
+        );
+    }
+    let current = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(current.directory, old.directory);
+    assert_eq!(current.folder_name, None);
+    assert_eq!(current.revision, old.revision);
+    assert!(library
+        .base
+        .join(old.attachments[0].local_file_path.as_str())
+        .is_file());
+}
+
+#[test]
+fn folder_rename_rejects_collisions_and_changes_after_review() {
+    let library = Library::new(false);
+    let old = library.db.torrent_card(library.id).unwrap();
+    let edit = TorrentEdit {
+        folder_name: Some("Renamed release".into()),
+        ..TorrentEdit::from(&old)
+    };
+    let prepare = || {
+        library
+            .service()
+            .prepare(library.id, old.revision, edit.clone(), false)
+    };
+    let plan = prepare().unwrap();
+    let destination = library.base.join(plan.to_directory.as_ref().unwrap());
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("keep.txt"), b"Existing files").unwrap();
+    assert!(prepare().is_err());
+    assert!(library.service().apply(plan, |_| {}).is_err());
+    assert_eq!(
+        std::fs::read(destination.join("keep.txt")).unwrap(),
+        b"Existing files"
+    );
+    std::fs::remove_file(destination.join("keep.txt")).unwrap();
+    std::fs::remove_dir(destination).unwrap();
+    let plan = prepare().unwrap();
+    let added = library
+        .base
+        .join(old.directory.as_ref().unwrap())
+        .join("added.txt");
+    std::fs::write(&added, b"Added after review").unwrap();
+    assert!(library.service().apply(plan, |_| {}).is_err());
+    assert!(added.is_file());
+    let plan = prepare().unwrap();
+    library.db.upsert_scraped_item(&library.page).unwrap();
+    assert!(library.service().apply(plan, |_| {}).is_err());
+    assert_eq!(
+        library.db.torrent_card(library.id).unwrap().directory,
+        old.directory
+    );
+}
+
+#[test]
+fn folder_rename_rolls_back_files_and_custom_name_when_database_commit_fails() {
+    let library = Library::new(false);
+    let old = library.db.torrent_card(library.id).unwrap();
+    let edit = TorrentEdit {
+        folder_name: Some("Renamed release".into()),
+        ..TorrentEdit::from(&old)
+    };
+    let plan = library
+        .service()
+        .prepare(library.id, old.revision, edit, false)
+        .unwrap();
+    let destination = library.base.join(plan.to_directory.as_ref().unwrap());
+    let connection =
+        rusqlite::Connection::open(library.root.path().join("archive.sqlite3")).unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_rename BEFORE UPDATE ON torrent_cards BEGIN SELECT RAISE(ABORT,'test commit failure'); END;").unwrap();
+    assert!(library.service().apply(plan, |_| {}).is_err());
+    let current = library.db.torrent_card(library.id).unwrap();
+    assert_eq!(current.folder_name, old.folder_name);
+    assert_eq!(current.directory, old.directory);
+    assert_eq!(current.revision, old.revision);
+    assert!(!destination.exists());
+    assert!(library
+        .base
+        .join(old.images[0].local_file_path.as_ref().unwrap())
+        .is_file());
+    for attachment in old.attachments {
+        assert!(library.base.join(attachment.local_file_path).is_file());
+    }
+}
+
+#[test]
 fn studio_move_keeps_complete_card_sidecars_and_search_paths_consistent() {
     let library = Library::new(false);
     let old = library.db.torrent_card(library.id).unwrap();

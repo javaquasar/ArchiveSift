@@ -69,6 +69,16 @@ Review and save prepares a preview containing the source locations, destination,
 file count and size. Nothing moves until Confirm and move. Cancel retains the
 draft without writing it. Metadata-only confirmation keeps current file locations.
 
+Edit Folder name to rename the whole release directory. Review and save displays
+the proposed destination; Confirm and move transfers its images, torrent, magnet,
+description and user-added sidecars, including nested files. A rename keeps the
+current parent directory unless the primary studio changes in the same edit.
+The chosen name persists across restarts, reprocessing and subsequent studio moves.
+Names must be a single Windows/Linux-compatible component, at most 120 characters
+and 240 UTF-8 bytes; invalid or reserved names and existing destinations are rejected.
+The same recovery journal protects renames and studio moves, and database file
+paths change only after a successful transfer.
+
 The complete parser-provided studio list is retained. A separate primary selection
 defaults to the first studio emitted by the parser, with an unknown-studio fallback.
 Manual additions and removal overrides survive subsequent scrapes. Newly discovered

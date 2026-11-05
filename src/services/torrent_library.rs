@@ -77,20 +77,35 @@ impl TorrentLibrary {
         }
         let edit = normalize_edit(edit)?;
         validate_primary_image(&card, &edit)?;
-        let organize = organize || edit.primary_studio != card.primary_studio;
-        let target = if organize {
-            Some(
-                torrent_directory_with_year(
-                    &card.site_key,
-                    &edit.primary_studio,
-                    card.content_title(),
-                    &card.page_url,
-                    card.page_id,
-                    production_year(&card.attributes),
-                )
-                .to_string_lossy()
-                .into_owned(),
-            )
+        let studio_changed = edit.primary_studio != card.primary_studio;
+        let name_changed = edit.folder_name != card.folder_name;
+        let move_files = organize || studio_changed || name_changed;
+        let target = if move_files {
+            let generated = torrent_directory_with_year(
+                &card.site_key,
+                &edit.primary_studio,
+                card.content_title(),
+                &card.page_url,
+                card.page_id,
+                production_year(&card.attributes),
+            );
+            // A rename keeps the current parent; studio changes explicitly
+            // organize the card and retain its chosen folder name.
+            let mut directory = if name_changed && !organize && !studio_changed {
+                card.directory
+                    .as_deref()
+                    .map(portable_path)
+                    .transpose()?
+                    .unwrap_or_else(|| generated.clone())
+            } else {
+                generated.clone()
+            };
+            directory.set_file_name(
+                edit.folder_name
+                    .as_deref()
+                    .unwrap_or_else(|| generated.file_name().unwrap().to_str().unwrap()),
+            );
+            Some(directory.to_string_lossy().into_owned())
         } else {
             card.directory.clone()
         };
@@ -106,7 +121,7 @@ impl TorrentLibrary {
             image_paths: vec![],
             attachment_paths: vec![],
         };
-        if !organize {
+        if !move_files {
             return Ok(plan);
         }
         let target = plan.to_directory.as_ref().unwrap();
@@ -188,7 +203,10 @@ impl TorrentLibrary {
         if card.directory != plan.to_directory {
             let destination = checked_path(&plan.base_dir, target)?;
             if destination.try_exists()? {
-                return Err("destination folder already exists; choose a different studio or resolve the conflict".into());
+                return Err(
+                    "destination folder already exists; choose a different folder name or studio"
+                        .into(),
+                );
             }
         }
         Ok(plan)
@@ -440,6 +458,11 @@ fn validate_primary_image(card: &TorrentCard, edit: &TorrentEdit) -> AppResult<(
 }
 
 fn normalize_edit(mut edit: TorrentEdit) -> AppResult<TorrentEdit> {
+    if let Some(name) = &edit.folder_name {
+        if name.is_empty() || name.len() > 240 || safe_component(name, "", 120) != *name {
+            return Err("folder name must be a single valid Windows/Linux name (up to 120 characters and 240 UTF-8 bytes), without reserved names, trailing dots or spaces".into());
+        }
+    }
     edit.primary_studio = edit.primary_studio.trim().into();
     for values in [&mut edit.studios, &mut edit.tags, &mut edit.categories] {
         let mut seen = HashSet::new();
@@ -671,6 +694,7 @@ mod tests {
                 card.revision,
                 TorrentEdit {
                     primary_studio: "Other studio".into(),
+                    folder_name: Some("Renamed fixture".into()),
                     ..TorrentEdit::from(&card)
                 },
                 false,
@@ -695,6 +719,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("primary_image_id");
+        payload["edit"]
+            .as_object_mut()
+            .unwrap()
+            .remove("folder_name");
         db.begin_torrent_move(
             plan.page_id,
             plan.revision,
