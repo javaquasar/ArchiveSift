@@ -178,21 +178,32 @@ impl
 
         let requests =
             self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)?;
-        self.execute_downloads(
-            requests,
-            config.effective_concurrent_image_downloads(),
-            scraper.asset_origins(),
-        )
-        .await?;
+        let image_result = self
+            .execute_downloads(
+                requests,
+                config.effective_concurrent_image_downloads(),
+                scraper.asset_origins(),
+            )
+            .await;
 
-        super::attachments::download(
+        let attachment_result = super::attachments::download(
             &page,
             persisted.page_id,
             scraper,
             &self.database,
             &self.base_dir,
         )
-        .await?;
+        .await;
+
+        match (image_result, attachment_result) {
+            (Ok(()), result) => result?,
+            (Err(error), Ok(())) => return Err(error),
+            (Err(images), Err(attachments)) => {
+                return Err(
+                    format!("{images} Attachment download also failed: {attachments}").into(),
+                );
+            }
+        }
 
         Ok(vec![])
     }
@@ -280,17 +291,23 @@ impl
             .buffer_unordered(max_concurrent_downloads.max(1))
             .collect::<Vec<_>>()
             .await;
-        let mut artifacts = Vec::with_capacity(results.len());
+        let total = results.len();
+        let mut artifacts = Vec::with_capacity(total);
+        let mut failed = 0;
         for result in results {
             match result {
                 Ok(artifact) => artifacts.push(artifact),
                 Err(error) => {
+                    failed += 1;
                     self.ui.print_download_failed(error.as_ref());
                 }
             }
         }
 
         self.database.update_image_artifacts_batch(&artifacts)?;
+        if failed > 0 {
+            return Err(format!("{failed} of {total} images could not be downloaded. Retry this page to download missing images; saved files are retained.").into());
+        }
         Ok(())
     }
 
@@ -686,6 +703,190 @@ mod tests {
         };
         assert!(service.download_one(request, None).await.is_err());
         assert_eq!(std::fs::read(path).unwrap(), data);
+    }
+
+    struct RetryFixtureScraper {
+        page: ScrapedItem,
+        attachment_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        attachment_fails: bool,
+    }
+
+    impl crate::scraper::ContentScraper for RetryFixtureScraper {
+        fn site_key(&self) -> &str {
+            "demo-site"
+        }
+        fn supports_url(&self, url: &str) -> bool {
+            url == self.page.page_url
+        }
+        fn scrape_content<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<ScrapedItem>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(self.page.clone()) })
+        }
+        fn fetch_attachment<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = AppResult<crate::models::AttachmentData>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.attachment_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.attachment_fails {
+                    return Err("fixture attachment unavailable".into());
+                }
+                Ok(crate::models::AttachmentData {
+                    bytes: b"fixture sidecar".to_vec(),
+                    content_type: "application/octet-stream".into(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_downloads_report_failure_keep_attachments_and_retry_only_missing_files() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for attachment_fails in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let fixture = root.path().join("fixture.png");
+            ImageBuffer::from_pixel(8, 8, Rgb([1u8, 2, 3]))
+                .save(&fixture)
+                .unwrap();
+            let bytes = std::fs::read(fixture).unwrap();
+            let recovered = Arc::new(AtomicBool::new(false));
+            let good_calls = Arc::new(AtomicUsize::new(0));
+            let retry_calls = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = {
+                let recovered = recovered.clone();
+                let good_calls = good_calls.clone();
+                let retry_calls = retry_calls.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut request = [0; 2048];
+                        let len = stream.read(&mut request).await.unwrap();
+                        let retry =
+                            String::from_utf8_lossy(&request[..len]).starts_with("GET /retry.png ");
+                        if retry {
+                            retry_calls.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            good_calls.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let ready = !retry || recovered.load(Ordering::SeqCst);
+                        let status = if ready {
+                            "200 OK"
+                        } else {
+                            "503 Service Unavailable"
+                        };
+                        let body = if ready {
+                            bytes.as_slice()
+                        } else {
+                            b"unavailable"
+                        };
+                        let headers = format!("HTTP/1.1 {status}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                        stream.write_all(headers.as_bytes()).await.unwrap();
+                        stream.write_all(body).await.unwrap();
+                    }
+                })
+            };
+            let mut page = sample_page();
+            page.images = ["ready.png", "retry.png"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let mut image = sample_image(&format!("{origin}/{name}"));
+                    image.sort_order = index as i64;
+                    image
+                })
+                .collect();
+            page.attributes.push(crate::models::MetadataAttribute {
+                kind: "attachment".into(),
+                label: "sidecar.bin".into(),
+                value: "Sidecar".into(),
+                source_url: Some("https://demo.example.test/sidecar.bin".into()),
+                is_female: None,
+            });
+            let attachment_calls = Arc::new(AtomicUsize::new(0));
+            let scraper = RetryFixtureScraper {
+                page: page.clone(),
+                attachment_calls: attachment_calls.clone(),
+                attachment_fails,
+            };
+            let database = Database::new(root.path().join("library.db"));
+            database.initialize().unwrap();
+            let config = AppConfig::default();
+            let service = ContentDownloadService::new(
+                ScraperRegistry::new(),
+                database,
+                FileDownloadStore::new(),
+                ConsoleUi::new(),
+                StructuredDirectoryStrategy,
+                root.path().join("downloads"),
+                root.path().join("thumbs"),
+            );
+            let error = service
+                .process_content_url(&scraper, &config, &page.page_url)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("1 of 2 images could not be downloaded"),
+                "{error}"
+            );
+            assert_eq!(
+                error.contains("Attachment download also failed"),
+                attachment_fails
+            );
+            assert_eq!(attachment_calls.load(Ordering::SeqCst), 1);
+            assert!(!service.database.has_processed_url(&page.page_url).unwrap());
+            let connection = rusqlite::Connection::open(root.path().join("library.db")).unwrap();
+            let finalized:i64 = connection.query_row("SELECT COUNT(*) FROM page_images WHERE local_file_path IS NOT NULL AND thumbnail_path IS NOT NULL",[],|row|row.get(0)).unwrap();
+            assert_eq!(finalized, 1);
+            if !attachment_fails {
+                let stored: String = connection
+                    .query_row(
+                        "SELECT local_file_path FROM page_attachments WHERE filename='sidecar.bin'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(service.base_dir.join(stored)).unwrap(),
+                    b"fixture sidecar"
+                );
+            }
+            recovered.store(true, Ordering::SeqCst);
+            let retried = service
+                .process_content_url(&scraper, &config, &page.page_url)
+                .await;
+            if attachment_fails {
+                assert!(retried
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fixture attachment unavailable"));
+            } else {
+                retried.unwrap();
+            }
+            assert!(service.database.has_processed_url(&page.page_url).unwrap());
+            let finalized:i64 = connection.query_row("SELECT COUNT(*) FROM page_images WHERE local_file_path IS NOT NULL AND thumbnail_path IS NOT NULL",[],|row|row.get(0)).unwrap();
+            assert_eq!(finalized, 2);
+            assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(retry_calls.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
     }
 
     #[tokio::test]

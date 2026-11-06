@@ -82,8 +82,11 @@ impl ThumbnailService {
                 })?;
             }
 
-            let img =
-                image::open(&source_buf).map_err(|source| ThumbnailError::LoadSourceImage {
+            let img = image::ImageReader::open(&source_buf)
+                .and_then(|reader| reader.with_guessed_format())
+                .map_err(image::ImageError::IoError)
+                .and_then(|reader| reader.decode())
+                .map_err(|source| ThumbnailError::LoadSourceImage {
                     path: source_buf.clone(),
                     source,
                 })?;
@@ -214,6 +217,24 @@ mod tests {
         assert_eq!(returned, Some(thumb_path));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_format_is_detected_from_content_when_filename_is_misleading() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ThumbnailService::new(root.path().join("thumbs"));
+        let ui = ConsoleUi::new();
+        for (index, name) in ["photo.webp", "photo.bin", "photo"].into_iter().enumerate() {
+            let source = root.path().join(name);
+            ImageBuffer::from_pixel(32, 24, Rgb([12u8, 34, 56]))
+                .save_with_format(&source, image::ImageFormat::Jpeg)
+                .unwrap();
+            let thumbnail = service
+                .ensure_with_diagnostics(&ui, index as i64, &source)
+                .await
+                .unwrap();
+            assert_eq!(image::image_dimensions(thumbnail).unwrap(), (400, 300));
+        }
     }
 
     #[tokio::test]

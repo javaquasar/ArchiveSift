@@ -2684,7 +2684,17 @@ impl AppWindow {
                                                     self.viewer_open = Some(index);
                                                 }
                                             } else {
-                                                let resp = ui.add_sized([IMG_W, IMG_W], egui::Button::new("⏳"));
+                                                let key = image_texture_cache_key(
+                                                    ImageLoadMode::Preview, result.image_id, &base_dir,
+                                                    &self.thumb_dir, result.local_file_path.as_deref(),
+                                                    result.thumbnail_path.as_deref(),
+                                                );
+                                                let unavailable = self.preview_loader.is_unavailable(&key);
+                                                let label = if unavailable { "Image unavailable" } else { "⏳" };
+                                                let resp = ui.add_sized([IMG_W, IMG_W], egui::Button::new(label));
+                                                let resp = if unavailable {
+                                                    resp.on_hover_text("The local image is missing or unreadable. Retry this page in the download queue to fetch missing images.")
+                                                } else { resp };
                                                 if resp.clicked() {
                                                     self.selected_result = Some(index);
                                                     if self.bulk_select_mode {

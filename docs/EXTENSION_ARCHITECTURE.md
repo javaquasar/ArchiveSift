@@ -218,6 +218,13 @@ files and references are recorded in `page_attachments` with relative paths;
 already saved binary files are reused on a retry. Attachment-only pages are also
 persisted, even if they contain no images.
 
+Individual image failures are logged and successful files are still finalized.
+The host attempts attachments independently, then reports partial image downloads
+as a failed queue job with the number of missing images. If both stages fail,
+the error includes both failures. Retrying re-parses the page to refresh temporary
+image URLs, retains completed files and downloads missing originals. Unavailable
+local previews display an explicit placeholder instead of an endless loading icon.
+
 These attribute conventions preserve the WIT/JSON wire contract. Older hosts
 retain the metadata but do not download attachments. Parsers requiring file
 downloads must be installed with a host that implements this convention.
@@ -227,6 +234,10 @@ Windows-1251. Response byte limits are checked before text decoding.
 Image downloads reject document MIME types and inspect a small raster signature
 before atomic file creation. Initial chunks are replayed without copying the full
 body. Existing files with non-image signatures are reported rather than reused.
+Thumbnail generation and preview/original decoding detect the image format from
+file contents, including the original-size safety check. A CDN URL with a
+misleading filename extension or no extension can still be displayed without
+renaming existing library files.
 
 ## Process protocol
 
@@ -353,6 +364,14 @@ installed manifest. Headers are injected only for the exact origin and path,
 re-evaluated at each redirect, marked sensitive and never returned to the guest.
 Malformed rules reject the affected package; a missing credential fails the
 matching request with a redacted error. Remove a binding to revoke injection.
+
+Non-cookie bindings can opt into a single resource identifier using a terminal
+`/*`, for example `/records/*`. It matches `/records/123` and an ASCII slug,
+but not the collection endpoint, an empty identifier, encoded separators or
+nested paths. The exact HTTPS origin is still required. Root-wide and ambiguous
+patterns, conflicting overlapping secrets and cookie/session patterns are
+rejected. Older hosts treat such paths literally and do not inject credentials
+into resource requests; use an updated host for this capability.
 
 Image URLs remain subject to the origin allowlist. Metadata reference links may
 point to other HTTP(S) origins without granting permission to fetch them. Embedded

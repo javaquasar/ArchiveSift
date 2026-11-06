@@ -186,6 +186,13 @@ impl PreviewLoader {
         }
     }
 
+    pub(super) fn is_unavailable(&self, key: &str) -> bool {
+        self.unavailable.contains(&PreviewIdentity {
+            generation: self.generation,
+            key: key.to_owned(),
+        })
+    }
+
     pub(super) fn drain_ready(&mut self) -> Vec<DecodedPreview> {
         self.drain_ready_up_to(usize::MAX)
     }
@@ -501,7 +508,11 @@ fn decode_preview(source: PreviewSource) -> PreviewDecodeOutcome {
 
     if source.mode == ImageLoadMode::Original {
         let header_started = Instant::now();
-        let Ok((width, height)) = image::image_dimensions(&source_path) else {
+        let dimensions = image::ImageReader::open(&source_path)
+            .and_then(|reader| reader.with_guessed_format())
+            .map_err(image::ImageError::IoError)
+            .and_then(|reader| reader.into_dimensions());
+        let Ok((width, height)) = dimensions else {
             return PreviewDecodeOutcome::Unavailable;
         };
         timings.header_read = header_started.elapsed();
@@ -514,7 +525,11 @@ fn decode_preview(source: PreviewSource) -> PreviewDecodeOutcome {
     }
 
     let decode_started = Instant::now();
-    let Ok(raw) = image::open(&source_path) else {
+    let image = image::ImageReader::open(&source_path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(image::ImageError::IoError)
+        .and_then(|reader| reader.decode());
+    let Ok(raw) = image else {
         return PreviewDecodeOutcome::Unavailable;
     };
     timings.decode = decode_started.elapsed();
@@ -669,6 +684,34 @@ mod tests {
 
         assert_eq!(keys, ["one", "two", "three"]);
         assert!(loader.drain_ready_up_to(0).is_empty());
+    }
+
+    #[test]
+    fn missing_preview_is_unavailable_until_a_new_search_retries_it() {
+        let decoder: PreviewDecoder = Arc::new(|_| PreviewDecodeOutcome::Unavailable);
+        let mut loader = PreviewLoader::with_decoder(1, 2, decoder);
+        let context = egui::Context::default();
+        assert!(!loader.is_unavailable("missing"));
+        assert_eq!(
+            loader.request(source("missing"), &context),
+            PreviewRequestDisposition::Scheduled
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !loader.is_unavailable("missing") && Instant::now() < deadline {
+            loader.drain_ready();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(loader.is_unavailable("missing"));
+        assert_eq!(
+            loader.request(source("missing"), &context),
+            PreviewRequestDisposition::Unavailable
+        );
+        loader.advance_generation();
+        assert!(!loader.is_unavailable("missing"));
+        assert_eq!(
+            loader.request(source("missing"), &context),
+            PreviewRequestDisposition::Scheduled
+        );
     }
 
     #[test]
@@ -877,6 +920,42 @@ mod tests {
         assert!(thumb_dir.join(thumb_rel_path(7)).is_file());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_and_original_detect_image_format_from_content_including_header_checks() {
+        let root = tempfile::tempdir().unwrap();
+        for (index, (name, format)) in [
+            ("photo.webp", image::ImageFormat::Jpeg),
+            ("photo", image::ImageFormat::Png),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ImageBuffer::from_pixel(64, 48, Rgb([12u8, 34, 56]))
+                .save_with_format(root.path().join(name), format)
+                .unwrap();
+            for (mode, max_side, expected_size) in [
+                (ImageLoadMode::Preview, None, [400, 300]),
+                (ImageLoadMode::Original, None, [64, 48]),
+                (ImageLoadMode::Original, Some(32), [32, 24]),
+            ] {
+                let request = PreviewSource {
+                    key: format!("misleading-{index}-{mode:?}-{max_side:?}"),
+                    image_id: index as i64,
+                    base_dir: root.path().to_path_buf(),
+                    thumb_dir: root.path().join("thumbs"),
+                    local_file_path: Some(name.into()),
+                    thumbnail_path: None,
+                    mode,
+                    max_side,
+                };
+                let PreviewDecodeOutcome::Ready(decoded) = decode_preview(request) else {
+                    panic!("image content should determine the decoder for {name}");
+                };
+                assert_eq!(decoded.image.size, expected_size);
+            }
+        }
     }
 
     #[test]

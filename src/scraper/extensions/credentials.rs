@@ -35,12 +35,45 @@ fn config_path() -> Option<PathBuf> {
         })
 }
 
+fn valid_path_pattern(path: &str) -> bool {
+    if !path.contains('*') {
+        return true;
+    }
+    path.ends_with("/*")
+        && path.matches('*').count() == 1
+        && path.len() > 2
+        && path[1..path.len() - 2]
+            .split('/')
+            .all(|segment| !segment.is_empty())
+}
+
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let Some(prefix) = pattern.strip_suffix('*') else {
+        return pattern == path;
+    };
+    let Some(identifier) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    !identifier.is_empty()
+        && identifier.len() <= 256
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right || path_matches(left, right) || path_matches(right, left)
+}
+
 impl Credentials {
     pub fn include_account(&mut self, account: &super::accounts::AccountProvider) -> AppResult<()> {
         for path in &account.form.session_paths {
+            if path.contains('*') {
+                return Err("account session credentials require exact paths".into());
+            }
             if let Some(binding) = self.0.iter().find(|binding| {
                 binding.origin == account.origin()
-                    && binding.path == *path
+                    && paths_overlap(&binding.path, path)
                     && binding.header.eq_ignore_ascii_case("Cookie")
             }) {
                 if binding.target != account.session_target() {
@@ -103,6 +136,8 @@ impl Credentials {
                 || url.query().is_some()
                 || url.fragment().is_some()
                 || !binding.path.starts_with('/')
+                || !valid_path_pattern(&binding.path)
+                || (binding.path.contains('*') && name == header::COOKIE)
                 || matches!(
                     name.as_str(),
                     "host"
@@ -118,7 +153,7 @@ impl Credentials {
                 || binding.target.len() > 256
                 || selected.iter().any(|b| {
                     b.origin == binding.origin
-                        && b.path == binding.path
+                        && paths_overlap(&b.path, &binding.path)
                         && b.header.eq_ignore_ascii_case(&binding.header)
                 })
             {
@@ -139,17 +174,24 @@ impl Credentials {
         bytes: &[u8],
     ) -> AppResult<()> {
         for binding in Self::parse(manifest, bytes)?.0 {
-            if let Some(existing) = self.0.iter().find(|b| {
+            let overlaps = |b: &&Binding| {
                 b.origin == binding.origin
-                    && b.path == binding.path
+                    && paths_overlap(&b.path, &binding.path)
                     && b.header.eq_ignore_ascii_case(&binding.header)
+            };
+            if self
+                .0
+                .iter()
+                .filter(overlaps)
+                .any(|existing| existing.target != binding.target)
+            {
+                return Err("package credential reference conflicts with a local binding".into());
+            }
+            if !self.0.iter().any(|existing| {
+                existing.origin == binding.origin
+                    && existing.path == binding.path
+                    && existing.header.eq_ignore_ascii_case(&binding.header)
             }) {
-                if existing.target != binding.target {
-                    return Err(
-                        "package credential reference conflicts with a local binding".into(),
-                    );
-                }
-            } else {
                 self.0.push(binding);
             }
         }
@@ -163,7 +205,9 @@ impl Credentials {
     ) -> AppResult<header::HeaderMap> {
         let mut headers = header::HeaderMap::new();
         for binding in &self.0 {
-            if url.origin().ascii_serialization() != binding.origin || url.path() != binding.path {
+            if url.origin().ascii_serialization() != binding.origin
+                || !path_matches(&binding.path, url.path())
+            {
                 continue;
             }
             let mut secret = read(&binding.target)?;
@@ -342,6 +386,161 @@ mod tests {
             &serde_json::to_vec(&config).unwrap()
         )
         .is_err());
+    }
+
+    #[test]
+    fn resource_credentials_match_one_identifier_without_reaching_children_or_other_origins() {
+        let mut config = configuration();
+        config["bindings"][0]["path"] = "/records/*".into();
+        config["bindings"][0]["header"] = "Authorization".into();
+        let credentials = Credentials::parse(
+            &super::super::tests::manifest(),
+            &serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        for url in [
+            "https://example.test/records/123",
+            "https://example.test/records/fixture-record_1?image=1",
+        ] {
+            let headers = credentials
+                .headers_with(&Url::parse(url).unwrap(), |_| {
+                    Ok(b"Bearer fixture-token".to_vec())
+                })
+                .unwrap();
+            assert_eq!(headers["Authorization"], "Bearer fixture-token");
+            assert!(headers["Authorization"].is_sensitive());
+        }
+        for url in [
+            "https://example.test/records",
+            "https://example.test/records/",
+            "https://example.test/records/id/images",
+            "https://example.test/records-evil/id",
+            "https://example.test/other/id",
+            "https://example.test/records/id%2Fimages",
+            "https://example.test/records/%252Fimages",
+            "https://example.test/records/..%2Fother",
+            "https://cdn.example.test/records/id",
+            "http://example.test/records/id",
+            "https://example.test:8443/records/id",
+        ] {
+            assert!(
+                credentials
+                    .headers_with(&Url::parse(url).unwrap(), |_| panic!(
+                        "out-of-scope secret access"
+                    ))
+                    .unwrap()
+                    .is_empty(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_and_broad_credential_patterns_are_rejected() {
+        for path in [
+            "/*",
+            "/api/**",
+            "/api/id*",
+            "/api/*/other",
+            "/api//records/*",
+        ] {
+            let mut config = configuration();
+            config["bindings"][0]["path"] = path.into();
+            assert!(
+                Credentials::parse(
+                    &super::super::tests::manifest(),
+                    &serde_json::to_vec(&config).unwrap()
+                )
+                .is_err(),
+                "{path}"
+            );
+        }
+        let mut config = configuration();
+        config["bindings"][0]["path"] = "/records/*".into();
+        let mut exact = config["bindings"][0].clone();
+        exact["path"] = "/records/123".into();
+        exact["target"] = "ArchiveSift/example.parser/other".into();
+        config["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(exact.clone());
+        assert!(Credentials::parse(
+            &super::super::tests::manifest(),
+            &serde_json::to_vec(&config).unwrap()
+        )
+        .is_err());
+        config["bindings"].as_array_mut().unwrap().pop();
+        let manifest = super::super::tests::manifest();
+        let mut credentials =
+            Credentials::parse(&manifest, &serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(credentials
+            .include_package(
+                &manifest,
+                &serde_json::to_vec(&serde_json::json!({"bindings":[exact]})).unwrap()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn wildcard_credentials_never_expand_cookie_sessions() {
+        let mut config = configuration();
+        config["bindings"][0]["path"] = "/records/*".into();
+        config["bindings"][0]["header"] = "Cookie".into();
+        assert!(Credentials::parse(
+            &super::super::tests::manifest(),
+            &serde_json::to_vec(&config).unwrap()
+        )
+        .is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest = super::super::tests::manifest();
+        manifest.network_origins = vec!["https://example.test".into()];
+        std::fs::write(
+            directory.path().join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let profile = serde_json::json!({"schema":1,"login_url":"https://example.test/login","check_url":"https://example.test/home","form_selector":"form","username_field":"username","password_field":"password","session_cookie":"session","session_paths":["/download/*"],"success_selector":"#logout"});
+        std::fs::write(
+            directory.path().join("account.json"),
+            serde_json::to_vec(&profile).unwrap(),
+        )
+        .unwrap();
+        if let Ok(Some(account)) =
+            super::super::accounts::AccountProvider::from_directory(directory.path())
+        {
+            assert!(Credentials::default().include_account(&account).is_err());
+        }
+    }
+
+    #[test]
+    fn broader_package_credentials_reject_any_conflicting_secret_and_keep_compatible_scopes() {
+        let manifest = super::super::tests::manifest();
+        let mut local = configuration();
+        local["bindings"][0]["path"] = "/records/one".into();
+        let mut second = local["bindings"][0].clone();
+        second["path"] = "/records/two".into();
+        second["target"] = "ArchiveSift/example.parser/other".into();
+        local["bindings"].as_array_mut().unwrap().push(second);
+        let mut package = configuration();
+        package["bindings"][0]["path"] = "/records/*".into();
+        let package = serde_json::to_vec(&package).unwrap();
+        let mut credentials =
+            Credentials::parse(&manifest, &serde_json::to_vec(&local).unwrap()).unwrap();
+        assert!(credentials.include_package(&manifest, &package).is_err());
+        local["bindings"].as_array_mut().unwrap().pop();
+        let mut credentials =
+            Credentials::parse(&manifest, &serde_json::to_vec(&local).unwrap()).unwrap();
+        credentials.include_package(&manifest, &package).unwrap();
+        let headers = credentials
+            .headers_with(
+                &Url::parse("https://example.test/records/three").unwrap(),
+                |target| {
+                    assert_eq!(target, "ArchiveSift/example.parser/api");
+                    Ok(b"fixture-value".to_vec())
+                },
+            )
+            .unwrap();
+        assert_eq!(headers["ApiKey"], "fixture-value");
     }
 
     #[test]
