@@ -73,6 +73,18 @@ impl CreatorFilter {
             .collect()
     }
 
+    pub fn remove(&mut self, value: &str) {
+        self.text = parts(&self.text)
+            .into_iter()
+            .map(|(_, token)| token.trim())
+            .filter(|token| !token.is_empty() && name(token) != value)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.suggestions.clear();
+        self.pending = None;
+        self.requested = None;
+    }
+
     fn request(&mut self, database: &str) -> Option<UiCommand> {
         let query = last_token(&self.text);
         let key = (database.to_owned(), query.clone());

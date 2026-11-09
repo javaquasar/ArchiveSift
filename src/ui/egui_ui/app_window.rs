@@ -47,6 +47,23 @@ enum Tab {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsPage {
+    Storage,
+    Integrations,
+    Accounts,
+    Appearance,
+    AgentAccess,
+    Advanced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperationTab {
+    Queue,
+    Activity,
+    PeerLume,
+}
+
 // ── SQL query results ─────────────────────────────────────────────────────────
 
 /// Result of an arbitrary SQL query: column names and string-formatted rows.
@@ -158,11 +175,17 @@ pub struct AppWindow {
     active_tab: Tab,
     pub(super) agent_access: super::agent_access::AgentAccessPanel,
     storage_settings: StorageSettingsEditor,
-    settings_json_mode: bool,
+    settings_page: SettingsPage,
+    appearance_applied: Option<crate::app::AppearanceConfig>,
+    scrape_options_open: bool,
+    operations_open: bool,
+    operation_tab: OperationTab,
     raw_settings: Option<super::raw_settings::RawSettingsEditor>,
     account_settings: Option<AccountSettingsEditor>,
     extensions_manager: super::extensions_manager::ExtensionsManagerUi,
     search_form: SearchForm,
+    search_filters_open: bool,
+    search_detail_open: bool,
     torrent_mode: bool,
     torrent_library: super::torrent_library::TorrentLibraryUi,
     peerlume: super::peerlume::PeerLumeUi,
@@ -303,11 +326,17 @@ impl AppWindow {
             active_tab: Tab::Scrape,
             agent_access: Default::default(),
             storage_settings,
-            settings_json_mode: false,
+            settings_page: SettingsPage::Storage,
+            appearance_applied: None,
+            scrape_options_open: false,
+            operations_open: false,
+            operation_tab: OperationTab::Queue,
             raw_settings: None,
             account_settings: None,
             extensions_manager: Default::default(),
             search_form: SearchForm::default(),
+            search_filters_open: false,
+            search_detail_open: false,
             torrent_mode: false,
             torrent_library: Default::default(),
             peerlume: Default::default(),
@@ -425,6 +454,7 @@ impl AppWindow {
         self.search_next_cursor = None;
         self.search_results = Arc::new(results);
         self.selected_result = self.search_results.first().map(|_| 0);
+        self.search_detail_open = false;
         self.selected_image_ids.clear();
         self.bulk_select_mode = false;
         self.viewer_open = None;
@@ -526,6 +556,7 @@ impl AppWindow {
                     .position(|result| result.image_id == image_id)
             })
             .or_else(|| (!self.search_results.is_empty()).then_some(0));
+        self.search_detail_open &= selected_id.is_some_and(|id| !removed.contains(&id));
         self.viewer_open = viewer_id
             .filter(|image_id| !removed.contains(image_id))
             .and_then(|image_id| {
@@ -538,11 +569,10 @@ impl AppWindow {
     /// Soft refresh: used after favorites/gender updates. Preserves the currently
     /// selected image (matched by image_id) and the viewer position.
     pub fn refresh_search_results(&mut self, results: Vec<SearchImageResult>) {
-        // Remember which image_id was selected.
-        let prev_image_id = self
+        let previous_selection = self
             .selected_result
             .and_then(|idx| self.search_results.get(idx))
-            .map(|r| r.image_id);
+            .map(|r| (r.page_id(), r.image_id));
         let prev_viewer_id = self
             .viewer_open
             .and_then(|idx| self.search_results.get(idx))
@@ -550,15 +580,18 @@ impl AppWindow {
 
         self.search_results = Arc::new(results);
 
-        // Restore selection to the same image_id if it still exists in the new results.
-        self.selected_result = prev_image_id
-            .and_then(|id| self.search_results.iter().position(|r| r.image_id == id))
-            .or_else(|| self.search_results.first().map(|_| 0));
+        let restored = previous_selection.and_then(|identity| {
+            self.search_results
+                .iter()
+                .position(|r| (r.page_id(), r.image_id) == identity)
+        });
+        self.search_detail_open &= restored.is_some();
+        self.selected_result = restored.or_else(|| self.search_results.first().map(|_| 0));
 
         // Keep viewer open at the same image if possible.
         if self.viewer_open.is_some() {
             self.viewer_open = prev_viewer_id
-                .or(prev_image_id)
+                .or(previous_selection.map(|(_, image_id)| image_id))
                 .and_then(|id| self.search_results.iter().position(|r| r.image_id == id));
         }
     }
@@ -667,6 +700,10 @@ impl AppWindow {
     }
 
     pub fn render(&mut self, ctx: &egui::Context) {
+        if self.appearance_applied != Some(self.config.appearance) {
+            super::appearance::apply(ctx, self.config.appearance);
+            self.appearance_applied = Some(self.config.appearance);
+        }
         self.peerlume.poll(&self.config);
         self.extensions_manager.poll(ctx, &self.config);
         if std::mem::take(&mut self.extensions_manager.changed) {
@@ -706,75 +743,22 @@ impl AppWindow {
                 },
             );
         });
+        self.render_status_bar(ctx);
         if self.active_tab == Tab::Settings && previous_tab != Tab::Settings {
             self.storage_settings = StorageSettingsEditor::new(&self.config);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Revocation remains available even while storage settings apply.
-            if self.active_tab == Tab::Settings {
-                if let Some(command) = self.agent_access.render(ui) {
-                    self.pending_command = Some(command);
-                }
-                ui.add_space(8.0);
-            }
-            ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
-                match self.active_tab {
+        egui::CentralPanel::default().show(ctx, |ui| match self.active_tab {
+            Tab::Settings => self.render_settings(ui, previous_tab != Tab::Settings),
+            tab => {
+                ui.add_enabled_ui(!self.storage_settings.applying, |ui| match tab {
                     Tab::Scrape => self.render_scrape_tab(ui),
                     Tab::Search => self.render_search_tab(ui, ctx),
                     Tab::SqlQuery => self.render_sql_tab(ui),
                     Tab::Extensions => self.render_extensions_tab(ui),
-                    Tab::Settings => {
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.settings_json_mode, false, "Form");
-                            ui.selectable_value(&mut self.settings_json_mode, true, "JSON");
-                        });
-                        let busy = self.storage_settings_busy();
-                        if self.settings_json_mode {
-                            let editor = self.raw_settings.get_or_insert_with(|| {
-                                super::raw_settings::RawSettingsEditor::installed(&self.config)
-                            });
-                            ui.heading("Settings · JSON");
-                            egui::ScrollArea::vertical()
-                                .id_salt("raw_settings_scroll")
-                                .show(ui, |ui| {
-                                    if let Some(command) = editor.render(
-                                        ui,
-                                        &self.config,
-                                        busy,
-                                        self.storage_settings.applying,
-                                    ) {
-                                        self.pending_command = Some(command);
-                                    }
-                                });
-                            return;
-                        }
-                        let editor = self
-                            .account_settings
-                            .get_or_insert_with(|| AccountSettingsEditor::installed(&self.config));
-                        let mut account_command = None;
-                        let mut integration_command = None;
-                        if let Some(settings) = self.storage_settings.render_with_accounts(
-                            ui,
-                            &self.config,
-                            busy,
-                            |ui| {
-                                integration_command =
-                                    self.peerlume.settings(ui, &self.config, busy);
-                                account_command = editor.render(ui, false);
-                            },
-                        ) {
-                            self.pending_command = Some(UiCommand::ApplyStorageSettings(settings));
-                        }
-                        if let Some(command) = account_command {
-                            self.pending_command = Some(UiCommand::Account(command));
-                        }
-                        if let Some(command) = integration_command {
-                            self.pending_command = Some(command);
-                        }
-                    }
-                }
-            });
+                    Tab::Settings => unreachable!(),
+                });
+            }
         });
 
         // Overlays (rendered outside central panel so they sit on top).
@@ -788,12 +772,14 @@ impl AppWindow {
             self.peerlume.tick(ctx, &self.config, storage_busy);
         }
         self.peerlume.render(ctx, &self.config, storage_busy);
+        self.render_operations(ctx);
         if !self.storage_settings.applying {
             self.render_viewer(ctx);
             self.render_description_popup(ctx);
             self.render_delete_confirm(ctx);
             self.render_rescrape_prompts(ctx);
             self.render_queue_window(ctx);
+            self.render_scrape_options(ctx);
         }
     }
 
@@ -889,8 +875,8 @@ impl AppWindow {
 
     pub(super) fn apply_storage_config(&mut self, config: AppConfig) {
         let mut replacement = Self::new(config, self.log.clone(), Arc::clone(&self.live_presets));
-        replacement.settings_json_mode = self.settings_json_mode;
-        if self.settings_json_mode {
+        replacement.settings_page = self.settings_page;
+        if self.settings_page == SettingsPage::Advanced {
             let mut editor = super::raw_settings::RawSettingsEditor::installed(&replacement.config);
             editor.status = Some("Full configuration saved and applied.".into());
             replacement.raw_settings = Some(editor);
@@ -909,6 +895,100 @@ impl AppWindow {
         }
     }
 
+    fn render_settings(&mut self, ui: &mut egui::Ui, entered: bool) {
+        let previous_page = self.settings_page;
+        ui.horizontal_wrapped(|ui| {
+            for (page, label) in [
+                (SettingsPage::Storage, "Storage"),
+                (SettingsPage::Integrations, "Integrations"),
+                (SettingsPage::Accounts, "Accounts"),
+                (SettingsPage::Appearance, "Appearance"),
+                (SettingsPage::AgentAccess, "Agent access"),
+                (SettingsPage::Advanced, "Advanced"),
+            ] {
+                ui.selectable_value(&mut self.settings_page, page, label);
+            }
+        });
+        ui.separator();
+        let busy = self.storage_settings_busy();
+        let applying = self.storage_settings.applying;
+        if self.settings_page == SettingsPage::Storage {
+            if let Some(settings) = self.storage_settings.render(ui, &self.config, busy) {
+                self.pending_command = Some(UiCommand::ApplyStorageSettings(settings));
+            }
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(("settings", self.settings_page as u8))
+            .show(ui, |ui| {
+                let command = match self.settings_page {
+                    SettingsPage::Integrations => self.peerlume.settings(ui, &self.config, busy),
+                    SettingsPage::Accounts => self
+                        .account_settings
+                        .get_or_insert_with(|| AccountSettingsEditor::installed(&self.config))
+                        .render(ui, applying)
+                        .map(UiCommand::Account),
+                    SettingsPage::Appearance => {
+                        let previous = self.config.appearance;
+                        let mut save = false;
+                        ui.add_enabled_ui(!applying, |ui| {
+                            save = super::appearance::editor(ui, &mut self.config.appearance);
+                            egui::ComboBox::from_label("Open image preview")
+                                .selected_text(
+                                    if self.config.preview_open_mode.opens_on_single_click() {
+                                        "Single click"
+                                    } else {
+                                        "Double click"
+                                    },
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (mode, label) in [
+                                        (PreviewOpenMode::SingleClick, "Single click"),
+                                        (PreviewOpenMode::DoubleClick, "Double click"),
+                                    ] {
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.config.preview_open_mode,
+                                                mode,
+                                                label,
+                                            )
+                                            .changed()
+                                        {
+                                            self.save_config_setting("preview open mode");
+                                        }
+                                    }
+                                });
+                        });
+                        if save {
+                            self.save_config_setting("appearance");
+                        }
+                        if previous != self.config.appearance {
+                            ui.ctx().request_repaint();
+                        }
+                        None
+                    }
+                    SettingsPage::AgentAccess => self.agent_access.render(ui),
+                    SettingsPage::Advanced => {
+                        ui.heading("Settings · JSON");
+                        let editor = self.raw_settings.get_or_insert_with(|| {
+                            super::raw_settings::RawSettingsEditor::installed(&self.config)
+                        });
+                        if entered || previous_page != SettingsPage::Advanced {
+                            editor.refresh_pristine_draft(&self.config);
+                        }
+                        editor.render(ui, &self.config, busy, applying)
+                    }
+                    SettingsPage::Storage => unreachable!(),
+                };
+                if let Some(command) = command {
+                    self.pending_command = Some(command);
+                }
+                if let Some(error) = &self.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            });
+    }
+
     fn render_extensions_tab(&mut self, ui: &mut egui::Ui) {
         let blocked = self.storage_settings.applying
             || self
@@ -919,11 +999,19 @@ impl AppWindow {
                 .raw_settings
                 .as_ref()
                 .is_some_and(|editor| editor.busy());
+        let editor = self
+            .raw_settings
+            .get_or_insert_with(|| super::raw_settings::RawSettingsEditor::installed(&self.config));
         egui::ScrollArea::vertical()
             .id_salt("extensions_page")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if let Some(command) = self.extensions_manager.render(ui, &self.config, blocked) {
+                if let Some(command) =
+                    self.extensions_manager
+                        .render(ui, &self.config, blocked, |ui, id, busy| {
+                            editor.render_plugin_credentials(ui, id, busy)
+                        })
+                {
                     self.pending_command = Some(command);
                 }
             });
@@ -1031,1310 +1119,458 @@ impl AppWindow {
 
     // ── Scrape tab ────────────────────────────────────────────────────────────
 
-    #[allow(unreachable_code)]
     fn render_scrape_tab(&mut self, ui: &mut egui::Ui) {
-        let card_frame = egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(14))
-            .corner_radius(egui::CornerRadius::same(14))
-            .fill(ui.visuals().faint_bg_color);
-        let strip_frame = egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(10))
-            .corner_radius(egui::CornerRadius::same(12))
-            .fill(ui.visuals().extreme_bg_color);
-        let queue_snapshot = clone_queue_snapshot(&self.queue_snapshot);
-        let queue_state = if queue_snapshot.paused {
-            "Paused"
-        } else {
-            "Running"
-        };
-        let can_start = self.config.has_download_folder();
-        let parsed_tags = crate::app::parse_comma_list(&self.config.preset_tags);
-        let parsed_cats = crate::app::parse_comma_list(&self.config.preset_categories);
-        let available_width = ui.available_width();
-        let layout = self.config.scrape_layout.normalized();
-        let compact_mode = available_width < layout.compact_breakpoint;
-        let split_mode = available_width >= layout.two_column_breakpoint;
-        let wide_split_mode = available_width >= layout.wide_breakpoint;
-        let primary_ratio = if wide_split_mode {
-            layout.wide_primary_ratio
-        } else {
-            layout.medium_primary_ratio
-        };
-
-        egui::ScrollArea::vertical()
-            .id_salt("scrape_tab_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let scroll_inset = layout.scroll_inset;
-                ui.horizontal(|ui| {
-                    ui.set_width((ui.available_width() - scroll_inset).max(0.0));
-                    ui.vertical(|ui| {
-                ui.heading("ArchiveSift");
-                ui.label("Queue URLs, configure destination, and monitor progress from one screen.");
-                ui.add_space(10.0);
-
-                strip_frame.show(ui, |ui| {
-                    let queue_text = if compact_mode {
-                        egui::RichText::new(format!("Q {}", queue_snapshot.pending_total))
-                            .strong()
-                            .small()
-                    } else {
-                        egui::RichText::new(format!("Queue: {} pending", queue_snapshot.pending_total))
-                            .strong()
-                    };
-                    let state_text = if compact_mode {
-                        format!("S {}", queue_state)
-                    } else {
-                        format!("State: {}", queue_state)
-                    };
-                    let clipboard_text = format!(
-                        "{}{}",
-                        if compact_mode { "Clip " } else { "Clipboard: " },
-                        if self.config.clipboard_listener_enabled { "On" } else { "Off" }
-                    );
-                    let skip_text = format!(
-                        "{}{}",
-                        if compact_mode { "Skip " } else { "Skip downloaded: " },
-                        if self.config.skip_downloaded { "On" } else { "Off" }
-                    );
-                    let folder_text = format!(
-                        "{}{}",
-                        if compact_mode { "Dir " } else { "Folder: " },
-                        if self.config.has_download_folder() {
-                            truncate(
-                                &self.config.download_folder,
-                                if compact_mode { 14 } else { 32 },
-                            )
-                        } else {
-                            "Not set".to_string()
-                        }
-                    );
-
-                    if compact_mode {
-                        ui.vertical(|ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                ui.label(queue_text);
-                                ui.separator();
-                                ui.label(egui::RichText::new(state_text).small());
-                                ui.separator();
-                                ui.label(egui::RichText::new(clipboard_text).small());
-                                ui.separator();
-                                ui.label(egui::RichText::new(skip_text).small());
-                                ui.separator();
-                                ui.label(egui::RichText::new(folder_text).small());
-                            });
-
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if queue_snapshot.paused {
-                                        if ui.button("Resume").clicked() {
-                                            self.pending_command = Some(UiCommand::ResumeQueue);
-                                        }
-                                    } else if ui.button("Pause").clicked() {
-                                        self.pending_command = Some(UiCommand::PauseQueue);
-                                    }
-
-                                    if ui.button("Queue").clicked() {
-                                        self.queue_window_open = !self.queue_window_open;
-                                    }
-                                });
-                            });
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            let button_block_width = 170.0;
-                            let left_width = (ui.available_width() - button_block_width).max(200.0);
-
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(left_width, 0.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 10.0;
-                                    ui.label(queue_text);
-                                    ui.separator();
-                                    ui.label(state_text);
-                                    ui.separator();
-                                    ui.label(clipboard_text);
-                                    ui.separator();
-                                    ui.label(skip_text);
-                                    ui.separator();
-                                    ui.label(folder_text);
-                                },
-                            );
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if queue_snapshot.paused {
-                                    if ui.button("Resume").clicked() {
-                                        self.pending_command = Some(UiCommand::ResumeQueue);
-                                    }
-                                } else if ui.button("Pause").clicked() {
-                                    self.pending_command = Some(UiCommand::PauseQueue);
-                                }
-
-                                if ui.button("Open Queue").clicked() {
-                                    self.queue_window_open = !self.queue_window_open;
-                                }
-                            });
+        let configured = self.config.has_download_folder();
+        ui.horizontal_wrapped(|ui| {
+            let input = ui.add(
+                egui::TextEdit::singleline(&mut self.config.source_url)
+                    .hint_text("Content or listing URL")
+                    .desired_width((ui.available_width() - 170.0).clamp(100.0, 680.0)),
+            );
+            let can_add = configured && !self.config.source_url.trim().is_empty();
+            if ui
+                .add_enabled(can_add, egui::Button::new("Add to queue"))
+                .clicked()
+                || (can_add && input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+            {
+                self.error = None;
+                self.pending_command = Some(UiCommand::QueueUrl(self.config.clone()));
+            }
+            ui.menu_button("More", |ui| {
+                if ui
+                    .add_enabled(
+                        configured && !self.import_running,
+                        egui::Button::new("Import URL file…"),
+                    )
+                    .clicked()
+                {
+                    ui.close_menu();
+                    if let Some(file) = rfd::FileDialog::new()
+                        .add_filter("Text files", &["txt"])
+                        .pick_file()
+                    {
+                        self.pending_command = Some(UiCommand::ImportFile {
+                            file_path: file.display().to_string(),
                         });
                     }
-                });
-
-                ui.add_space(12.0);
-
-                if split_mode {
-                    self.render_scrape_split_columns(
-                        ui,
-                        &card_frame,
-                        can_start,
-                        &parsed_tags,
-                        &parsed_cats,
-                        &queue_snapshot,
-                        compact_mode,
-                        primary_ratio,
-                    );
-                } else {
-                    self.render_scrape_primary_column(
-                        ui,
-                        &card_frame,
-                        can_start,
-                        &parsed_tags,
-                        &parsed_cats,
-                        compact_mode,
-                    );
-                    ui.add_space(12.0);
-                    self.render_scrape_secondary_column(ui, &card_frame, &queue_snapshot, compact_mode);
                 }
-                    });
-                    ui.add_space(scroll_inset);
-                });
+                if ui.button("Scrape options…").clicked() {
+                    self.scrape_options_open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Open queue in window").clicked() {
+                    self.queue_window_open = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .add_enabled(
+                        self.queue_snapshot.pending_total > 0,
+                        egui::Button::new("Clear pending"),
+                    )
+                    .clicked()
+                {
+                    self.pending_command = Some(UiCommand::ClearPendingQueue);
+                    ui.close_menu();
+                }
             });
-
-        return;
-
-        ui.heading("ArchiveSift");
-        ui.label("Queue URLs below for scraping and downloading.");
-
-        ui.horizontal(|ui| {
-            ui.label("Content URL");
-            ui.text_edit_singleline(&mut self.config.source_url);
         });
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Destination");
+            if ui
+                .button(if configured {
+                    "Change…"
+                } else {
+                    "Choose folder…"
+                })
+                .clicked()
+            {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.pending_command =
+                        Some(UiCommand::SetDownloadFolder(folder.display().to_string()));
+                }
+            }
+            if configured {
+                let folder = self.config.effective_download_dir();
+                let path = folder.to_string_lossy();
+                ui.add_sized(
+                    [ui.available_width().max(60.0), ui.spacing().interact_size.y],
+                    egui::Label::new(path.as_ref()).truncate(),
+                )
+                .on_hover_text(path.as_ref());
+            } else {
+                ui.weak("Choose a download folder to start.");
+            }
+        });
+        if self.import_running {
+            ui.weak("Importing URLs…");
+        }
         if !self.config.parse_additional_links
             && looks_like_additional_link_source(&self.config.source_url)
         {
             ui.colored_label(
-                egui::Color32::YELLOW,
-                "This looks like a listing page. It will be skipped until additional content links are enabled.",
+                ui.visuals().warn_fg_color,
+                "Enable listing expansion in Scrape options to queue linked content.",
             );
         }
-
-        ui.horizontal(|ui| {
-            ui.label("Download Folder");
-            ui.text_edit_singleline(&mut self.config.download_folder);
-            if ui.button("Browse").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    let folder = folder.display().to_string();
-                    self.pending_command = Some(UiCommand::SetDownloadFolder(folder));
-                }
-            }
-        });
-
-        // Task 7: subfolder field constrained within the root download folder.
-        ui.horizontal(|ui| {
-            ui.label("Subfolder");
-            ui.text_edit_singleline(&mut self.config.subfolder);
-            if !self.config.subfolder.trim().is_empty() {
-                let effective = self.config.effective_download_dir();
-                ui.small(format!("→ {}", effective.display()));
-            }
-        });
-
-        let recent_folders = self.config.download_folder_history.clone();
-        egui::ComboBox::from_label("Recent Folders")
-            .selected_text(if self.config.has_download_folder() {
-                self.config.download_folder.clone()
-            } else {
-                "Choose a recent folder".to_string()
-            })
-            .show_ui(ui, |ui| {
-                if recent_folders.is_empty() {
-                    ui.label("No recent folders yet.");
-                } else {
-                    for folder in recent_folders {
-                        if ui.selectable_label(false, &folder).clicked() {
-                            self.pending_command = Some(UiCommand::SetDownloadFolder(folder));
-                        }
-                    }
-                }
-            });
-
-        ui.horizontal(|ui| {
-            ui.label("Database");
-            ui.text_edit_singleline(&mut self.config.database_path);
-        });
-
+        if let Some(error) = &self.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
         ui.separator();
-        ui.label(egui::RichText::new("Preset tags & categories").strong());
-        ui.small("Applied to every image downloaded. Separate values with commas. Multi-word values are supported: e.g. \"night sky, outdoor, portrait\"");
-
-        ui.horizontal(|ui| {
-            ui.label("Tags");
-            let tags_resp = ui.text_edit_singleline(&mut self.config.preset_tags);
-            if tags_resp.lost_focus() {
-                self.save_config_setting("preset tags");
-                if let Ok(mut p) = self.live_presets.write() {
-                    p.tags = self.config.preset_tags.clone();
-                }
-            }
-            let has_tags = !self.config.preset_tags.is_empty();
-            if ui
-                .add_enabled(
-                    has_tags,
-                    egui::Button::new("🗑 Clear")
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 60, 60))),
-                )
-                .on_hover_text("Clear preset tags")
-                .clicked()
-            {
-                self.config.preset_tags.clear();
-                self.save_config_setting("preset tags");
-                if let Ok(mut p) = self.live_presets.write() {
-                    p.tags.clear();
-                }
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Categories");
-            let cats_resp = ui.text_edit_singleline(&mut self.config.preset_categories);
-            if cats_resp.lost_focus() {
-                self.save_config_setting("preset categories");
-                if let Ok(mut p) = self.live_presets.write() {
-                    p.categories = self.config.preset_categories.clone();
-                }
-            }
-            let has_cats = !self.config.preset_categories.is_empty();
-            if ui
-                .add_enabled(
-                    has_cats,
-                    egui::Button::new("🗑 Clear")
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 60, 60))),
-                )
-                .on_hover_text("Clear preset categories")
-                .clicked()
-            {
-                self.config.preset_categories.clear();
-                self.save_config_setting("preset categories");
-                if let Ok(mut p) = self.live_presets.write() {
-                    p.categories.clear();
-                }
-            }
-        });
-
-        // Preview parsed values so user can verify what will be applied.
-        let parsed_tags = crate::app::parse_comma_list(&self.config.preset_tags);
-        let parsed_cats = crate::app::parse_comma_list(&self.config.preset_categories);
-        if !parsed_tags.is_empty() || !parsed_cats.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.small("Will apply:");
-                for t in &parsed_tags {
-                    ui.small(
-                        egui::RichText::new(format!("[tag] {}", t))
-                            .color(egui::Color32::from_rgb(100, 180, 100)),
-                    );
-                }
-                for c in &parsed_cats {
-                    ui.small(
-                        egui::RichText::new(format!("[cat] {}", c))
-                            .color(egui::Color32::from_rgb(100, 150, 220)),
-                    );
-                }
-            });
-        }
-
-        ui.separator();
-
-        let prev_listener = self.config.clipboard_listener_enabled;
-        ui.checkbox(
-            &mut self.config.clipboard_listener_enabled,
-            "Monitor clipboard for content URLs",
-        );
-        if self.config.clipboard_listener_enabled != prev_listener {
-            self.pending_command = Some(UiCommand::SetClipboardListener(
-                self.config.clipboard_listener_enabled,
-            ));
-        }
-        if self.config.clipboard_listener_enabled {
-            ui.small("Listening — copy a supported content URL to auto-queue it.");
-        }
-
-        let prev_skip = self.config.skip_downloaded;
-        let prev_parse_additional = self.config.parse_additional_links;
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(
-                &mut self.config.skip_downloaded,
-                "Skip already-downloaded URLs automatically",
-            );
-            ui.checkbox(
-                &mut self.config.parse_additional_links,
-                "Parse additional content links",
-            );
-        });
-        if !self.config.skip_downloaded {
-            ui.small("⚠ Disabled — already-processed URLs will be queued again.");
-        }
-        if !self.config.parse_additional_links {
-            ui.small(
-                "Additional actor/listing expansion is off — parser only processes direct content pages with ready images.",
-            );
-        }
-        if self.config.skip_downloaded != prev_skip {
-            self.save_config_setting("skip downloaded");
-        }
-        if self.config.parse_additional_links != prev_parse_additional {
-            self.save_config_setting("parse additional links");
-        }
-
-        let previous_preview_open_mode = self.config.preview_open_mode;
-        egui::ComboBox::from_label("Preview open mode")
-            .selected_text(match self.config.preview_open_mode {
-                PreviewOpenMode::DoubleClick => "Double click",
-                PreviewOpenMode::SingleClick => "Single click",
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.config.preview_open_mode,
-                    PreviewOpenMode::DoubleClick,
-                    "Double click",
-                );
-                ui.selectable_value(
-                    &mut self.config.preview_open_mode,
-                    PreviewOpenMode::SingleClick,
-                    "Single click",
-                );
-            });
-        if self.config.preview_open_mode != previous_preview_open_mode {
-            self.save_config_setting("preview open mode");
-        }
-
-        // ── Download settings ─────────────────────────────────────────────────
-        ui.separator();
-        ui.label(egui::RichText::new("Download settings").strong());
-        // Parallel workers
-        ui.horizontal(|ui| {
-            ui.label("Parallel pages")
-                .on_hover_text("How many content pages are fetched simultaneously.");
-            let prev = self.config.max_parallel_downloads;
-            ui.add(
-                egui::DragValue::new(&mut self.config.max_parallel_downloads)
-                    .range(1..=16)
-                    .suffix(" workers"),
-            );
-            if self.config.max_parallel_downloads != prev {
-                self.save_config_setting("parallel pages");
+            ui.heading("Queue");
+            if ui.button("Activity").clicked() {
+                self.operation_tab = OperationTab::Activity;
+                self.operations_open = true;
+            }
+            if let Some(status) = &self.queue_status {
+                ui.weak(status);
             }
         });
-
-        // Concurrent image downloads per content item
-        ui.horizontal(|ui| {
-            ui.label("Concurrent images").on_hover_text(
-                "How many images inside a single content item are downloaded at the same time.",
-            );
-            let prev = self.config.max_concurrent_downloads;
-            ui.add(
-                egui::DragValue::new(&mut self.config.max_concurrent_downloads)
-                    .range(1..=32)
-                    .suffix(" threads"),
-            );
-            if self.config.max_concurrent_downloads != prev {
-                self.save_config_setting("concurrent images");
+        if self.queue_window_open {
+            if ui.button("Show queue here").clicked() {
+                self.queue_window_open = false;
             }
-        });
-
-        // ── Request throttling ────────────────────────────────────────────────
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("Request throttling").strong());
-        ui.small(
-            "Random pause before each page request. \
-             Mimics human browsing and reduces rate-limit risk. \
-             Set both to 0 to disable.",
-        );
-
-        let mut delay_changed = false;
-
-        ui.horizontal(|ui| {
-            ui.label("Min delay");
-            let prev = self.config.request_delay_min_ms;
-            ui.add(
-                egui::DragValue::new(&mut self.config.request_delay_min_ms)
-                    .range(0..=60_000)
-                    .suffix(" ms"),
-            );
-            if self.config.request_delay_min_ms != prev {
-                // Keep min ≤ max
-                if self.config.request_delay_min_ms > self.config.request_delay_max_ms {
-                    self.config.request_delay_max_ms = self.config.request_delay_min_ms;
-                }
-                delay_changed = true;
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Max delay");
-            let prev = self.config.request_delay_max_ms;
-            ui.add(
-                egui::DragValue::new(&mut self.config.request_delay_max_ms)
-                    .range(0..=60_000)
-                    .suffix(" ms"),
-            );
-            if self.config.request_delay_max_ms != prev {
-                // Keep min ≤ max
-                if self.config.request_delay_max_ms < self.config.request_delay_min_ms {
-                    self.config.request_delay_min_ms = self.config.request_delay_max_ms;
-                }
-                delay_changed = true;
-            }
-        });
-
-        if delay_changed {
-            self.save_config_setting("request delay");
+        } else {
+            self.render_queue_rows(ui);
         }
-
-        // Human-readable summary line
-        {
-            let lo = self.config.request_delay_min_ms;
-            let hi = self.config.request_delay_max_ms;
-            if lo == 0 && hi == 0 {
-                ui.small(
-                    egui::RichText::new("⚡ No delay — fastest speed, higher risk of blocks.")
-                        .color(egui::Color32::from_rgb(200, 160, 0)),
-                );
-            } else {
-                let rps_lo = if hi > 0 {
-                    1_000.0 / hi as f64
-                } else {
-                    f64::INFINITY
-                };
-                let rps_hi = if lo > 0 {
-                    1_000.0 / lo as f64
-                } else {
-                    f64::INFINITY
-                };
-                let rps_text = if rps_lo.is_finite() && rps_hi.is_finite() {
-                    format!("{:.2}–{:.2} req/s per worker", rps_lo, rps_hi)
-                } else if rps_lo.is_finite() {
-                    format!("≤ {:.2} req/s per worker", rps_lo)
-                } else {
-                    "unlimited".to_string()
-                };
-                ui.small(format!("⏱ {}–{} ms  ({})", lo, hi, rps_text));
-            }
-        }
-
-        if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::RED, error);
-        }
-
-        let can_start = self.config.has_download_folder();
-        if ui
-            .add_enabled(can_start, egui::Button::new("Queue URL"))
-            .clicked()
-        {
-            self.error = None;
-            self.pending_command = Some(UiCommand::QueueUrl(self.config.clone()));
-        }
-
-        if ui
-            .add_enabled(!self.import_running, egui::Button::new("Import URL File"))
-            .clicked()
-        {
-            if let Some(file_path) = rfd::FileDialog::new()
-                .add_filter("Text files", &["txt"])
-                .pick_file()
-            {
-                self.error = None;
-                self.pending_command = Some(UiCommand::ImportFile {
-                    file_path: file_path.display().to_string(),
-                });
-            }
-        }
-
-        if !can_start {
-            ui.label("Select a download directory to enable scraping.");
-        }
-
-        ui.horizontal(|ui| {
-            if let Some(queue_status) = &self.queue_status {
-                ui.label(queue_status);
-            }
-            if ui
-                .selectable_label(self.queue_window_open, "📋 Queue")
-                .clicked()
-            {
-                self.queue_window_open = !self.queue_window_open;
-            }
-        });
-
-        ui.separator();
-        ui.heading("Activity");
-
-        // Snapshot once per frame (bounded by MAX_LOG_LINES = 500).
-        let log_lines = self.log.snapshot_shared();
-        let line_height = ui.text_style_height(&egui::TextStyle::Body);
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .auto_shrink([false; 2])
-            .show_rows(ui, line_height, log_lines.len(), |ui, row_range| {
-                for line in &log_lines[row_range] {
-                    ui.label(line.as_ref());
-                }
-            });
     }
 
-    // ── Search tab ────────────────────────────────────────────────────────────
-
-    fn render_scrape_primary_column(
-        &mut self,
-        ui: &mut egui::Ui,
-        card_frame: &egui::Frame,
-        can_start: bool,
-        parsed_tags: &[String],
-        parsed_cats: &[String],
-        compact_mode: bool,
-    ) {
-        let full_width = ui.available_width();
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(full_width);
-                card_frame.show(ui, |ui| {
-            ui.set_min_width(full_width - 28.0);
-            ui.small(egui::RichText::new("STEP 1").weak().strong());
-            ui.heading("Source");
-            ui.add_space(10.0);
-            ui.label("Content or listing URL");
-            ui.text_edit_singleline(&mut self.config.source_url);
-
-            if !self.config.parse_additional_links
-                && looks_like_additional_link_source(&self.config.source_url)
-            {
-                ui.add_space(8.0);
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "This looks like a listing page. It will not expand until additional content links are enabled.",
-                );
-            }
-
-            ui.add_space(12.0);
-            if compact_mode {
+    fn render_scrape_options(&mut self, ctx: &egui::Context) {
+        let mut open = self.scrape_options_open;
+        if !open {
+            return;
+        }
+        egui::Window::new("Scrape options")
+            .open(&mut open)
+            .default_width(440.0)
+            .max_width((ctx.screen_rect().width() - 24.0).max(160.0))
+            .vscroll(true)
+            .show(ctx, |ui| {
                 if ui
-                    .add_enabled(
-                        can_start,
-                        egui::Button::new("Add URL to Queue"),
+                    .checkbox(
+                        &mut self.config.clipboard_listener_enabled,
+                        "Monitor clipboard for supported URLs",
                     )
-                    .clicked()
+                    .changed()
                 {
-                    self.error = None;
-                    self.pending_command = Some(UiCommand::QueueUrl(self.config.clone()));
+                    self.pending_command = Some(UiCommand::SetClipboardListener(
+                        self.config.clipboard_listener_enabled,
+                    ));
                 }
-
-                if ui
-                    .add_enabled(
-                        can_start && !self.import_running,
-                        egui::Button::new("Import URL File"),
+                let mut changed = ui
+                    .checkbox(
+                        &mut self.config.skip_downloaded,
+                        "Skip already downloaded URLs",
                     )
-                    .clicked()
-                {
-                    if let Some(file_path) = rfd::FileDialog::new()
-                        .add_filter("Text files", &["txt"])
-                        .pick_file()
-                    {
-                        self.error = None;
-                        self.pending_command = Some(UiCommand::ImportFile {
-                            file_path: file_path.display().to_string(),
-                        });
-                    }
-                }
-            } else {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(can_start, egui::Button::new("Add URL to Queue"))
-                        .clicked()
-                    {
-                        self.error = None;
-                        self.pending_command = Some(UiCommand::QueueUrl(self.config.clone()));
-                    }
-
-                    if ui
-                        .add_enabled(
-                            can_start && !self.import_running,
-                            egui::Button::new("Import URL File"),
-                        )
-                        .clicked()
-                    {
-                        if let Some(file_path) = rfd::FileDialog::new()
-                            .add_filter("Text files", &["txt"])
-                            .pick_file()
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.config.parse_additional_links,
+                        "Expand listings into content URLs",
+                    )
+                    .changed();
+                ui.separator();
+                ui.label("Subfolder");
+                changed |= ui
+                    .text_edit_singleline(&mut self.config.subfolder)
+                    .lost_focus();
+                ui.menu_button("Recent folders", |ui| {
+                    for folder in &self.config.download_folder_history {
+                        if ui
+                            .button(truncate(folder, 52))
+                            .on_hover_text(folder)
+                            .clicked()
                         {
-                            self.error = None;
-                            self.pending_command = Some(UiCommand::ImportFile {
-                                file_path: file_path.display().to_string(),
-                            });
+                            self.pending_command =
+                                Some(UiCommand::SetDownloadFolder(folder.clone()));
+                            ui.close_menu();
                         }
                     }
                 });
-            }
-
-            ui.add_space(10.0);
-            let prev_listener = self.config.clipboard_listener_enabled;
-            ui.checkbox(
-                &mut self.config.clipboard_listener_enabled,
-                "Monitor clipboard for supported URLs",
-            );
-            if self.config.clipboard_listener_enabled != prev_listener {
-                self.pending_command = Some(UiCommand::SetClipboardListener(
-                    self.config.clipboard_listener_enabled,
-                ));
-            }
-            ui.small(if self.config.clipboard_listener_enabled {
-                "Copy a supported URL at any time to auto-queue it while clipboard monitoring is enabled."
-            } else {
-                "Clipboard monitoring is off. URLs will only be queued manually or from imported files."
-            });
-
-            if !can_start {
-                ui.add_space(8.0);
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Select a download directory to enable scraping.",
-                );
-            }
-        });
-            },
-        );
-
-        ui.add_space(12.0);
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(full_width);
-                card_frame.show(ui, |ui| {
-                    ui.set_min_width(full_width - 28.0);
-                    ui.small(egui::RichText::new("STEP 2").weak().strong());
-                    ui.heading("Destination");
-                    ui.add_space(10.0);
-
-                    ui.label("Download folder");
-                    if compact_mode {
-                        ui.text_edit_singleline(&mut self.config.download_folder);
-                        ui.add_space(6.0);
-                        if ui.button("Browse").clicked() {
-                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                let folder = folder.display().to_string();
-                                self.pending_command = Some(UiCommand::SetDownloadFolder(folder));
-                            }
-                        }
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.config.download_folder);
-                            if ui.button("Browse").clicked() {
-                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                    let folder = folder.display().to_string();
-                                    self.pending_command =
-                                        Some(UiCommand::SetDownloadFolder(folder));
-                                }
-                            }
-                        });
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label("Subfolder");
-                    ui.text_edit_singleline(&mut self.config.subfolder);
-                    if !self.config.subfolder.trim().is_empty() {
-                        ui.small(format!(
-                            "Final download path: {}",
-                            self.config.effective_download_dir().display()
-                        ));
-                    }
-
-                    ui.add_space(10.0);
-                    let recent_folders = self.config.download_folder_history.clone();
-                    if compact_mode {
-                        ui.label("Recent folders");
-                        egui::ComboBox::from_id_salt("scrape_recent_folders_compact")
-                            .width(ui.available_width())
-                            .selected_text(if self.config.has_download_folder() {
-                                truncate(&self.config.download_folder, 28)
-                            } else {
-                                "Choose a recent folder".to_string()
-                            })
-                            .show_ui(ui, |ui| {
-                                if recent_folders.is_empty() {
-                                    ui.label("No recent folders yet.");
-                                } else {
-                                    for folder in recent_folders {
-                                        if ui.selectable_label(false, &folder).clicked() {
-                                            self.pending_command =
-                                                Some(UiCommand::SetDownloadFolder(folder));
-                                        }
-                                    }
-                                }
-                            });
-                    } else {
-                        egui::ComboBox::from_label("Recent folders")
-                            .selected_text(if self.config.has_download_folder() {
-                                self.config.download_folder.clone()
-                            } else {
-                                "Choose a recent folder".to_string()
-                            })
-                            .show_ui(ui, |ui| {
-                                if recent_folders.is_empty() {
-                                    ui.label("No recent folders yet.");
-                                } else {
-                                    for folder in recent_folders {
-                                        if ui.selectable_label(false, &folder).clicked() {
-                                            self.pending_command =
-                                                Some(UiCommand::SetDownloadFolder(folder));
-                                        }
-                                    }
-                                }
-                            });
-                    }
-                });
-            },
-        );
-
-        ui.add_space(12.0);
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(full_width);
-                card_frame.show(ui, |ui| {
-            ui.set_width((full_width - 28.0).max(0.0));
-            ui.small(egui::RichText::new("STEP 3").weak().strong());
-            ui.heading("Scrape Behavior");
-            ui.add_space(10.0);
-
-            let prev_skip = self.config.skip_downloaded;
-            let prev_parse_additional = self.config.parse_additional_links;
-            ui.checkbox(
-                &mut self.config.skip_downloaded,
-                "Skip already-downloaded URLs automatically",
-            );
-            ui.checkbox(
-                &mut self.config.parse_additional_links,
-                "Parse additional content links",
-            );
-            if self.config.skip_downloaded != prev_skip {
-                self.save_config_setting("skip downloaded");
-            }
-            if self.config.parse_additional_links != prev_parse_additional {
-                self.save_config_setting("parse additional links");
-            }
-
-            ui.add_space(10.0);
-            ui.group(|ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("i").strong());
-                    ui.label(
-                        "Actor and listing pages will expand into additional queue entries when parsing is enabled.",
-                    );
-                });
-            });
-
-            if !self.config.skip_downloaded {
-                ui.add_space(8.0);
-                ui.small("Already-processed URLs will be queued again.");
-            }
-            if !self.config.parse_additional_links {
-                ui.small("Only direct content pages will be processed.");
-            }
-
-            ui.add_space(12.0);
-            ui.label(egui::RichText::new("Preset tags & categories").strong());
-            ui.small("Applied to every downloaded image. Separate values with commas.");
-
-            ui.add_space(8.0);
-            if compact_mode {
-                ui.label("Preset tags");
-                let tags_resp = ui.text_edit_singleline(&mut self.config.preset_tags);
-                if tags_resp.lost_focus() {
-                    self.save_config_setting("preset tags");
-                    if let Ok(mut p) = self.live_presets.write() {
-                        p.tags = self.config.preset_tags.clone();
-                    }
+                if ui.button("Edit storage settings").clicked() {
+                    self.active_tab = Tab::Settings;
+                    self.settings_page = SettingsPage::Storage;
+                    self.storage_settings = StorageSettingsEditor::new(&self.config);
+                    self.scrape_options_open = false;
                 }
-                let has_tags = !self.config.preset_tags.is_empty();
-                if ui
-                    .add_enabled(has_tags, egui::Button::new("Clear preset tags"))
-                    .clicked()
-                {
-                    self.config.preset_tags.clear();
-                    self.save_config_setting("preset tags");
-                    if let Ok(mut p) = self.live_presets.write() {
-                        p.tags.clear();
-                    }
-                }
-
-                ui.add_space(10.0);
-                ui.label("Preset categories");
-                let cats_resp = ui.text_edit_singleline(&mut self.config.preset_categories);
-                if cats_resp.lost_focus() {
-                    self.save_config_setting("preset categories");
-                    if let Ok(mut p) = self.live_presets.write() {
-                        p.categories = self.config.preset_categories.clone();
-                    }
-                }
-                let has_cats = !self.config.preset_categories.is_empty();
-                if ui
-                    .add_enabled(has_cats, egui::Button::new("Clear preset categories"))
-                    .clicked()
-                {
-                    self.config.preset_categories.clear();
-                    self.save_config_setting("preset categories");
-                    if let Ok(mut p) = self.live_presets.write() {
-                        p.categories.clear();
-                    }
-                }
-            } else {
-                ui.columns(2, |columns| {
-                    columns[0].label("Preset tags");
-                    let tags_resp = columns[0].text_edit_singleline(&mut self.config.preset_tags);
-                    if tags_resp.lost_focus() {
-                        self.save_config_setting("preset tags");
-                        if let Ok(mut p) = self.live_presets.write() {
-                            p.tags = self.config.preset_tags.clone();
-                        }
-                    }
-                    let has_tags = !self.config.preset_tags.is_empty();
-                    if columns[0]
-                        .add_enabled(has_tags, egui::Button::new("Clear"))
-                        .clicked()
-                    {
-                        self.config.preset_tags.clear();
-                        self.save_config_setting("preset tags");
-                        if let Ok(mut p) = self.live_presets.write() {
-                            p.tags.clear();
-                        }
-                    }
-
-                    columns[1].label("Preset categories");
-                    let cats_resp = columns[1].text_edit_singleline(&mut self.config.preset_categories);
-                    if cats_resp.lost_focus() {
-                        self.save_config_setting("preset categories");
-                        if let Ok(mut p) = self.live_presets.write() {
-                            p.categories = self.config.preset_categories.clone();
-                        }
-                    }
-                    let has_cats = !self.config.preset_categories.is_empty();
-                    if columns[1]
-                        .add_enabled(has_cats, egui::Button::new("Clear"))
-                        .clicked()
-                    {
-                        self.config.preset_categories.clear();
-                        self.save_config_setting("preset categories");
-                        if let Ok(mut p) = self.live_presets.write() {
-                            p.categories.clear();
-                        }
-                    }
-                });
-            }
-
-            if !parsed_tags.is_empty() || !parsed_cats.is_empty() {
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.small("Will apply:");
-                    for t in parsed_tags {
-                        ui.small(
-                            egui::RichText::new(format!("[tag] {}", t))
-                                .color(egui::Color32::from_rgb(100, 180, 100)),
-                        );
-                    }
-                    for c in parsed_cats {
-                        ui.small(
-                            egui::RichText::new(format!("[cat] {}", c))
-                                .color(egui::Color32::from_rgb(100, 150, 220)),
-                        );
-                    }
-                });
-            }
-        });
-            },
-        );
-
-        ui.add_space(12.0);
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(full_width);
-                card_frame.show(ui, |ui| {
-            ui.set_min_width(full_width - 28.0);
-            egui::CollapsingHeader::new("Advanced Settings")
-                .default_open(false)
-                .show(ui, |ui| {
-                    let previous_preview_open_mode = self.config.preview_open_mode;
-                    egui::ComboBox::from_label("Preview open mode")
-                        .selected_text(match self.config.preview_open_mode {
-                            PreviewOpenMode::DoubleClick => "Double click",
-                            PreviewOpenMode::SingleClick => "Single click",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.config.preview_open_mode,
-                                PreviewOpenMode::DoubleClick,
-                                "Double click",
-                            );
-                            ui.selectable_value(
-                                &mut self.config.preview_open_mode,
-                                PreviewOpenMode::SingleClick,
-                                "Single click",
-                            );
-                        });
-                    if self.config.preview_open_mode != previous_preview_open_mode {
-                        self.save_config_setting("preview open mode");
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Download settings").strong());
-                    ui.horizontal(|ui| {
-                        ui.label("Parallel pages")
-                            .on_hover_text("How many content pages are fetched simultaneously.");
-                        let prev = self.config.max_parallel_downloads;
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.max_parallel_downloads)
-                                .range(1..=16)
-                                .suffix(" workers"),
-                        );
-                        if self.config.max_parallel_downloads != prev {
-                            self.save_config_setting("parallel pages");
+                ui.separator();
+                ui.weak("Presets apply to downloaded images. Separate values with commas.");
+                for (label, value) in [
+                    ("Preset tags", &mut self.config.preset_tags),
+                    ("Preset categories", &mut self.config.preset_categories),
+                ] {
+                    ui.label(label);
+                    ui.horizontal_wrapped(|ui| {
+                        changed |= ui.text_edit_singleline(value).lost_focus();
+                        if ui
+                            .add_enabled(!value.is_empty(), egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            value.clear();
+                            changed = true;
                         }
                     });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Concurrent images")
-                            .on_hover_text(
-                                "How many images inside a single content item are downloaded at the same time.",
-                            );
-                        let prev = self.config.max_concurrent_downloads;
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.max_concurrent_downloads)
-                                .range(1..=32)
-                                .suffix(" threads"),
-                        );
-                        if self.config.max_concurrent_downloads != prev {
-                            self.save_config_setting("concurrent images");
-                        }
-                    });
-
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Request throttling").strong());
-                    ui.small(
-                        "Random pause before each page request. Set both values to 0 to disable delays.",
-                    );
-
-                    let mut delay_changed = false;
-                    ui.horizontal(|ui| {
+                }
+                ui.collapsing("Download settings", |ui| {
+                    for (label, value, maximum) in [
+                        (
+                            "Parallel pages",
+                            &mut self.config.max_parallel_downloads,
+                            16,
+                        ),
+                        (
+                            "Concurrent images",
+                            &mut self.config.max_concurrent_downloads,
+                            32,
+                        ),
+                    ] {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(label);
+                            changed |= ui
+                                .add(egui::DragValue::new(value).range(1..=maximum))
+                                .changed();
+                        });
+                    }
+                    ui.weak("Random delay before each page request. Set both to zero to disable.");
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Min delay");
-                        let prev = self.config.request_delay_min_ms;
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.request_delay_min_ms)
-                                .range(0..=60_000)
-                                .suffix(" ms"),
-                        );
-                        if self.config.request_delay_min_ms != prev {
-                            if self.config.request_delay_min_ms > self.config.request_delay_max_ms {
-                                self.config.request_delay_max_ms = self.config.request_delay_min_ms;
-                            }
-                            delay_changed = true;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.request_delay_min_ms)
+                                    .range(0..=60_000)
+                                    .suffix(" ms"),
+                            )
+                            .changed()
+                        {
+                            self.config.request_delay_max_ms = self
+                                .config
+                                .request_delay_max_ms
+                                .max(self.config.request_delay_min_ms);
+                            changed = true;
                         }
-                    });
-
-                    ui.horizontal(|ui| {
                         ui.label("Max delay");
-                        let prev = self.config.request_delay_max_ms;
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.request_delay_max_ms)
-                                .range(0..=60_000)
-                                .suffix(" ms"),
-                        );
-                        if self.config.request_delay_max_ms != prev {
-                            if self.config.request_delay_max_ms < self.config.request_delay_min_ms {
-                                self.config.request_delay_min_ms = self.config.request_delay_max_ms;
-                            }
-                            delay_changed = true;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.config.request_delay_max_ms)
+                                    .range(0..=60_000)
+                                    .suffix(" ms"),
+                            )
+                            .changed()
+                        {
+                            self.config.request_delay_min_ms = self
+                                .config
+                                .request_delay_min_ms
+                                .min(self.config.request_delay_max_ms);
+                            changed = true;
                         }
                     });
-                    if delay_changed {
-                        self.save_config_setting("request delay");
-                    }
-
-                    let lo = self.config.request_delay_min_ms;
-                    let hi = self.config.request_delay_max_ms;
-                    if lo == 0 && hi == 0 {
-                        ui.small(
-                            egui::RichText::new("No delay - fastest speed, higher risk of blocks.")
-                                .color(egui::Color32::from_rgb(200, 160, 0)),
-                        );
-                    } else {
-                        let rps_lo = if hi > 0 { 1_000.0 / hi as f64 } else { f64::INFINITY };
-                        let rps_hi = if lo > 0 { 1_000.0 / lo as f64 } else { f64::INFINITY };
-                        let rps_text = if rps_lo.is_finite() && rps_hi.is_finite() {
-                            format!("{:.2}-{:.2} req/s per worker", rps_lo, rps_hi)
-                        } else if rps_lo.is_finite() {
-                            format!("<= {:.2} req/s per worker", rps_lo)
-                        } else {
-                            "unlimited".to_string()
-                        };
-                        ui.small(format!("{}-{} ms ({})", lo, hi, rps_text));
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label("Database path");
-                    ui.add(egui::Label::new(&self.config.database_path).wrap());
-                    if ui.button("Edit storage settings").clicked() {
-                        self.storage_settings = StorageSettingsEditor::new(&self.config);
-                        self.active_tab = Tab::Settings;
-                    }
                 });
-        });
-            },
-        );
+                if changed {
+                    self.save_scrape_options();
+                }
+            });
+        if !open && self.scrape_options_open {
+            self.save_scrape_options();
+        }
+        self.scrape_options_open &= open;
+    }
 
-        if let Some(error) = &self.error {
-            ui.add_space(12.0);
-            ui.colored_label(egui::Color32::RED, error);
+    fn save_scrape_options(&mut self) {
+        if let Ok(mut presets) = self.live_presets.write() {
+            presets.tags.clone_from(&self.config.preset_tags);
+            presets
+                .categories
+                .clone_from(&self.config.preset_categories);
+        }
+        self.save_config_setting("scrape options");
+    }
+
+    pub(super) fn needs_queue_rows(&self) -> bool {
+        self.queue_window_open || self.active_tab == Tab::Scrape
+    }
+
+    pub(super) fn needs_queue_failures(&self) -> bool {
+        self.operations_open && self.operation_tab == OperationTab::Queue
+    }
+
+    fn render_queue_rows(&mut self, ui: &mut egui::Ui) {
+        let snapshot = clone_queue_snapshot(&self.queue_snapshot);
+        if snapshot.in_progress.is_empty() && snapshot.pending_total == 0 {
+            ui.weak("Queue is empty. Add a URL to start.");
+            return;
+        }
+        let active = snapshot.in_progress.len();
+        let total = active.saturating_add(snapshot.pending_total);
+        let row_height = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical()
+            .id_salt("queue_rows")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, total, |ui, rows| {
+                let pending = rows.start.saturating_sub(active)..rows.end.saturating_sub(active);
+                if !pending.is_empty()
+                    && update_queue_visible_range(
+                        &mut self.queue_visible_range,
+                        queue_range_with_overscan(pending, snapshot.pending_total),
+                    )
+                {
+                    ui.ctx().request_repaint();
+                }
+                for index in rows {
+                    let (label, url) = if let Some((url, _)) = snapshot.in_progress.get(index) {
+                        ("Active", url.as_str())
+                    } else {
+                        (
+                            "Pending",
+                            queue_snapshot_pending_at(&snapshot, index - active)
+                                .unwrap_or("Loading…"),
+                        )
+                    };
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(row_height);
+                        ui.add_sized([66.0, row_height], egui::Label::new(label));
+                        ui.add(egui::Label::new(url).truncate()).on_hover_text(url);
+                    });
+                }
+            });
+    }
+
+    fn queue_controls(&mut self, ui: &mut egui::Ui) {
+        let paused = self.queue_snapshot.paused;
+        if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+            self.pending_command = Some(if paused {
+                UiCommand::ResumeQueue
+            } else {
+                UiCommand::PauseQueue
+            });
+        }
+        if self.queue_snapshot.failed_total > 0 && ui.button("Retry failed").clicked() {
+            self.pending_command = Some(UiCommand::RetryFailedQueue);
         }
     }
 
-    fn render_scrape_split_columns(
-        &mut self,
-        ui: &mut egui::Ui,
-        card_frame: &egui::Frame,
-        can_start: bool,
-        parsed_tags: &[String],
-        parsed_cats: &[String],
-        queue_snapshot: &crate::models::QueueSnapshot,
-        compact_mode: bool,
-        primary_ratio: f32,
-    ) {
-        let gap = if compact_mode { 12.0 } else { 16.0 };
-        let total_width = ui.available_width();
-        let content_width = (total_width - gap).max(0.0);
-        let left_width = (content_width * primary_ratio).max(640.0);
-        let right_width = (content_width - left_width).max(320.0);
-        let adjusted_left_width = (content_width - right_width).max(0.0);
-
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(adjusted_left_width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    self.render_scrape_primary_column(
-                        ui,
-                        card_frame,
-                        can_start,
-                        parsed_tags,
-                        parsed_cats,
-                        compact_mode,
-                    );
-                },
-            );
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(right_width, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    self.render_scrape_secondary_column(
-                        ui,
-                        card_frame,
-                        queue_snapshot,
-                        compact_mode,
-                    );
-                },
-            );
+    fn render_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("workspace_status").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(self.operations_open, "Operations")
+                    .clicked()
+                {
+                    self.operations_open = !self.operations_open;
+                }
+                let snapshot = &self.queue_snapshot;
+                ui.label(format!(
+                    "{} active · {} pending · {} failed",
+                    snapshot.in_progress.len(),
+                    snapshot.pending_total,
+                    snapshot.failed_total,
+                ));
+                ui.weak(if snapshot.paused {
+                    "Paused"
+                } else if !snapshot.in_progress.is_empty() {
+                    "Running"
+                } else {
+                    "Idle"
+                });
+                ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
+                    self.queue_controls(ui)
+                });
+                if self.agent_access.enabled || self.agent_access.busy {
+                    if ui.button("Agent access").clicked() {
+                        self.active_tab = Tab::Settings;
+                        self.settings_page = SettingsPage::AgentAccess;
+                    }
+                }
+            });
         });
     }
 
-    fn render_scrape_secondary_column(
-        &mut self,
-        ui: &mut egui::Ui,
-        card_frame: &egui::Frame,
-        queue_snapshot: &crate::models::QueueSnapshot,
-        compact_mode: bool,
-    ) {
-        let full_width = ui.available_width();
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(full_width);
-                card_frame.show(ui, |ui| {
-                    ui.set_width((full_width - 28.0).max(0.0));
-                    if compact_mode {
-                        ui.small(egui::RichText::new("OPERATIONS").weak().strong());
-                        ui.heading("Queue");
-                        ui.add_space(8.0);
-                        if ui.button("Open Queue").clicked() {
-                            self.queue_window_open = !self.queue_window_open;
+    fn render_operations(&mut self, ctx: &egui::Context) {
+        let mut open = self.operations_open;
+        if !open {
+            return;
+        }
+        egui::Window::new("Operations")
+            .open(&mut open)
+            .default_width(540.0)
+            .max_width((ctx.screen_rect().width() - 24.0).max(160.0))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.operation_tab, OperationTab::Queue, "Queue");
+                    ui.selectable_value(
+                        &mut self.operation_tab,
+                        OperationTab::Activity,
+                        "Activity",
+                    );
+                    ui.selectable_value(
+                        &mut self.operation_tab,
+                        OperationTab::PeerLume,
+                        "PeerLume",
+                    );
+                });
+                ui.separator();
+                match self.operation_tab {
+                    OperationTab::Queue => {
+                        if ui
+                            .add_enabled(
+                                !self.storage_settings.applying,
+                                egui::Button::new("Go to queue"),
+                            )
+                            .clicked()
+                        {
+                            self.active_tab = Tab::Scrape;
+                            self.operations_open = false;
                         }
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.small(egui::RichText::new("OPERATIONS").weak().strong());
-                                ui.heading("Queue");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
+                                self.queue_controls(ui)
                             });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Open Queue").clicked() {
-                                        self.queue_window_open = !self.queue_window_open;
-                                    }
-                                },
-                            );
                         });
-                    }
-
-                    if let Some(queue_status) = &self.queue_status {
-                        ui.add_space(8.0);
-                        ui.small(queue_status);
-                    }
-
-                    ui.add_space(10.0);
-                    ui.horizontal_wrapped(|ui| {
-                        let status = if queue_snapshot.paused {
-                            "Paused"
+                        let snapshot = clone_queue_snapshot(&self.queue_snapshot);
+                        if snapshot.failed_total == 0 {
+                            ui.weak("No failed downloads.");
                         } else {
-                            "Running"
-                        };
-                        ui.label(egui::RichText::new(status).strong());
-                        ui.separator();
-                        ui.label(format!("{} in progress", queue_snapshot.in_progress.len()));
-                        ui.separator();
-                        ui.label(format!("{} pending", queue_snapshot.pending_total));
-                        if queue_snapshot.failed_total > 0 {
-                            ui.separator();
-                            ui.colored_label(
-                                egui::Color32::YELLOW,
-                                format!("{} failed", queue_snapshot.failed_total),
-                            );
+                            ui.label(format!("Recent failures · {} total", snapshot.failed_total));
+                            egui::ScrollArea::vertical()
+                                .max_height(260.0)
+                                .show(ui, |ui| {
+                                    for (url, error) in &snapshot.failed_preview {
+                                        ui.add(egui::Label::new(url).truncate()).on_hover_text(url);
+                                        ui.add(egui::Label::new(error).wrap());
+                                        ui.separator();
+                                    }
+                                });
                         }
-                    });
-
-                    ui.add_space(10.0);
-                    if compact_mode {
-                        if queue_snapshot.paused {
-                            if ui.button("Resume").clicked() {
-                                self.pending_command = Some(UiCommand::ResumeQueue);
-                            }
-                        } else if ui.button("Pause").clicked() {
-                            self.pending_command = Some(UiCommand::PauseQueue);
+                    }
+                    OperationTab::Activity => {
+                        if ui.button("Clear log").clicked() {
+                            self.log.clear();
                         }
-                        if ui.button("Clear pending").clicked() {
-                            self.pending_command = Some(UiCommand::ClearPendingQueue);
-                        }
-                        if queue_snapshot.failed_total > 0 && ui.button("Retry failed").clicked() {
-                            self.pending_command = Some(UiCommand::RetryFailedQueue);
-                        }
-                    } else {
-                        ui.horizontal(|ui| {
-                            if queue_snapshot.paused {
-                                if ui.button("Resume").clicked() {
-                                    self.pending_command = Some(UiCommand::ResumeQueue);
+                        let log = self.log.snapshot_shared();
+                        egui::ScrollArea::vertical()
+                            .max_height(300.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                if log.is_empty() {
+                                    ui.weak("No activity yet.");
                                 }
-                            } else if ui.button("Pause").clicked() {
-                                self.pending_command = Some(UiCommand::PauseQueue);
-                            }
-                            if ui.button("Clear pending").clicked() {
-                                self.pending_command = Some(UiCommand::ClearPendingQueue);
-                            }
-                            if queue_snapshot.failed_total > 0
-                                && ui.button("Retry failed").clicked()
-                            {
-                                self.pending_command = Some(UiCommand::RetryFailedQueue);
-                            }
-                        });
-                    }
-
-                    if !queue_snapshot.in_progress.is_empty() {
-                        ui.add_space(12.0);
-                        ui.label(egui::RichText::new("In progress").strong());
-                        for (url, connector) in &queue_snapshot.in_progress {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.small(egui::RichText::new(format!("[{}]", connector)).weak());
-                                ui.small(truncate(url, 48));
+                                for entry in log.iter() {
+                                    ui.add(
+                                        egui::Label::new(entry.as_ref()).wrap().selectable(true),
+                                    );
+                                }
                             });
-                        }
                     }
-
-                    ui.add_space(12.0);
-                    ui.label(egui::RichText::new("Pending").strong());
-                    if queue_snapshot.pending_total == 0 {
-                        ui.small(egui::RichText::new("Queue is empty").weak().italics());
-                    } else {
-                        for url in &queue_snapshot.pending_preview {
-                            ui.small(truncate(url, 56));
-                        }
-                        if queue_snapshot.pending_total > queue_snapshot.pending_preview.len() {
-                            ui.small(format!(
-                                "+ {} more",
-                                queue_snapshot.pending_total - queue_snapshot.pending_preview.len()
-                            ));
-                        }
+                    OperationTab::PeerLume => {
+                        self.peerlume.render_operations(
+                            ui,
+                            &self.config,
+                            self.storage_settings.applying || self.torrent_library.busy,
+                        );
                     }
-                });
-            },
-        );
-
-        ui.add_space(12.0);
-
-        ui.allocate_ui_with_layout(
-            egui::vec2(full_width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_min_width(full_width);
-                card_frame.show(ui, |ui| {
-                    ui.set_min_width(full_width - 28.0);
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.small(egui::RichText::new("FEEDBACK").weak().strong());
-                            ui.heading("Activity");
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Clear").clicked() {
-                                self.log.clear();
-                            }
-                        });
-                    });
-
-                    ui.add_space(10.0);
-                    let log_lines = self.log.snapshot_shared();
-                    let line_height = ui.text_style_height(&egui::TextStyle::Body);
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .max_height(420.0)
-                        .auto_shrink([false; 2])
-                        .show_rows(ui, line_height, log_lines.len(), |ui, row_range| {
-                            for line in &log_lines[row_range] {
-                                ui.label(line.as_ref());
-                            }
-                        });
-                });
-            },
-        );
+                }
+            });
+        self.operations_open &= open;
     }
 
     fn render_search_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2365,124 +1601,31 @@ impl AppWindow {
             }
         }
 
-        ui.heading("Search");
-
-        self.render_search_filters(ui);
+        self.render_image_search_controls(ui);
         self.sync_date_browse_site();
-
-        // ── Recent pages row ──────────────────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label("🕐 Recent:");
-            ui.add(
-                egui::DragValue::new(&mut self.recent_pages_limit)
-                    .range(1..=200)
-                    .suffix(" pages"),
-            );
-            let (recent_label, recent_stroke) = if self.recent_pages_active {
-                (
-                    "⟳ Refresh",
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 220)),
-                )
-            } else {
-                (
-                    "Show",
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 220)),
-                )
-            };
-            if ui
-                .add_enabled(
-                    !self.running,
-                    egui::Button::new(recent_label).stroke(recent_stroke),
-                )
-                .on_hover_text("Show images from the most recently scraped pages")
-                .clicked()
-            {
-                self.error = None;
-                self.recent_pages_active = true;
-                self.date_browse_active = false;
-                self.date_browse_loading = false;
-                self.search_seq += 1;
-                let seq = self.search_seq;
-                self.pending_command = Some(UiCommand::SearchRecentPages {
-                    database_path: self.config.database_path.clone(),
-                    page_limit: self.recent_pages_limit,
-                    seq,
-                    cursor: None,
-                    append: false,
+        if self.date_browse_active || self.date_browse_loading {
+            self.render_date_browse_row(ui);
+        }
+        if self.search_filters_open {
+            let mut open = self.search_filters_open;
+            egui::Window::new("Image filters")
+                .open(&mut open)
+                .default_width(380.0)
+                .max_width((ctx.screen_rect().width() - 24.0).max(160.0))
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    self.render_search_filters(ui);
+                    if ui
+                        .add_enabled(!self.running, egui::Button::new("Apply filters"))
+                        .clicked()
+                    {
+                        self.start_image_search();
+                        self.search_filters_open = false;
+                    }
                 });
-            }
-            if self.recent_pages_active {
-                ui.separator();
-                ui.colored_label(
-                    egui::Color32::from_rgb(80, 160, 220),
-                    format!("Showing last {} pages", self.recent_pages_limit),
-                );
-            }
-        });
-
-        // ── Date-group browsing row ───────────────────────────────────────────
-        self.render_date_browse_row(ui);
-
-        ui.separator();
-
-        // ── Main search / filter row ──────────────────────────────────────────
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.running, egui::Button::new("🔍 Run Search"))
-                .clicked()
-            {
-                self.error = None;
-                self.recent_pages_active = false;
-                self.date_browse_active = false;
-                self.date_browse_loading = false;
-                self.search_seq += 1;
-                let seq = self.search_seq;
-                self.pending_command = Some(UiCommand::Search {
-                    database_path: self.config.database_path.clone(),
-                    query: self.search_form.to_query(),
-                    seq,
-                    cursor: None,
-                    append: false,
-                });
-            }
-
-            let has_filters = !self.search_form.text.is_empty()
-                || !self.search_form.site_key.is_empty()
-                || !self.search_form.tags.is_empty()
-                || !self.search_form.actors.is_empty()
-                || !self.search_form.creators.text.is_empty()
-                || !self.search_form.categories.is_empty()
-                || !self.search_form.studios.is_empty()
-                || !self.search_form.channels.is_empty()
-                || self.search_form.favorites_only;
-
-            if ui
-                .add_enabled(
-                    has_filters,
-                    egui::Button::new("↺ Reset filters").stroke(egui::Stroke::new(
-                        1.5,
-                        if has_filters {
-                            egui::Color32::from_rgb(200, 120, 30)
-                        } else {
-                            egui::Color32::GRAY
-                        },
-                    )),
-                )
-                .on_hover_text("Clear all search filters")
-                .clicked()
-            {
-                self.search_form = SearchForm::default();
-                self.tag_suggestions.clear();
-                self.actor_suggestions.clear();
-                self.category_suggestions.clear();
-                self.studio_suggestions.clear();
-                self.last_tag_query.clear();
-                self.last_actor_query.clear();
-                self.last_category_query.clear();
-                self.last_studio_query.clear();
-                self.sync_date_browse_site();
-            }
-
+            self.search_filters_open &= open;
+        }
+        ui.horizontal_wrapped(|ui| {
             // Toggle bulk-select mode.
             let (select_label, select_stroke, select_fill) = if self.bulk_select_mode {
                 (
@@ -2564,9 +1707,6 @@ impl AppWindow {
         const IMG_W: f32 = 120.0; // displayed image side length
         const ROW_H: f32 = 205.0; // image(120) + checkbox(20) + 3 text lines + spacing
 
-        // Number of columns from config, clamped to a safe range.
-        let cols = self.config.search_columns.clamp(1, 10);
-
         // cell_w = exactly the image-button width so nothing sticks out sideways.
         let btn_pad = ui.spacing().button_padding.x;
         let cell_w = IMG_W + btn_pad * 2.0; // ≈ 132 px at default style
@@ -2574,8 +1714,29 @@ impl AppWindow {
         let scrollbar_w = ui.spacing().scroll.bar_width
             + ui.spacing().scroll.bar_inner_margin * 2.0
             + ui.spacing().scroll.bar_outer_margin;
-        // Total width: N columns + (N-1) gaps + scrollbar + 2 px safety margin.
-        let results_w = cols as f32 * cell_w + (cols - 1) as f32 * item_gap + scrollbar_w + 2.0;
+        let width = ui.available_width();
+        let previous_selection = (self.selected_result, self.search_detail_open);
+        let show_details = self.search_detail_open
+            && !self.bulk_select_mode
+            && self
+                .selected_result
+                .is_some_and(|index| index < self.search_results.len());
+        let split = show_details && width >= 880.0;
+        let details_only = show_details && !split;
+        let detail_width = if split {
+            (width * 0.34).clamp(300.0, 520.0)
+        } else {
+            0.0
+        };
+        let results_w =
+            (width - detail_width - if split { item_gap * 3.0 + 4.0 } else { 0.0 }).max(1.0);
+        let cols = grid_columns(
+            results_w,
+            cell_w,
+            item_gap,
+            scrollbar_w,
+            self.config.search_columns,
+        );
 
         let results_heading = if self.recent_pages_active {
             format!(
@@ -2593,33 +1754,15 @@ impl AppWindow {
         let base_dir = self.config.download_folder.clone();
         let mut metadata_to_request = HashSet::new();
 
-        // ── Two-column layout: fixed results | flexible details ───────────────
-        // Using allocate_ui_with_layout instead of SidePanel to guarantee that
-        // text labels inside cells can never push the panel width.
         let avail = ui.available_size();
         ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-
-            // ── LEFT: results grid (fixed width) ─────────────────────────────
-            ui.allocate_ui_with_layout(
-                egui::vec2(results_w, avail.y),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                // Heading row: title left, column-count picker right.
-                ui.horizontal(|ui| {
-                    ui.heading(&results_heading);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let prev_cols = self.config.search_columns;
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.search_columns)
-                                .range(1..=10)
-                                .prefix("⊞ "),
-                        )
-                        .on_hover_text("Columns (drag or scroll • also saved to settings)");
-                        if self.config.search_columns != prev_cols {
-                            self.save_config_setting("search columns");
-                        }
-                    });
-                });
+            if !details_only {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(results_w, avail.y),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_width(results_w);
+                        ui.heading(&results_heading);
                 if results.is_empty() {
                     ui.label("No matching images. Try a broader search.");
                 } else {
@@ -2675,6 +1818,7 @@ impl AppWindow {
                                                 let resp = ui.add(egui::Button::image(img));
                                                 if resp.clicked() {
                                                     self.selected_result = Some(index);
+                                                    self.search_detail_open = !self.bulk_select_mode;
                                                     if self.bulk_select_mode {
                                                         if self.selected_image_ids.contains(&result.image_id) { self.selected_image_ids.remove(&result.image_id); }
                                                         else { self.selected_image_ids.insert(result.image_id); }
@@ -2697,6 +1841,7 @@ impl AppWindow {
                                                 } else { resp };
                                                 if resp.clicked() {
                                                     self.selected_result = Some(index);
+                                                    self.search_detail_open = !self.bulk_select_mode;
                                                     if self.bulk_select_mode {
                                                         if self.selected_image_ids.contains(&result.image_id) { self.selected_image_ids.remove(&result.image_id); }
                                                         else { self.selected_image_ids.insert(result.image_id); }
@@ -2728,6 +1873,7 @@ impl AppWindow {
                                                     .clicked()
                                                 {
                                                     self.selected_result = Some(index);
+                                                    self.search_detail_open = !self.bulk_select_mode;
                                                 }
                                             });
 
@@ -2780,15 +1926,23 @@ impl AppWindow {
                 }
             });
 
-            ui.separator();
-
-            // ── RIGHT: details panel (takes remaining width) ──────────────────
-            let detail_w = ui.available_width();
-            ui.allocate_ui_with_layout(
-                egui::vec2(detail_w, avail.y),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-            ui.heading("Details");
+            }
+            if show_details {
+                if split {
+                    ui.separator();
+                }
+                let detail_w = ui.available_width().max(1.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(detail_w, avail.y),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_width(detail_w);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button(if details_only { "Back to results" } else { "Close details" }).clicked() {
+                                self.search_detail_open = false;
+                            }
+                            ui.heading("Details");
+                        });
             egui::ScrollArea::vertical()
                 .id_salt("detail_scroll")
                 .show(ui, |ui| {
@@ -2800,9 +1954,14 @@ impl AppWindow {
                                 metadata_to_request.insert(result.image_id);
                             }
                             ui.add(egui::Label::new(egui::RichText::new(result.page_title()).heading()).wrap().selectable(true));
-                            ui.label(format!("Page: {}", result.page_url()));
                             ui.hyperlink_to("Open scene/page", result.page_url());
-                            ui.label(format!("Image: {}", result.source_url));
+                            ui.collapsing("Links and paths", |ui| {
+                                ui.add(egui::Label::new(result.page_url()).wrap().selectable(true));
+                                ui.add(egui::Label::new(&result.source_url).wrap().selectable(true));
+                                if let Some(path) = &result.local_file_path {
+                                    ui.add(egui::Label::new(path).wrap().selectable(true));
+                                }
+                            });
 
                             let actors = result.actors();
                             if !actors.is_empty() {
@@ -2841,7 +2000,6 @@ impl AppWindow {
                             }
 
                             if let Some(path) = &result.local_file_path {
-                                ui.label(format!("Local: {}", path));
                                 let full = resolve_preview_path(&base_dir, path);
                                 if ui.button("Open in Explorer").clicked() {
                                     open_in_explorer(&full);
@@ -3158,8 +2316,12 @@ impl AppWindow {
                         ui.label("Select a result to inspect its details.");
                     }
                 }); // ScrollArea
-            }); // allocate_ui_with_layout (details)
-        }); // with_layout
+                });
+            }
+        });
+        if previous_selection != (self.selected_result, self.search_detail_open) {
+            ctx.request_repaint();
+        }
 
         if self.pending_command.is_none() && !metadata_to_request.is_empty() {
             let image_ids = metadata_to_request.into_iter().collect::<Vec<_>>();
@@ -3175,6 +2337,192 @@ impl AppWindow {
 
     // ── Search filters ────────────────────────────────────────────────────────
 
+    fn start_image_search(&mut self) {
+        self.error = None;
+        self.recent_pages_active = false;
+        self.date_browse_active = false;
+        self.date_browse_loading = false;
+        self.search_seq += 1;
+        self.pending_command = Some(UiCommand::Search {
+            database_path: self.config.database_path.clone(),
+            query: self.search_form.to_query(),
+            seq: self.search_seq,
+            cursor: None,
+            append: false,
+        });
+    }
+
+    fn start_recent_pages(&mut self) {
+        self.error = None;
+        self.recent_pages_active = true;
+        self.date_browse_active = false;
+        self.date_browse_loading = false;
+        self.search_seq += 1;
+        self.pending_command = Some(UiCommand::SearchRecentPages {
+            database_path: self.config.database_path.clone(),
+            page_limit: self.recent_pages_limit,
+            seq: self.search_seq,
+            cursor: None,
+            append: false,
+        });
+    }
+
+    fn render_image_search_controls(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_width();
+        let query = self.search_form.to_query();
+        let filter_count = usize::from(query.site_key.is_some())
+            + query.tags.len()
+            + query.actors.len()
+            + query.creators.len()
+            + query.categories.len()
+            + query.studios.len()
+            + query.channels.len()
+            + usize::from(query.favorites_only);
+        ui.horizontal_wrapped(|ui| {
+            let text = ui.add(
+                egui::TextEdit::singleline(&mut self.search_form.text)
+                    .hint_text("Search images")
+                    .desired_width((available * 0.32).clamp(115.0, 320.0)),
+            );
+            egui::ComboBox::from_id_salt("search_site_filter")
+                .width(108.0)
+                .selected_text(if self.search_form.site_key.is_empty() {
+                    "All sites".to_owned()
+                } else {
+                    truncate(&self.search_form.site_key, 18)
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.search_form.site_key, String::new(), "All sites");
+                    for key in ScraperRegistry::with_all_scrapers().list_site_keys() {
+                        ui.selectable_value(&mut self.search_form.site_key, key.to_owned(), key);
+                    }
+                });
+            let tags = ui.add(
+                egui::TextEdit::singleline(&mut self.search_form.tags)
+                    .hint_text("Tags")
+                    .desired_width((available * 0.19).clamp(86.0, 175.0)),
+            );
+            if tags.changed() {
+                let query = last_comma_token(&self.search_form.tags);
+                self.last_tag_query.clone_from(&query);
+                self.tag_suggestions.clear();
+                if !query.is_empty() {
+                    self.pending_command = Some(UiCommand::SuggestTags {
+                        database_path: self.config.database_path.clone(),
+                        query,
+                    });
+                }
+            }
+            let enter = (text.lost_focus() || tags.lost_focus())
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(!self.running, egui::Button::new("Run Search"))
+                .clicked()
+                || (!self.running && enter)
+            {
+                self.start_image_search();
+            }
+            if ui.button(format!("Filters ({filter_count})")).clicked() {
+                self.search_filters_open = !self.search_filters_open;
+            }
+            ui.menu_button("Browse", |ui| {
+                if ui
+                    .add_enabled(!self.running, egui::Button::new("By Date"))
+                    .clicked()
+                {
+                    self.request_date_group(DateBrowseDirection::Initial);
+                    ui.close_menu();
+                }
+                ui.label("Recent pages");
+                ui.add(
+                    egui::DragValue::new(&mut self.recent_pages_limit)
+                        .range(1..=200)
+                        .suffix(" pages"),
+                );
+                if ui
+                    .add_enabled(!self.running, egui::Button::new("Show recent"))
+                    .clicked()
+                {
+                    self.start_recent_pages();
+                    ui.close_menu();
+                }
+                if (self.recent_pages_active || self.date_browse_active)
+                    && ui
+                        .add_enabled(!self.running, egui::Button::new("Return to search"))
+                        .clicked()
+                {
+                    self.start_image_search();
+                    ui.close_menu();
+                }
+            });
+        });
+        if !self.tag_suggestions.is_empty() {
+            render_suggestions(ui, &mut self.search_form.tags, &mut self.tag_suggestions);
+        }
+
+        if filter_count > 0 && !self.recent_pages_active {
+            let mut removed = false;
+            ui.add_enabled_ui(!self.running, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mut remaining = 6;
+                    if let Some(site) = &query.site_key {
+                        if filter_chip(ui, "Site", site, &mut remaining) {
+                            self.search_form.site_key.clear();
+                            removed = true;
+                        }
+                    }
+                    if !self.date_browse_active {
+                        for (label, field, values) in [
+                            ("Tag", &mut self.search_form.tags, &query.tags),
+                            ("Actor", &mut self.search_form.actors, &query.actors),
+                            (
+                                "Category",
+                                &mut self.search_form.categories,
+                                &query.categories,
+                            ),
+                            ("Studio", &mut self.search_form.studios, &query.studios),
+                            ("Channel", &mut self.search_form.channels, &query.channels),
+                        ] {
+                            removed |= filter_value_chips(ui, label, field, values, &mut remaining);
+                        }
+                        for value in &query.creators {
+                            if filter_chip(ui, "Creator", value, &mut remaining) {
+                                self.search_form.creators.remove(value);
+                                removed = true;
+                            }
+                        }
+                        if query.favorites_only
+                            && filter_chip(ui, "Favorites", "Only", &mut remaining)
+                        {
+                            self.search_form.favorites_only = false;
+                            removed = true;
+                        }
+                        if filter_count > 6 {
+                            ui.weak(format!("+{}", filter_count - 6));
+                        }
+                    }
+                })
+            });
+            if removed {
+                self.clear_search_suggestions();
+                if !self.date_browse_active {
+                    self.start_image_search();
+                }
+            }
+        }
+    }
+
+    fn clear_search_suggestions(&mut self) {
+        self.tag_suggestions.clear();
+        self.actor_suggestions.clear();
+        self.category_suggestions.clear();
+        self.studio_suggestions.clear();
+        self.last_tag_query.clear();
+        self.last_actor_query.clear();
+        self.last_category_query.clear();
+        self.last_studio_query.clear();
+    }
+
     fn render_search_filters(&mut self, ui: &mut egui::Ui) {
         let label_width = 112.0;
         let row_height = ui.spacing().interact_size.y;
@@ -3189,65 +2537,9 @@ impl AppWindow {
             .num_columns(2)
             .spacing([ui.spacing().item_spacing.x, 4.0])
             .show(ui, |ui| {
-                search_filter_label(ui, "Text", label_width, row_height);
-                ui.add_sized(
-                    field_size,
-                    egui::TextEdit::singleline(&mut self.search_form.text),
-                );
-                ui.end_row();
-
-                search_filter_label(ui, "Site", label_width, row_height);
-                egui::ComboBox::from_id_salt("search_site_filter")
-                    .width(field_width)
-                    .selected_text(if self.search_form.site_key.is_empty() {
-                        "All sites"
-                    } else {
-                        self.search_form.site_key.as_str()
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.search_form.site_key,
-                            String::new(),
-                            "All sites",
-                        );
-                        for key in ScraperRegistry::with_all_scrapers().list_site_keys() {
-                            ui.selectable_value(
-                                &mut self.search_form.site_key,
-                                key.to_string(),
-                                key,
-                            );
-                        }
-                    });
-                ui.end_row();
-
-                // Favorites filter (Task 1)
                 search_filter_label(ui, "", label_width, row_height);
                 ui.checkbox(&mut self.search_form.favorites_only, "Favorites only");
                 ui.end_row();
-
-                // Tags
-                search_filter_label(ui, "Tags", label_width, row_height);
-                let resp = ui.add_sized(
-                    field_size,
-                    egui::TextEdit::singleline(&mut self.search_form.tags),
-                );
-                let cur = last_comma_token(&self.search_form.tags);
-                if resp.changed() && cur != self.last_tag_query {
-                    self.last_tag_query = cur.clone();
-                    self.tag_suggestions.clear();
-                    if !cur.is_empty() {
-                        self.pending_command = Some(UiCommand::SuggestTags {
-                            database_path: self.config.database_path.clone(),
-                            query: cur,
-                        });
-                    }
-                }
-                ui.end_row();
-                if !self.tag_suggestions.is_empty() {
-                    search_filter_label(ui, "", label_width, row_height);
-                    render_suggestions(ui, &mut self.search_form.tags, &mut self.tag_suggestions);
-                    ui.end_row();
-                }
 
                 // Actors
                 search_filter_label(ui, "Actors", label_width, row_height);
@@ -3356,6 +2648,18 @@ impl AppWindow {
                 );
                 ui.end_row();
             });
+        let columns = self.config.search_columns;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Maximum grid columns");
+            ui.add(egui::DragValue::new(&mut self.config.search_columns).range(1..=10));
+            if ui.button("Reset filters").clicked() {
+                self.search_form = SearchForm::default();
+                self.clear_search_suggestions();
+            }
+        });
+        if columns != self.config.search_columns {
+            self.save_config_setting("search columns");
+        }
     }
 
     // ── Bulk edit panel ───────────────────────────────────────────────────────
@@ -4250,7 +3554,6 @@ impl AppWindow {
         if !self.queue_window_open {
             return;
         }
-        let snapshot = clone_queue_snapshot(&self.queue_snapshot);
         let viewport_id = egui::ViewportId::from_hash_of("queue_window");
         let viewport_builder = application_viewport()
             .with_title("Download Queue")
@@ -4262,94 +3565,10 @@ impl AppWindow {
                 return;
             }
 
-            egui::CentralPanel::default().show(ctx, |ui| {
-                // Status row
-                ui.horizontal(|ui| {
-                    let status = if snapshot.paused {
-                        egui::RichText::new("⏸ Paused").color(egui::Color32::YELLOW)
-                    } else {
-                        egui::RichText::new("▶ Running").color(egui::Color32::GREEN)
-                    };
-                    ui.label(status);
-                    ui.separator();
-                    ui.label(format!(
-                        "{} in progress, {} pending, {} failed",
-                        snapshot.in_progress.len(),
-                        snapshot.pending_total,
-                        snapshot.failed_total
-                    ));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Clear pending").clicked() {
-                            self.pending_command = Some(UiCommand::ClearPendingQueue);
-                        }
-                        if snapshot.failed_total > 0 && ui.button("Retry failed").clicked() {
-                            self.pending_command = Some(UiCommand::RetryFailedQueue);
-                        }
-                        if snapshot.paused {
-                            if ui.button("▶ Resume").clicked() {
-                                self.pending_command = Some(UiCommand::ResumeQueue);
-                            }
-                        } else {
-                            if ui.button("⏸ Pause").clicked() {
-                                self.pending_command = Some(UiCommand::PauseQueue);
-                            }
-                        }
-                    });
-                });
-                ui.separator();
-
-                // In progress
-                if !snapshot.in_progress.is_empty() {
-                    ui.label(egui::RichText::new("In Progress").strong());
-                    for (url, connector) in &snapshot.in_progress {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("[{}]", connector))
-                                    .small()
-                                    .weak(),
-                            );
-                            ui.label(egui::RichText::new(truncate(url, 60)).small());
-                        });
-                    }
-                    ui.separator();
-                }
-
-                // Pending
-                ui.label(
-                    egui::RichText::new(format!("Pending ({})", snapshot.pending_total)).strong(),
-                );
-                let row_height =
-                    ui.text_style_height(&egui::TextStyle::Small) + ui.spacing().item_spacing.y;
-                egui::ScrollArea::vertical().show_rows(
-                    ui,
-                    row_height,
-                    snapshot.pending_total,
-                    |ui, row_range| {
-                        if snapshot.pending_total == 0 {
-                            ui.label(egui::RichText::new("Queue is empty").weak().italics());
-                        } else {
-                            let requested_range = queue_range_with_overscan(
-                                row_range.clone(),
-                                snapshot.pending_total,
-                            );
-                            if update_queue_visible_range(
-                                &mut self.queue_visible_range,
-                                requested_range,
-                            ) {
-                                ui.ctx().request_repaint();
-                            }
-                            for queue_index in row_range {
-                                if let Some(url) = queue_snapshot_pending_at(&snapshot, queue_index)
-                                {
-                                    ui.label(egui::RichText::new(truncate(url, 70)).small());
-                                } else {
-                                    ui.label(egui::RichText::new("Loading…").small().weak());
-                                }
-                            }
-                        }
-                    },
-                );
+            egui::TopBottomPanel::top("detached_queue_controls").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| self.queue_controls(ui));
             });
+            egui::CentralPanel::default().show(ctx, |ui| self.render_queue_rows(ui));
         });
     }
 }
@@ -4557,46 +3776,10 @@ impl AppWindow {
 
     /// Renders the date-browse controls row inside the Search tab.
     fn render_date_browse_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // ── Activate / deactivate toggle ─────────────────────────────────
-            let (activate_label, activate_stroke) = if self.date_browse_active {
-                (
-                    "📅 By Date ●",
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 100)),
-                )
-            } else {
-                (
-                    "📅 By Date",
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 220)),
-                )
-            };
-
-            let loading = self.date_browse_loading;
-            if ui
-                .add_enabled(
-                    !loading,
-                    egui::Button::new(activate_label).stroke(activate_stroke),
-                )
-                .on_hover_text(if self.date_browse_active {
-                    "Browse by upload date — click to deactivate"
-                } else {
-                    "Browse photos grouped by upload date (PageUp/PageDown to navigate)"
-                })
-                .clicked()
-            {
-                if self.date_browse_active {
-                    self.date_browse_active = false;
-                } else {
-                    self.request_date_group(DateBrowseDirection::Initial);
-                }
-            }
-
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("By Date");
             if self.date_browse_loading {
                 ui.spinner();
-                return;
-            }
-
-            if !self.date_browse_active {
                 return;
             }
 
@@ -6120,6 +5303,49 @@ fn update_queue_visible_range(
     }
     *current = requested;
     true
+}
+
+fn grid_columns(width: f32, cell: f32, gap: f32, scrollbar: f32, limit: usize) -> usize {
+    (((width - scrollbar + gap) / (cell + gap)).floor() as usize).clamp(1, limit.clamp(1, 10))
+}
+
+pub(super) fn filter_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    remaining: &mut usize,
+) -> bool {
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    ui.small_button(format!("{label} {} ×", truncate(value, 21)))
+        .on_hover_text(format!("Remove {label} filter: {value}"))
+        .clicked()
+}
+
+pub(super) fn filter_value_chips(
+    ui: &mut egui::Ui,
+    label: &str,
+    field: &mut String,
+    values: &[String],
+    remaining: &mut usize,
+) -> bool {
+    for (index, value) in values.iter().enumerate() {
+        if *remaining == 0 {
+            break;
+        }
+        if filter_chip(ui, label, value, remaining) {
+            *field = values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, value)| (i != index).then_some(value.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return true;
+        }
+    }
+    false
 }
 
 fn search_filter_field_width(available_width: f32, label_width: f32, column_spacing: f32) -> f32 {

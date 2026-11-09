@@ -1,6 +1,7 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 
+use super::app_window::{filter_chip, filter_value_chips};
 use super::background_executor::spawn_background;
 use super::creator_filter::CreatorFilter;
 use super::preview_loader::{ImageLoadMode, PreviewLoader, PreviewSource};
@@ -67,6 +68,8 @@ pub(super) struct TorrentLibraryUi {
     checked_cards: std::collections::BTreeSet<i64>,
     pending_command: Option<crate::ui::UiCommand>,
     filters: Filters,
+    filters_open: bool,
+    details_open: bool,
     page: TorrentSummaryPage,
     selected: Option<Arc<TorrentCard>>,
     edit: TorrentEdit,
@@ -97,6 +100,8 @@ impl Default for TorrentLibraryUi {
             checked_cards: Default::default(),
             pending_command: None,
             filters: Filters::default(),
+            filters_open: false,
+            details_open: false,
             page: TorrentSummaryPage {
                 cards: vec![],
                 total: 0,
@@ -222,6 +227,7 @@ impl TorrentLibraryUi {
         self.edit = TorrentEdit::from(card.as_ref());
         self.folder_name = card.directory_name().unwrap_or("").to_owned();
         self.selected = Some(card);
+        self.details_open = true;
         self.inputs = Default::default();
         self.organize = false;
         self.plan = None;
@@ -304,45 +310,7 @@ impl TorrentLibraryUi {
             self.load(ui.ctx(), config);
         }
         self.install_previews(ui.ctx());
-        ui.add_enabled_ui(!self.busy && self.plan.is_none(), |ui| {
-            egui::Grid::new("torrent_filters")
-                .num_columns(4)
-                .show(ui, |ui| {
-                    for (label, value) in [
-                        ("Text", &mut self.filters.text),
-                        ("Source", &mut self.filters.site),
-                        ("Studio", &mut self.filters.studio),
-                        ("Year", &mut self.filters.year),
-                        ("Tags (comma separated)", &mut self.filters.tags),
-                        ("Categories (comma separated)", &mut self.filters.categories),
-                    ] {
-                        ui.label(label);
-                        ui.add(egui::TextEdit::singleline(value).desired_width(180.0));
-                        if matches!(label, "Source" | "Year" | "Categories (comma separated)") {
-                            ui.end_row();
-                        }
-                    }
-                    ui.label("Director / Author");
-                    if let Some(command) = self.filters.creators.input(
-                        ui,
-                        [180.0, ui.spacing().interact_size.y],
-                        &config.database_path,
-                    ) {
-                        self.pending_command = Some(command);
-                    }
-                    ui.end_row();
-                    if self.filters.creators.has_suggestions() {
-                        ui.label("");
-                        self.filters.creators.render_suggestions(ui);
-                        ui.end_row();
-                    }
-                });
-            if ui.button("Find torrents / Refresh").clicked() {
-                self.filters.offset = 0;
-                self.refresh_suggestions = true;
-                self.load(ui.ctx(), config);
-            }
-        });
+        self.render_filters(ui, config);
         if self.busy {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -382,71 +350,110 @@ impl TorrentLibraryUi {
             }
         });
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(format!("{} selected", self.checked_cards.len()));
-            if ui
-                .add_enabled(
-                    !self.busy
-                        && config.peerlume.enabled
-                        && !self.checked_cards.is_empty()
-                        && self.checked_cards.len() <= 100,
-                    egui::Button::new("Download selected in PeerLume"),
-                )
-                .clicked()
-            {
-                self.handoff = Some(self.checked_cards.iter().copied().collect());
-            }
-            if ui.button("Clear selection").clicked() {
-                self.checked_cards.clear();
-            }
-        });
+        if !self.checked_cards.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                let visible = self
+                    .page
+                    .cards
+                    .iter()
+                    .filter(|card| self.checked_cards.contains(&card.page_id))
+                    .count();
+                ui.label(format!(
+                    "{} selected · {} outside this page",
+                    self.checked_cards.len(),
+                    self.checked_cards.len() - visible
+                ));
+                if ui
+                    .add_enabled(
+                        !self.busy
+                            && config.peerlume.enabled
+                            && !self.checked_cards.is_empty()
+                            && self.checked_cards.len() <= 100,
+                        egui::Button::new("Download selected in PeerLume"),
+                    )
+                    .clicked()
+                {
+                    self.handoff = Some(self.checked_cards.iter().copied().collect());
+                }
+                if ui.button("Clear selection").clicked() {
+                    self.checked_cards.clear();
+                }
+            });
+        }
         let height = ui.available_height();
-        ui.columns(2, |columns| {
-            egui::ScrollArea::vertical()
-                .id_salt("torrent_cards")
-                .max_height(height)
-                .show(&mut columns[0], |ui| {
-                    let mut choose = None;
-                    for card in &self.page.cards {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            let mut checked = self.checked_cards.contains(&card.page_id);
-                            if ui.checkbox(&mut checked, "Select for PeerLume").changed() {
-                                if checked {
-                                    self.checked_cards.insert(card.page_id);
-                                } else {
-                                    self.checked_cards.remove(&card.page_id);
-                                }
+        let selected = self.details_open && self.selected.is_some();
+        if selected && ui.available_width() >= 820.0 {
+            ui.columns(2, |columns| {
+                self.render_cards(&mut columns[0], config, height);
+                self.render_details(&mut columns[1], config, height);
+            });
+        } else if selected {
+            if ui.button("Back to torrent cards").clicked() {
+                self.details_open = false;
+                ui.ctx().request_repaint();
+            }
+            self.render_details(ui, config, ui.available_height());
+        } else {
+            self.render_cards(ui, config, height);
+        }
+        self.confirm(ui.ctx(), config);
+        self.preview_window(ui.ctx(), config);
+    }
+
+    fn render_cards(&mut self, ui: &mut egui::Ui, config: &AppConfig, height: f32) {
+        egui::ScrollArea::vertical()
+            .id_salt("torrent_cards")
+            .max_height(height)
+            .show(ui, |ui| {
+                let mut choose = None;
+                for card in &self.page.cards {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        let mut checked = self.checked_cards.contains(&card.page_id);
+                        if ui.checkbox(&mut checked, "Select for PeerLume").changed() {
+                            if checked {
+                                self.checked_cards.insert(card.page_id);
+                            } else {
+                                self.checked_cards.remove(&card.page_id);
                             }
-                            ui.set_width(ui.available_width());
-                            if ui
-                                .add_enabled(
-                                    !self.busy && self.plan.is_none(),
-                                    egui::Button::new(&card.content_title).wrap().selected(
-                                        self.selected
-                                            .as_ref()
-                                            .is_some_and(|c| c.page_id == card.page_id),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                choose = Some(card.page_id);
+                        }
+                        ui.set_width(ui.available_width());
+                        if ui
+                            .add_enabled(
+                                !self.busy && self.plan.is_none(),
+                                egui::Button::new(&card.content_title).wrap().selected(
+                                    self.selected
+                                        .as_ref()
+                                        .is_some_and(|c| c.page_id == card.page_id),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            choose = Some(card.page_id);
+                        }
+                        ui.label(format!(
+                            "{} · {}",
+                            card.site_key,
+                            if card.primary_studio.is_empty() {
+                                "Unknown studio"
+                            } else {
+                                &card.primary_studio
                             }
-                            ui.label(format!(
-                                "{} · {}",
-                                card.site_key,
-                                if card.primary_studio.is_empty() {
-                                    "Unknown studio"
-                                } else {
-                                    &card.primary_studio
-                                }
-                            ));
-                            ui.label(format!(
-                                "{} attachments · {} images",
-                                card.attachment_count, card.image_count
-                            ));
-                        });
-                    }
-                    if let Some(id) = choose {
+                        ));
+                        ui.label(format!(
+                            "{} attachments · {} images",
+                            card.attachment_count, card.image_count
+                        ));
+                    });
+                }
+                if let Some(id) = choose {
+                    if self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|card| card.page_id == id)
+                    {
+                        self.details_open = true;
+                        ui.ctx().request_repaint();
+                    } else {
                         let database = Database::new(&config.database_path);
                         self.job(ui.ctx(), move |_, _| {
                             database
@@ -455,19 +462,147 @@ impl TorrentLibraryUi {
                                 .map_err(|e| e.to_string())
                         });
                     }
-                    if self.page.total == 0 {
-                        ui.label(
-                            "Download a page containing a torrent or magnet to create a card.",
-                        );
+                }
+                if self.page.total == 0 {
+                    ui.label("Download a page containing a torrent or magnet to create a card.");
+                }
+            });
+    }
+
+    fn render_details(&mut self, ui: &mut egui::Ui, config: &AppConfig, height: f32) {
+        egui::ScrollArea::vertical()
+            .id_salt("torrent_details")
+            .max_height(height)
+            .show(ui, |ui| self.details(ui, config));
+    }
+
+    fn render_filters(&mut self, ui: &mut egui::Ui, config: &AppConfig) {
+        let query = self.filters.query();
+        let count = usize::from(!query.site_key.is_empty())
+            + usize::from(!query.studio.is_empty())
+            + usize::from(!query.year.is_empty())
+            + query.tags.len()
+            + query.categories.len()
+            + query.creators.len();
+        let width = ui.available_width();
+        let can_search = !self.busy && self.plan.is_none();
+        ui.add_enabled_ui(can_search, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let text = ui.add(
+                    egui::TextEdit::singleline(&mut self.filters.text)
+                        .hint_text("Search torrents")
+                        .desired_width((width * 0.32).clamp(105.0, 320.0)),
+                );
+                let site = ui.add(
+                    egui::TextEdit::singleline(&mut self.filters.site)
+                        .hint_text("Source")
+                        .desired_width(104.0),
+                );
+                let tags = ui.add(
+                    egui::TextEdit::singleline(&mut self.filters.tags)
+                        .hint_text("Tags")
+                        .desired_width(105.0),
+                );
+                let enter = (text.lost_focus() || site.lost_focus() || tags.lost_focus())
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Find torrents / Refresh").clicked() || enter {
+                    self.search_from_first_page(ui.ctx(), config);
+                }
+                if ui.button(format!("Filters ({count})")).clicked() {
+                    self.filters_open = !self.filters_open;
+                }
+            });
+            if count > 0 {
+                let mut removed = false;
+                ui.horizontal_wrapped(|ui| {
+                    let mut remaining = 6;
+                    for (label, field, value) in [
+                        ("Source", &mut self.filters.site, &query.site_key),
+                        ("Studio", &mut self.filters.studio, &query.studio),
+                        ("Year", &mut self.filters.year, &query.year),
+                    ] {
+                        if !value.is_empty() && filter_chip(ui, label, value, &mut remaining) {
+                            field.clear();
+                            removed = true;
+                        }
+                    }
+                    removed |= filter_value_chips(
+                        ui,
+                        "Tag",
+                        &mut self.filters.tags,
+                        &query.tags,
+                        &mut remaining,
+                    );
+                    removed |= filter_value_chips(
+                        ui,
+                        "Category",
+                        &mut self.filters.categories,
+                        &query.categories,
+                        &mut remaining,
+                    );
+                    for value in &query.creators {
+                        if filter_chip(ui, "Creator", value, &mut remaining) {
+                            self.filters.creators.remove(value);
+                            removed = true;
+                        }
+                    }
+                    if count > 6 {
+                        ui.weak(format!("+{}", count - 6));
                     }
                 });
-            egui::ScrollArea::vertical()
-                .id_salt("torrent_details")
-                .max_height(height)
-                .show(&mut columns[1], |ui| self.details(ui, config));
+                if removed {
+                    self.search_from_first_page(ui.ctx(), config);
+                }
+            }
         });
-        self.confirm(ui.ctx(), config);
-        self.preview_window(ui.ctx(), config);
+
+        if self.filters_open {
+            let ctx = ui.ctx().clone();
+            let mut open = self.filters_open;
+            egui::Window::new("Torrent filters")
+                .open(&mut open)
+                .default_width(360.0)
+                .max_width((ctx.screen_rect().width() - 24.0).max(160.0))
+                .vscroll(true)
+                .show(&ctx, |ui| {
+                    ui.add_enabled_ui(can_search, |ui| {
+                        for (label, value) in [
+                            ("Studio", &mut self.filters.studio),
+                            ("Year", &mut self.filters.year),
+                            ("Categories (comma separated)", &mut self.filters.categories),
+                        ] {
+                            ui.label(label);
+                            ui.text_edit_singleline(value);
+                        }
+                        ui.label("Director / Author");
+                        let size = [ui.available_width(), ui.spacing().interact_size.y];
+                        if let Some(command) =
+                            self.filters.creators.input(ui, size, &config.database_path)
+                        {
+                            self.pending_command = Some(command);
+                        }
+                        if self.filters.creators.has_suggestions() {
+                            self.filters.creators.render_suggestions(ui);
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Apply filters").clicked() {
+                                self.search_from_first_page(ui.ctx(), config);
+                                self.filters_open = false;
+                            }
+                            if ui.button("Reset filters").clicked() {
+                                self.filters = Filters::default();
+                            }
+                        });
+                    });
+                });
+            self.filters_open &= open;
+        }
+    }
+
+    fn search_from_first_page(&mut self, ctx: &egui::Context, config: &AppConfig) {
+        self.filters.offset = 0;
+        self.refresh_suggestions = true;
+        self.load(ctx, config);
     }
 
     fn details(&mut self, ui: &mut egui::Ui, config: &AppConfig) {
@@ -1099,7 +1234,7 @@ mod tests {
             "Tags",
             "Categories",
             "Review and save",
-            "Year",
+            "Filters (0)",
         ] {
             assert!(
                 labels.iter().any(|(text, _)| text == expected),

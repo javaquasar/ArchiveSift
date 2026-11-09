@@ -1,7 +1,8 @@
 # Full configuration editor
 
-Open **Settings → JSON** to edit the complete application configuration, including
-`extension_accounts` and `extension_settings`. The existing form remains available.
+Open **Settings → Advanced** to edit the complete JSON configuration, including
+`extension_accounts` and `extension_settings`. Open an extension's
+**Credentials** section to store its declared keys.
 JSON is the application's persisted format. Windows paths need escaped backslashes,
 for example `"Z:\\archive"`; forward slashes also work in Windows path values.
 

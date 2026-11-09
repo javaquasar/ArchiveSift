@@ -27,10 +27,13 @@ pub(super) struct RawSettingsEditor {
     selected_suggestion: usize,
     secrets: BTreeMap<String, SecretInput>,
 }
+#[derive(Default)]
 struct SecretInput {
     text: Zeroizing<String>,
     pending: bool,
     status: Option<String>,
+    presence: Option<Result<bool, String>>,
+    presence_job: Option<std::sync::mpsc::Receiver<Result<bool, String>>>,
 }
 impl RawSettingsEditor {
     pub(super) fn refresh_catalog(&mut self) {
@@ -39,11 +42,9 @@ impl RawSettingsEditor {
         let targets = self.catalog.secret_targets();
         self.secrets.retain(|target, _| targets.contains(target));
         for target in targets {
-            self.secrets.entry(target).or_insert_with(|| SecretInput {
-                text: Zeroizing::new(String::new()),
-                pending: false,
-                status: None,
-            });
+            let input = self.secrets.entry(target).or_default();
+            input.presence = None;
+            input.presence_job = None;
         }
         self.validate();
         self.status = Some(
@@ -76,14 +77,7 @@ impl RawSettingsEditor {
             secrets: BTreeMap::new(),
         };
         for target in editor.catalog.secret_targets() {
-            editor.secrets.insert(
-                target,
-                SecretInput {
-                    text: Zeroizing::new(String::new()),
-                    pending: false,
-                    status: None,
-                },
-            );
+            editor.secrets.insert(target, SecretInput::default());
         }
         editor.validate();
         editor
@@ -105,15 +99,129 @@ impl RawSettingsEditor {
     pub(super) fn busy(&self) -> bool {
         self.secrets.values().any(|s| s.pending)
     }
+    pub(super) fn refresh_pristine_draft(&mut self, config: &AppConfig) {
+        if self.draft == self.initial
+            && serde_json::to_value(config).ok().as_ref() != Some(&self.baseline)
+        {
+            self.reset_draft(config);
+        }
+    }
+
+    fn reset_draft(&mut self, config: &AppConfig) {
+        let mut editor = Self::new(config, self.catalog.clone());
+        editor.secrets = std::mem::take(&mut self.secrets);
+        *self = editor;
+    }
     pub(super) fn secret_finished(&mut self, target: &str, result: Result<(), String>) {
         if let Some(input) = self.secrets.get_mut(target) {
             input.pending = false;
+            if result.is_ok() {
+                input.presence = Some(Ok(true));
+            }
             input.status = Some(
                 result
                     .err()
                     .unwrap_or_else(|| "Credential saved in the system password store.".into()),
             );
         }
+    }
+
+    pub(super) fn render_plugin_credentials(
+        &mut self,
+        ui: &mut egui::Ui,
+        plugin_id: &str,
+        blocked: bool,
+    ) -> Option<UiCommand> {
+        let prefix = format!("ArchiveSift/{plugin_id}/");
+        if !self
+            .secrets
+            .keys()
+            .any(|target| target.starts_with(&prefix))
+        {
+            return None;
+        }
+        egui::CollapsingHeader::new("Credentials")
+            .id_salt("plugin_credentials")
+            .show(ui, |ui| self.render_credentials(ui, Some(&prefix), blocked))
+            .body_returned
+            .flatten()
+    }
+
+    fn render_credentials(
+        &mut self,
+        ui: &mut egui::Ui,
+        prefix: Option<&str>,
+        blocked: bool,
+    ) -> Option<UiCommand> {
+        let mut command = None;
+        for (target, input) in &mut self.secrets {
+            if prefix.is_some_and(|prefix| !target.starts_with(prefix)) {
+                continue;
+            }
+            let hint = self.catalog.plugins.values().find_map(|plugin| {
+                plugin.schema.value()["properties"]
+                    .as_object()?
+                    .values()
+                    .find_map(|node| {
+                        (node["format"] == "secret-reference"
+                            && node["const"].as_str() == Some(target.as_str()))
+                        .then(|| node["description"].as_str())
+                        .flatten()
+                    })
+            });
+            ui.push_id(target, |ui| {
+                ui.add(egui::Label::new(target.as_str()).wrap());
+                if let Some(hint) = hint {
+                    ui.add(egui::Label::new(egui::RichText::new(hint).weak()).wrap());
+                }
+                input.poll_presence(ui.ctx(), target);
+                match &input.presence {
+                    Some(Ok(true)) => {
+                        ui.label("Saved in system password store");
+                    }
+                    Some(Ok(false)) => {
+                        ui.weak("Credential not set");
+                    }
+                    Some(Err(error)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                    None => {
+                        ui.weak("Checking saved credential…");
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut *input.text)
+                            .password(true)
+                            .hint_text("New credential value")
+                            .desired_width(ui.available_width().clamp(100.0, 280.0))
+                            .char_limit(8192),
+                    );
+                    if ui
+                        .add_enabled(
+                            !blocked && !input.pending && !input.text.is_empty(),
+                            egui::Button::new("Store credential"),
+                        )
+                        .clicked()
+                    {
+                        let value =
+                            crate::secure_store::Secret::new(input.text.as_bytes().to_vec());
+                        input.text.zeroize();
+                        input.pending = true;
+                        input.presence_job = None;
+                        input.status = None;
+                        command = Some(UiCommand::StoreSettingSecret {
+                            target: target.clone(),
+                            value,
+                        });
+                    }
+                });
+                if let Some(status) = &input.status {
+                    ui.label(status);
+                }
+            });
+        }
+        command
     }
 
     pub(super) fn render(
@@ -143,7 +251,7 @@ impl RawSettingsEditor {
                 .add_enabled(!applying, egui::Button::new("Discard draft"))
                 .clicked()
             {
-                *self = Self::new(config, self.catalog.clone());
+                self.reset_draft(config);
             }
             if ui
                 .add_enabled(
@@ -315,45 +423,115 @@ impl RawSettingsEditor {
                     }
                 }
             }
-            for (target, input) in &mut self.secrets {
-                ui.push_id(target, |ui| {
-                    ui.label(target);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut *input.text)
-                            .password(true)
-                            .hint_text("New credential value")
-                            .char_limit(8192),
-                    );
-                    if ui
-                        .add_enabled(
-                            !busy && !applying && !input.pending && !input.text.is_empty(),
-                            egui::Button::new("Store credential"),
-                        )
-                        .clicked()
-                    {
-                        let value =
-                            crate::secure_store::Secret::new(input.text.as_bytes().to_vec());
-                        input.text.zeroize();
-                        input.pending = true;
-                        input.status = None;
-                        command = Some(UiCommand::StoreSettingSecret {
-                            target: target.clone(),
-                            value,
-                        });
-                    }
-                    if let Some(status) = &input.status {
-                        ui.label(status);
-                    }
-                });
+            if let Some(action) = self.render_credentials(ui, None, busy || applying) {
+                command = Some(action);
             }
         });
         command
     }
 }
 
+impl SecretInput {
+    fn poll_presence(&mut self, ctx: &egui::Context, target: &str) {
+        if self.pending {
+            return;
+        }
+        if let Some(job) = &self.presence_job {
+            match job.try_recv() {
+                Ok(result) => self.presence = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.presence = Some(Err("Could not check saved credential.".into()));
+                }
+            }
+            self.presence_job = None;
+        }
+        if self.presence.is_none() {
+            use crate::secure_store::{SecretStore, SystemSecretStore};
+            let (tx, rx) = std::sync::mpsc::channel();
+            let target = target.to_owned();
+            let ctx = ctx.clone();
+            match super::spawn_background(move || {
+                let present = SystemSecretStore
+                    .get(&target)
+                    .map(|value| value.is_some())
+                    .map_err(|_| "Could not access the system password store.".to_owned());
+                let _ = tx.send(present);
+                ctx.request_repaint();
+            }) {
+                Ok(()) => self.presence_job = Some(rx),
+                Err(error) => self.presence = Some(Err(error)),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_credentials_show_only_the_requested_namespace_and_mask_the_input() {
+        let ctx = egui::Context::default();
+        let mut editor = RawSettingsEditor::new(&AppConfig::default(), SettingsCatalog::default());
+        let chosen = "ArchiveSift/example.first/api";
+        let other = "ArchiveSift/example.second/api";
+        for target in [chosen, other] {
+            editor.secrets.insert(
+                target.into(),
+                SecretInput {
+                    text: Zeroizing::new("fixture-private-value".into()),
+                    presence: Some(Ok(target == chosen)),
+                    ..Default::default()
+                },
+            );
+        }
+        let frame = |editor: &mut RawSettingsEditor, events| {
+            let mut command = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        command = editor.render_plugin_credentials(ui, "example.first", false);
+                    });
+                },
+            );
+            (output, command)
+        };
+        let events = |pos, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        let (output, _) = frame(&mut editor, Vec::new());
+        let pos = position(&output, "Credentials");
+        frame(&mut editor, events(pos, true));
+        frame(&mut editor, events(pos, false));
+        let (output, _) = frame(&mut editor, Vec::new());
+        position(&output, chosen);
+        position(&output, "Saved in system password store");
+        let rendered = format!("{:?}", output.shapes);
+        assert!(!rendered.contains(other));
+        assert!(!rendered.contains("fixture-private-value"));
+        let pos = position(&output, "Store credential");
+        frame(&mut editor, events(pos, true));
+        let (_, command) = frame(&mut editor, events(pos, false));
+        assert!(
+            matches!(command, Some(UiCommand::StoreSettingSecret { target, .. }) if target == chosen)
+        );
+        assert!(editor.secrets[chosen].text.is_empty());
+        assert!(!editor.secrets[other].text.is_empty());
+    }
+
     fn render(
         editor: &mut RawSettingsEditor,
         config: &AppConfig,

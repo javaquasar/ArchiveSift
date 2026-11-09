@@ -143,6 +143,7 @@ impl ExtensionsManagerUi {
         ui: &mut egui::Ui,
         config: &AppConfig,
         blocked: bool,
+        mut credentials: impl FnMut(&mut egui::Ui, &str, bool) -> Option<UiCommand>,
     ) -> Option<UiCommand> {
         let mut command = None;
         ui.heading("Extensions");
@@ -345,6 +346,9 @@ impl ExtensionsManagerUi {
                             .wrap(),
                         );
                         ui.add(egui::Label::new(&status.message).wrap());
+                        if let Some(action) = credentials(ui, &status.id, busy || self.busy()) {
+                            command = Some(action);
+                        }
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(status.directory.to_string_lossy()).small(),
@@ -541,7 +545,7 @@ mod tests {
         for _ in 0..3 {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    editor.render(ui, &AppConfig::default(), false);
+                    editor.render(ui, &AppConfig::default(), false, |_, _, _| None);
                 });
             });
             assert!(editor.worker.is_none());

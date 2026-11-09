@@ -58,18 +58,19 @@ The application icon is embedded in the executable and native windows. Editable
 artwork, export instructions and the Linux desktop entry are in
 [assets/icons](assets/icons/README.md).
 
-The full desktop workspace opens on the first launch: **Scrape** contains source
-and destination settings, the URL queue and activity log; **Search** provides
-image filters and previews; **SQL** opens the database console. **Extensions**
-installs and checks parser packages, manages permissions and switches versions without
-restarting. See the [extension manager guide](docs/EXTENSION_MANAGER.md). Choose a download folder in Scrape to enable
-downloads. Search and SQL remain available without a download folder.
+**Scrape** puts the URL field, destination and queue on the main screen.
+**More** opens file import and scrape options. The bottom bar shows queue
+counts and opens **Operations** for failures, activity and PeerLume handoffs.
+**Search** offers image and torrent results, with additional fields under
+**Filters**. **SQL** opens the database console. **Extensions** manages parser
+packages and their credentials. Choose a download folder in Scrape to enable
+downloads. Search and SQL are available before setup.
 
 Configure the optional local download-client connection under **Settings →
-Integrations · PeerLume**. Setup, release scope, the wire contract and recovery
+Integrations → PeerLume**. Setup, release scope, the wire contract and recovery
 behavior are described in the [PeerLume integration release document](docs/releases/peerlume-integration.md).
 
-**Search → By Date** follows the selected Site filter for group counts, oldest/newest
+**Search → Browse → By Date** follows the selected Site filter for group counts, oldest/newest
 ordering and previous/next wraparound. Changing Site while browsing restarts at the
 first matching group; All sites restores browsing across sources.
 
@@ -120,9 +121,11 @@ images. Select a primary studio, edit tags/categories and confirm file moves in
 the card editor. See [Torrent library](docs/TORRENT_LIBRARY.md) for storage layout,
 migration, recovery and test details.
 
-**Settings → JSON** edits the full configuration with schema-based completion and
-validation. Plugins declare their options in `settings.schema.json`; credentials
-stay in the system password store. See [Configuration editor](docs/CONFIGURATION_EDITOR.md).
+**Settings → Appearance** saves the theme, control density and interface scale.
+**Settings → Advanced** opens the JSON editor with schema-based completion and
+validation. Use **Credentials** on an extension card to store its declared
+keys in the system password store. See the [configuration editor](docs/CONFIGURATION_EDITOR.md)
+and [extension manager guide](docs/EXTENSION_MANAGER.md).
 
 ## Adding a scraper
 

@@ -148,7 +148,16 @@ impl UrlQueueService {
     /// Returns only the requested pending-URL range plus bounded summary data.
     /// Range bounds are clamped to the current queue length.
     pub fn snapshot_range(&self, range: Range<usize>) -> crate::models::QueueSnapshot {
-        self.snapshot_from_store(range).unwrap_or_default()
+        self.snapshot_for_ui(range, false)
+    }
+
+    pub(crate) fn snapshot_for_ui(
+        &self,
+        range: Range<usize>,
+        include_failures: bool,
+    ) -> crate::models::QueueSnapshot {
+        self.snapshot_from_store(range, include_failures)
+            .unwrap_or_default()
     }
 
     /// Lightweight snapshot with counts, active items, and a bounded preview.
@@ -160,6 +169,7 @@ impl UrlQueueService {
     fn snapshot_from_store(
         &self,
         requested: Range<usize>,
+        include_failures: bool,
     ) -> rusqlite::Result<crate::models::QueueSnapshot> {
         let connection = self.store.connection.lock().unwrap();
         // The UI requests this snapshot frequently. Compute both counters in a
@@ -195,12 +205,26 @@ impl UrlQueueService {
         let in_progress = active_statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let failed_preview = if include_failures && failed_total > 0 {
+            let mut statement = connection.prepare_cached(
+                "SELECT url, substr(coalesce(last_error, 'Unknown error'), 1, 1024)
+                 FROM queue_items WHERE state = 'failed'
+                 ORDER BY updated_at DESC, id DESC LIMIT 10",
+            )?;
+            let failures = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            failures
+        } else {
+            Vec::new()
+        };
 
         Ok(crate::models::QueueSnapshot {
             paused: self.is_paused(),
             in_progress,
             pending_total,
             failed_total,
+            failed_preview,
             pending_start,
             pending: load_urls(pending_start, pending_end - pending_start)?,
             pending_preview: load_urls(0, QUEUE_PREVIEW_LIMIT)?,
@@ -244,7 +268,7 @@ impl UrlQueueService {
 
         let mut offset = 0;
         loop {
-            let snapshot = self.snapshot_from_store(offset..offset + PRUNE_BATCH_SIZE)?;
+            let snapshot = self.snapshot_from_store(offset..offset + PRUNE_BATCH_SIZE, false)?;
             if snapshot.pending.is_empty() {
                 break;
             }

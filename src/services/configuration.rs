@@ -126,6 +126,11 @@ pub fn schema(catalog: &SettingsCatalog) -> Result<SettingsSchema, String> {
         properties.get_mut(key).unwrap()["minimum"] = min.into();
         properties.get_mut(key).unwrap()["maximum"] = max.into();
     }
+    let appearance = &mut properties.get_mut("appearance").unwrap()["properties"];
+    appearance["theme"]["enum"] = json!(["system", "light", "dark"]);
+    appearance["density"]["enum"] = json!(["compact", "comfortable"]);
+    appearance["zoom_percent"]["minimum"] = crate::app::AppearanceConfig::MIN_ZOOM.into();
+    appearance["zoom_percent"]["maximum"] = crate::app::AppearanceConfig::MAX_ZOOM.into();
     properties.get_mut("database_path").unwrap()["minLength"] = 1.into();
     properties.insert("thumbnail_folder".into(),json!({"type":["string","null"],"minLength":1,"description":"Null uses the thumbnail folder next to the database"}));
     root["required"] = json!([

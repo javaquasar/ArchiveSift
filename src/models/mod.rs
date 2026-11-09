@@ -234,6 +234,8 @@ pub struct QueueSnapshot {
     pub pending_total: usize,
     /// URLs retained after a failed processing attempt.
     pub failed_total: usize,
+    /// Recent failed URLs and their errors for the operations panel.
+    pub failed_preview: Vec<(String, String)>,
     /// Queue index represented by `pending[0]`.
     pub pending_start: usize,
     /// Requested range of pending URLs, in queue order.

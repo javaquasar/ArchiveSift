@@ -294,6 +294,46 @@ impl PeerLumeUi {
         command
     }
 
+    pub(super) fn render_operations(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &AppConfig,
+        storage_busy: bool,
+    ) {
+        if !config.peerlume.enabled {
+            ui.weak("Enable PeerLume in Settings → Integrations.");
+            return;
+        }
+        if ui
+            .add_enabled(
+                !self.busy() && !storage_busy && self.review.is_empty(),
+                egui::Button::new("Refresh handoffs"),
+            )
+            .clicked()
+        {
+            self.update_history(ui.ctx(), config, true, false);
+        }
+        if self.busy() {
+            ui.weak("Working with PeerLume…");
+        }
+        if let Some(error) = &self.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if self.history.is_empty() {
+            ui.weak("No handoffs to show.");
+        }
+        egui::ScrollArea::vertical().max_height(300.0).show_rows(
+            ui,
+            176.0,
+            self.history.len(),
+            |ui, rows| {
+                for index in rows {
+                    history_card(ui, &self.history[index]);
+                }
+            },
+        );
+    }
+
     pub fn render(&mut self, ctx: &egui::Context, config: &AppConfig, storage_busy: bool) {
         if !self.open {
             return;
@@ -411,7 +451,16 @@ fn history_card(ui: &mut egui::Ui, record: &Handoff) {
         ui.set_width(ui.available_width());
         ui.add(egui::Label::new(&record.title).truncate()).on_hover_text(&record.title);
         let transfer = record.transfer.map_or("Not observed".into(), |s| format!("{s:?}"));
-        ui.add(egui::Label::new(format!("Handoff: {:?} · Transfer: {transfer}", record.state)).truncate());
+        let state = match record.state {
+            HandoffState::Submitting => "Sending request",
+            HandoffState::Accepted => "Request accepted · awaiting confirmation",
+            HandoffState::Added => "Confirmed · added",
+            HandoffState::Linked => "Confirmed · linked to existing transfer",
+            HandoffState::Failed => "Failed",
+            HandoffState::ReconciliationRequired => "Needs review",
+        };
+        ui.add(egui::Label::new(state).wrap());
+        ui.weak(format!("Transfer: {transfer}"));
         let setup = record.mode_setup.as_ref().map_or("".into(), |s| format!(" · Setup: {:?}",s.state));
         let observed = record.observed_mode.map_or("Not observed", |mode| mode.label());
         let label = format!("Requested: {} · PeerLume: {observed}{setup}",record.download_mode.mode.label());

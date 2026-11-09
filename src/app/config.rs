@@ -89,6 +89,50 @@ impl PreviewOpenMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiTheme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    Compact,
+    #[default]
+    Comfortable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    pub theme: UiTheme,
+    pub density: UiDensity,
+    pub zoom_percent: u16,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            theme: UiTheme::System,
+            density: UiDensity::Comfortable,
+            zoom_percent: 100,
+        }
+    }
+}
+
+impl AppearanceConfig {
+    pub const MIN_ZOOM: u16 = 75;
+    pub const MAX_ZOOM: u16 = 200;
+
+    fn normalize(&mut self) {
+        self.zoom_percent = self.zoom_percent.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScrapeLayoutConfig {
     #[serde(default = "default_scrape_compact_breakpoint")]
@@ -205,6 +249,8 @@ pub struct AppConfig {
     /// Responsive layout tuning for the Scrape tab.
     #[serde(default)]
     pub scrape_layout: ScrapeLayoutConfig,
+    #[serde(default)]
+    pub appearance: AppearanceConfig,
 }
 
 impl Default for AppConfig {
@@ -234,6 +280,7 @@ impl Default for AppConfig {
             request_delay_min_ms: 1_000,
             request_delay_max_ms: 3_000,
             scrape_layout: ScrapeLayoutConfig::default(),
+            appearance: AppearanceConfig::default(),
         }
     }
 }
@@ -285,6 +332,7 @@ impl AppConfig {
         config.normalize_download_history();
         config.normalize_performance_limits();
         config.scrape_layout = config.scrape_layout.normalized();
+        config.appearance.normalize();
         Ok(config)
     }
 
@@ -298,6 +346,7 @@ impl AppConfig {
         config.normalize_download_history();
         config.normalize_performance_limits();
         config.scrape_layout = config.scrape_layout.normalized();
+        config.appearance.normalize();
 
         let json = serde_json::to_string_pretty(&config).map_err(|source| {
             ConfigError::SerializeConfig {
@@ -407,6 +456,7 @@ impl AppConfig {
     fn migrate_to_current_version(&mut self) {
         self.config_version = CURRENT_CONFIG_VERSION;
         self.scrape_layout = self.scrape_layout.normalized();
+        self.appearance.normalize();
     }
 
     fn path() -> PathBuf {

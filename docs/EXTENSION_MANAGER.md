@@ -35,7 +35,7 @@ plugins/
 `extensions-state.json` contains active/previous version pointers, enabled state,
 per-version origin grants, publisher public keys, native approvals, settings
 snapshots and optional update sources. Actual plugin settings remain editable in
-Settings → JSON. Snapshot values contain configuration and secret references;
+Settings → Advanced. Snapshot values contain configuration and secret references;
 passwords, session cookies and tokens remain in the system password store.
 An installer does not modify the publisher manifest or replace older directories.
 Publishing different bytes under the same semantic version is rejected.

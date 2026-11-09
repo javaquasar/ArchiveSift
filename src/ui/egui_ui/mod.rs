@@ -1,6 +1,7 @@
 mod account_settings;
 mod agent_access;
 mod app_window;
+mod appearance;
 mod background_executor;
 mod coalescing_worker;
 mod creator_filter;
@@ -1412,14 +1413,19 @@ impl DesktopApp {
             }
         }
 
-        // Only clone the full pending URL list when the queue window is actually
-        // visible — with 1000+ URLs in the queue, doing this every frame causes
-        // noticeable UI lag on every keystroke.
+        // Load a bounded slice only when the queue or its details are visible.
         {
             let window = &mut self.window;
-            if window.queue_window_open {
-                let range = window.queue_visible_range.clone();
-                window.queue_snapshot = Arc::new(self.queue_service.snapshot_range(range));
+            let rows = window.needs_queue_rows();
+            let details = window.needs_queue_failures();
+            if rows || details {
+                let range = if rows {
+                    window.queue_visible_range.clone()
+                } else {
+                    0..0
+                };
+                window.queue_snapshot =
+                    Arc::new(self.queue_service.snapshot_for_ui(range, details));
             } else {
                 // Lightweight update: just the paused flag and in-progress items
                 // (typically ≤ 16 entries), no full pending clone.
@@ -2689,6 +2695,7 @@ mod startup_ui_tests {
         assert!(!app.window.agent_access.enabled);
         let output = render(&mut app, &context, egui::vec2(1900.0, 1400.0), Vec::new());
         let output = click_label(&mut app, &context, &output, "Settings");
+        let output = click_label(&mut app, &context, &output, "Agent access");
         assert_labels(
             &output,
             &["Agent access · MCP", "Allow agents to use this application"],
@@ -2931,6 +2938,16 @@ mod startup_ui_tests {
         output: &egui::FullOutput,
         label: &str,
     ) -> egui::FullOutput {
+        click_label_at_size(app, context, output, label, egui::vec2(1900.0, 1400.0))
+    }
+
+    fn click_label_at_size(
+        app: &mut DesktopApp,
+        context: &egui::Context,
+        output: &egui::FullOutput,
+        label: &str,
+        size: egui::Vec2,
+    ) -> egui::FullOutput {
         let pos = rendered_text(output)
             .into_iter()
             .find(|(text, _)| text == label)
@@ -2941,7 +2958,7 @@ mod startup_ui_tests {
             let _ = render(
                 app,
                 context,
-                egui::vec2(1900.0, 1400.0),
+                size,
                 vec![
                     egui::Event::PointerMoved(pos),
                     egui::Event::PointerButton {
@@ -2953,38 +2970,123 @@ mod startup_ui_tests {
                 ],
             );
         }
-        render(app, context, egui::vec2(1900.0, 1400.0), Vec::new())
+        render(app, context, size, Vec::new())
     }
 
     #[test]
     fn fresh_start_exposes_workspace_settings_queue_and_activity_log() {
         let (mut app, _root, context) = test_app(false);
         app.window.log.push("Download progress is visible here");
-        for size in [egui::vec2(800.0, 600.0), egui::vec2(1900.0, 1400.0)] {
+        for (size, zoom) in [
+            (egui::vec2(800.0, 600.0), 100),
+            (egui::vec2(800.0 / 1.5, 600.0 / 1.5), 150),
+        ] {
+            app.window.config.appearance.zoom_percent = zoom;
+            let _ = render(&mut app, &context, size, Vec::new());
             let output = render(&mut app, &context, size, Vec::new());
-            assert_labels(
-                &output,
-                &["Scrape", "Search", "SQL", "Extensions", "Source"],
-            );
-            if size.x > 1440.0 {
-                assert_labels(
-                    &output,
-                    &[
-                        "Destination",
-                        "Download folder",
-                        "Queue",
-                        "Activity",
-                        "Download progress is visible here",
-                        "Select a download directory to enable scraping.",
-                    ],
-                );
-                let output = click_label(&mut app, &context, &output, "Add URL to Queue");
-                assert_labels(&output, &["Source", "Activity"]);
-                assert!(!app.worker_running);
-                assert!(!app.queue_service.has_pending_work());
-                assert!(app.window.error.is_none());
+            let expected = [
+                "Scrape",
+                "Search",
+                "SQL",
+                "Extensions",
+                "Settings",
+                "Content or listing URL",
+                "Add to queue",
+                "Destination",
+                "Queue",
+                "Operations",
+                "0 active · 0 pending · 0 failed",
+            ];
+            assert_labels(&output, &expected);
+            for (label, bounds) in rendered_text(&output) {
+                if expected.contains(&label.as_str()) {
+                    assert!(bounds.left() >= 0.0 && bounds.top() >= 0.0);
+                    assert!(
+                        bounds.right() <= size.x && bounds.bottom() <= size.y,
+                        "{label} is clipped at {zoom}%: {bounds:?}"
+                    );
+                }
             }
+            let output = click_label_at_size(&mut app, &context, &output, "Add to queue", size);
+            assert!(!app.worker_running);
+            assert!(!app.queue_service.has_pending_work());
+            let output = click_label_at_size(&mut app, &context, &output, "Activity", size);
+            assert_labels(&output, &["Download progress is visible here"]);
+            let _ = click_label_at_size(&mut app, &context, &output, "Operations", size);
         }
+    }
+
+    #[test]
+    fn narrow_image_search_shows_results_before_details_and_returns_to_the_grid() {
+        use crate::models::{SearchImageResult, SearchPageSummary};
+        let (mut app, _root, context) = test_app(true);
+        app.window.config.appearance.zoom_percent = 150;
+        let size = egui::vec2(800.0 / 1.5, 600.0 / 1.5);
+        let _ = render(&mut app, &context, size, Vec::new());
+        let output = render(&mut app, &context, size, Vec::new());
+        let _ = click_label_at_size(&mut app, &context, &output, "Search", size);
+        let page = Arc::new(SearchPageSummary {
+            page_id: 1,
+            url: "https://example.test/page".into(),
+            title: "First result".into(),
+            attributes: Arc::new(Vec::new()),
+        });
+        app.window.set_search_results(vec![SearchImageResult {
+            image_id: 1,
+            source_url: "https://example.test/image.jpg".into(),
+            page,
+            preview_url: None,
+            local_file_path: None,
+            thumbnail_path: None,
+            is_favorite: false,
+            attributes: Arc::new(Vec::new()),
+        }]);
+        let output = render(&mut app, &context, size, Vec::new());
+        assert_labels(
+            &output,
+            &["Run Search", "Filters (0)", "Results (1)", "First result"],
+        );
+        let (label, bounds) = rendered_text(&output)
+            .into_iter()
+            .find(|(label, _)| label == "First result")
+            .unwrap();
+        assert!(
+            bounds.bottom() < size.y,
+            "{label} must fit above the footer"
+        );
+        assert!(!rendered_text(&output)
+            .iter()
+            .any(|(label, _)| label == "Details"));
+        let output = click_label_at_size(&mut app, &context, &output, "First result", size);
+        assert_labels(&output, &["Details", "Back to results", "Links and paths"]);
+        assert!(!rendered_text(&output)
+            .iter()
+            .any(|(label, _)| label == "Results (1)"));
+        let output = click_label_at_size(&mut app, &context, &output, "Back to results", size);
+        assert_labels(&output, &["Results (1)", "First result"]);
+    }
+
+    #[test]
+    fn operations_shows_persisted_queue_error_and_retry_after_switching_tabs() {
+        let (mut app, _root, context) = test_app(false);
+        app.queue_service
+            .mark_failed("https://example.test/fixture", "Fixture download failed");
+        let size = egui::vec2(800.0, 600.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label_at_size(&mut app, &context, &output, "Search", size);
+        assert_labels(
+            &output,
+            &["0 active · 0 pending · 1 failed", "Retry failed"],
+        );
+        let output = click_label_at_size(&mut app, &context, &output, "Operations", size);
+        assert_labels(
+            &output,
+            &["Recent failures · 1 total", "Fixture download failed"],
+        );
+        let _ = click_label_at_size(&mut app, &context, &output, "Retry failed", size);
+        let snapshot = app.queue_service.snapshot_light();
+        assert_eq!(snapshot.failed_total, 0);
+        assert_eq!(snapshot.pending_total, 1);
     }
 
     #[test]
@@ -2994,7 +3096,19 @@ mod startup_ui_tests {
         let output = click_label(&mut app, &context, &output, "Search");
         assert_labels(
             &output,
-            &["Text", "Site", "Tags", "Actors", "Categories", "Studios"],
+            &[
+                "Search images",
+                "All sites",
+                "Tags",
+                "Run Search",
+                "Filters (0)",
+                "Browse",
+            ],
+        );
+        let output = click_label(&mut app, &context, &output, "Filters (0)");
+        assert_labels(
+            &output,
+            &["Actors", "Categories", "Studios", "Apply filters"],
         );
         let output = click_label(&mut app, &context, &output, "SQL");
         assert_labels(&output, &["SQL Console", "Ctrl+Enter"]);
@@ -3013,7 +3127,10 @@ mod startup_ui_tests {
             ],
         );
         let output = click_label(&mut app, &context, &output, "Scrape");
-        assert_labels(&output, &["Source", "Destination", "Queue", "Activity"]);
+        assert_labels(
+            &output,
+            &["Content or listing URL", "Destination", "Queue", "Activity"],
+        );
     }
 
     #[test]
