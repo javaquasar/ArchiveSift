@@ -76,6 +76,23 @@ impl
         config: &AppConfig,
         source_url: &str,
     ) -> AppResult<Vec<String>> {
+        self.run_page(config, source_url, false).await
+    }
+
+    pub(crate) async fn repair_page_images(
+        &self,
+        config: &AppConfig,
+        source_url: &str,
+    ) -> AppResult<Vec<String>> {
+        self.run_page(config, source_url, true).await
+    }
+
+    async fn run_page(
+        &self,
+        config: &AppConfig,
+        source_url: &str,
+        images_only: bool,
+    ) -> AppResult<Vec<String>> {
         self.database.initialize()?;
         self.ui.print_database_path(&config.database_path);
 
@@ -87,9 +104,13 @@ impl
             })?;
 
         match scraper.classify_url(source_url) {
+            PageKind::Listing if images_only => {
+                Err("An image repair requires a saved content page.".into())
+            }
             PageKind::Listing => self.process_listing_url(scraper, config, source_url).await,
             PageKind::Content | PageKind::Unknown => {
-                self.process_content_url(scraper, config, source_url).await
+                self.process_content_url(scraper, config, source_url, images_only)
+                    .await
             }
         }
     }
@@ -132,6 +153,7 @@ impl
         scraper: &dyn crate::scraper::ContentScraper,
         config: &AppConfig,
         source_url: &str,
+        images_only: bool,
     ) -> AppResult<Vec<String>> {
         let settings = scraper
             .extension_id()
@@ -139,6 +161,9 @@ impl
         let mut page = scraper
             .scrape_content_configured(source_url, settings)
             .await?;
+        if images_only && page.page_url != source_url {
+            return Err("The extension returned a different page for this image repair.".into());
+        }
         let content_lock = self.database.content_lock(&page.page_url);
         let _guard = content_lock.lock_owned().await;
         let recovery_database = self.database.clone();
@@ -155,26 +180,43 @@ impl
         .await??;
         self.log_content_discovery(&page);
 
-        let persisted = self.database.upsert_scraped_item(&page)?;
+        let mut persisted = if images_only {
+            self.database.upsert_repair_images(&page)?
+        } else {
+            self.database.upsert_scraped_item(&page)?
+        };
         // The diagnostic HTML has been archived transactionally. Release the
         // potentially large allocation before image downloads start.
         page.raw_html = String::new();
-        self.apply_preset_attributes(
-            config,
-            &persisted
-                .image_ids_by_url
-                .values()
-                .copied()
-                .collect::<Vec<_>>(),
-        )?;
+        if images_only {
+            // A fresh parse can discover more images or refresh signed URLs.
+            // Keep retrying saved images that the parser omitted this time.
+            for (id, image) in self.database.page_repair_images(persisted.page_id)? {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    persisted.image_ids_by_url.entry(image.source_url.clone())
+                {
+                    entry.insert(id);
+                    page.images.push(image);
+                }
+            }
+        } else {
+            self.apply_preset_attributes(
+                config,
+                &persisted
+                    .image_ids_by_url
+                    .values()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )?;
 
-        super::attachments::save_description(
-            &page,
-            persisted.page_id,
-            &self.database,
-            &self.base_dir,
-        )
-        .await?;
+            super::attachments::save_description(
+                &page,
+                persisted.page_id,
+                &self.database,
+                &self.base_dir,
+            )
+            .await?;
+        }
 
         let requests =
             self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)?;
@@ -183,9 +225,13 @@ impl
                 requests,
                 config.effective_concurrent_image_downloads(),
                 scraper.asset_origins(),
+                images_only,
             )
             .await;
 
+        if images_only {
+            return image_result.map(|()| Vec::new());
+        }
         let attachment_result = super::attachments::download(
             &page,
             persisted.page_id,
@@ -284,29 +330,39 @@ impl
         requests: Vec<DownloadRequest>,
         max_concurrent_downloads: usize,
         asset_origins: Option<&[String]>,
+        repair_empty: bool,
     ) -> AppResult<()> {
         let restricted_client = asset_origins.map(OriginRestrictedClient::new).transpose()?;
         let results = stream::iter(requests)
-            .map(|request| self.download_one(request, restricted_client.as_ref()))
+            .map(|request| self.download_one(request, restricted_client.as_ref(), repair_empty))
             .buffer_unordered(max_concurrent_downloads.max(1))
             .collect::<Vec<_>>()
             .await;
         let total = results.len();
         let mut artifacts = Vec::with_capacity(total);
         let mut failed = 0;
+        let mut cause = None;
         for result in results {
             match result {
                 Ok(artifact) => artifacts.push(artifact),
                 Err(error) => {
                     failed += 1;
                     self.ui.print_download_failed(error.as_ref());
+                    if cause.is_none() {
+                        cause = Some(error);
+                    }
                 }
             }
         }
 
         self.database.update_image_artifacts_batch(&artifacts)?;
-        if failed > 0 {
-            return Err(format!("{failed} of {total} images could not be downloaded. Retry this page to download missing images; saved files are retained.").into());
+        if let Some(cause) = cause {
+            return Err(crate::error::IncompleteImages {
+                failed,
+                total,
+                cause,
+            }
+            .into());
         }
         Ok(())
     }
@@ -315,6 +371,7 @@ impl
         &self,
         mut request: DownloadRequest,
         restricted_client: Option<&OriginRestrictedClient>,
+        repair_empty: bool,
     ) -> AppResult<ImageArtifactUpdate> {
         self.ui.print_download_target(&request.image_url);
 
@@ -340,12 +397,14 @@ impl
             let mut file = tokio::fs::File::open(&absolute).await?;
             let mut header = [0; 32];
             let size = file.read(&mut header).await?;
-            if image::guess_format(&header[..size]).is_err() {
-                return Err("existing image file has an invalid image header".into());
+            if size > 0 || !repair_empty {
+                if image::guess_format(&header[..size]).is_err() {
+                    return Err("existing image file has an invalid image header".into());
+                }
+                self.ui.print_output_file(&absolute_str);
+                self.ui.print_skipped_existing(&absolute_str);
+                return Ok(self.prepare_local_artifact(&request, &absolute).await);
             }
-            self.ui.print_output_file(&absolute_str);
-            self.ui.print_skipped_existing(&absolute_str);
-            return Ok(self.prepare_local_artifact(&request, &absolute).await);
         }
 
         let limited_response = match restricted_client {
@@ -674,7 +733,7 @@ mod tests {
                 page_id: 1,
                 relative_path: "scene/image.jpg".into(),
             };
-            assert!(service.download_one(request, None).await.is_err());
+            assert!(service.download_one(request, None, false).await.is_err());
             assert!(!root.path().join("downloads/scene/image.jpg").exists());
             server.await.unwrap();
         }
@@ -701,7 +760,7 @@ mod tests {
             page_id: 1,
             relative_path: "image.jpg".into(),
         };
-        assert!(service.download_one(request, None).await.is_err());
+        assert!(service.download_one(request, None, false).await.is_err());
         assert_eq!(std::fs::read(path).unwrap(), data);
     }
 
@@ -757,7 +816,7 @@ mod tests {
         };
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        for attachment_fails in [false, true] {
+        for (attachment_fails, images_only) in [(false, false), (true, false), (false, true)] {
             let root = tempfile::tempdir().unwrap();
             let fixture = root.path().join("fixture.png");
             ImageBuffer::from_pixel(8, 8, Rgb([1u8, 2, 3]))
@@ -820,7 +879,7 @@ mod tests {
                 is_female: None,
             });
             let attachment_calls = Arc::new(AtomicUsize::new(0));
-            let scraper = RetryFixtureScraper {
+            let mut scraper = RetryFixtureScraper {
                 page: page.clone(),
                 attachment_calls: attachment_calls.clone(),
                 attachment_fails,
@@ -828,7 +887,7 @@ mod tests {
             let database = Database::new(root.path().join("library.db"));
             database.initialize().unwrap();
             let config = AppConfig::default();
-            let service = ContentDownloadService::new(
+            let mut service = ContentDownloadService::new(
                 ScraperRegistry::new(),
                 database,
                 FileDownloadStore::new(),
@@ -838,7 +897,7 @@ mod tests {
                 root.path().join("thumbs"),
             );
             let error = service
-                .process_content_url(&scraper, &config, &page.page_url)
+                .process_content_url(&scraper, &config, &page.page_url, false)
                 .await
                 .unwrap_err()
                 .to_string();
@@ -869,9 +928,67 @@ mod tests {
                 );
             }
             recovered.store(true, Ordering::SeqCst);
-            let retried = service
-                .process_content_url(&scraper, &config, &page.page_url)
-                .await;
+            let retried = if images_only {
+                let (page_id, image_id): (i64, i64) = connection
+                    .query_row(
+                        "SELECT page_id, image_id FROM page_images WHERE local_file_path IS NULL",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let folder = service
+                    .database
+                    .torrent_directory(page_id)
+                    .unwrap()
+                    .unwrap();
+                let empty = folder.join("images").join("empty.png");
+                std::fs::write(service.base_dir.join(&empty), []).unwrap();
+                service
+                    .database
+                    .update_image_file_location(page_id, image_id, &empty.to_string_lossy())
+                    .unwrap();
+
+                let read_attachments = || {
+                    service
+                        .database
+                        .torrent_card(page_id)
+                        .unwrap()
+                        .attachments
+                        .into_iter()
+                        .map(|attachment| {
+                            let bytes =
+                                std::fs::read(service.base_dir.join(&attachment.local_file_path))
+                                    .unwrap();
+                            (attachment.local_file_path, bytes)
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                };
+                let saved_attachments = read_attachments();
+
+                // Repair preserves the saved title and sidecars and also retries
+                // the known image even when a fresh parse omits its URL.
+                scraper.page.title = "Changed remote title".into();
+                scraper.page.attributes.clear();
+                scraper.page.images.pop();
+                service.scraper_registry.register(Box::new(scraper));
+                let result = service.repair_page_images(&config, &page.page_url).await;
+                let card = service.database.torrent_card(page_id).unwrap();
+                assert_eq!(card.title, page.title);
+                assert_eq!(saved_attachments.len(), 2);
+                assert_eq!(read_attachments(), saved_attachments);
+                assert_eq!(attachment_calls.load(Ordering::SeqCst), 1);
+                assert!(
+                    std::fs::metadata(service.base_dir.join(empty))
+                        .unwrap()
+                        .len()
+                        > 0
+                );
+                result
+            } else {
+                service
+                    .process_content_url(&scraper, &config, &page.page_url, false)
+                    .await
+            };
             if attachment_fails {
                 assert!(retried
                     .unwrap_err()
@@ -947,7 +1064,7 @@ mod tests {
             thumb_dir,
         );
         service
-            .execute_downloads(requests, 2, None)
+            .execute_downloads(requests, 2, None, false)
             .await
             .expect("finalize existing files");
 

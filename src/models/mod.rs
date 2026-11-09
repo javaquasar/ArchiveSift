@@ -92,7 +92,7 @@ pub struct UrlQueueReport {
     pub decisions: Vec<UrlQueueDecision>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchQuery {
     pub text: String,
     /// Exact scraper/site identifier, for example `demo-site`.
@@ -234,8 +234,9 @@ pub struct QueueSnapshot {
     pub pending_total: usize,
     /// URLs retained after a failed processing attempt.
     pub failed_total: usize,
+    pub failed_matches: usize,
     /// Recent failed URLs and their errors for the operations panel.
-    pub failed_preview: Vec<(String, String)>,
+    pub failed_preview: Vec<QueueFailure>,
     /// Queue index represented by `pending[0]`.
     pub pending_start: usize,
     /// Requested range of pending URLs, in queue order.
@@ -243,6 +244,41 @@ pub struct QueueSnapshot {
     /// Small prefix used by the scrape-tab summary. It is bounded independently
     /// from the visible queue-window range.
     pub pending_preview: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueueFailureKind {
+    Storage,
+    Authorization,
+    #[default]
+    Download,
+}
+
+impl QueueFailureKind {
+    pub const ALL: [Self; 3] = [Self::Storage, Self::Authorization, Self::Download];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Storage => "Storage",
+            Self::Authorization => "Authorization",
+            Self::Download => "Download",
+        }
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Authorization => "authorization",
+            Self::Download => "download",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QueueFailure {
+    pub url: String,
+    pub error: String,
+    pub kind: QueueFailureKind,
 }
 
 // Page-kind classification

@@ -372,6 +372,15 @@ pub enum UiCommand {
     PauseQueue,
     ResumeQueue,
     RetryFailedQueue,
+    RetryQueueItem {
+        url: String,
+    },
+    RepairPageImages {
+        url: String,
+    },
+    OpenQueuedCard {
+        url: String,
+    },
     ClearPendingQueue,
     /// Execute an arbitrary SQL query and return column names + rows.
     RunSqlQuery {

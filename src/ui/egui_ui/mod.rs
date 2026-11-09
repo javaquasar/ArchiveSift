@@ -5,6 +5,7 @@ mod appearance;
 mod background_executor;
 mod coalescing_worker;
 mod creator_filter;
+mod download_status;
 mod extensions_manager;
 mod icon;
 mod peerlume;
@@ -859,6 +860,29 @@ impl DesktopApp {
         }
     }
 
+    fn refresh_downloaded_images(&mut self) {
+        self.cancel_metadata();
+        let window = &mut self.window;
+        let service = SearchService::new(Database::new(&window.config.database_path));
+        let seq = window.search_seq;
+        let limit = window.search_result_limit();
+        let refresh = window.search_refresh();
+        let cancellation = QueryCancellation::default();
+        if let Some(previous) = self.search_cancellation.replace(cancellation.clone()) {
+            previous.cancel();
+        }
+        let state_tx = self.state_tx.clone();
+        window.running = true;
+        if let Err(error) = spawn_background(move || {
+            let result = reload_search_window(&service, &refresh, limit, &cancellation)
+                .map_err(|error| error.to_string());
+            let _ = state_tx.send(WorkerState::DownloadSearchRefreshed { seq, result });
+        }) {
+            window.running = false;
+            window.log.push(error);
+        }
+    }
+
     fn start_tag_suggestions(&mut self, database_path: String, query: String) {
         self.suggestion_worker.submit(
             SuggestionKind::Tag,
@@ -1120,8 +1144,8 @@ impl DesktopApp {
                 log,
             );
             let worker_state = match result {
-                Ok(()) => WorkerState::QueueFinished(Ok(())),
-                Err(error) => WorkerState::QueueFinished(Err(error.to_string())),
+                Ok(()) => WorkerState::RescrapeFinished(Ok(())),
+                Err(error) => WorkerState::RescrapeFinished(Err(error.to_string())),
             };
             let _ = state_tx.send(worker_state);
         }) {
@@ -1133,6 +1157,7 @@ impl DesktopApp {
     fn start_processor_if_needed(&mut self, config: AppConfig) {
         if !config.has_download_folder()
             || self.worker_running
+            || self.queue_service.is_paused()
             || !self.queue_service.has_pending_work()
         {
             return;
@@ -1140,7 +1165,6 @@ impl DesktopApp {
 
         let window = &mut self.window;
         self.worker_running = true;
-        window.running = true;
         window.log.push("Starting queued URL processing...");
 
         let state_tx = self.state_tx.clone();
@@ -1150,8 +1174,14 @@ impl DesktopApp {
         let live_presets = Arc::clone(&self.live_presets);
 
         if let Err(error) = spawn_background(move || {
-            let result =
-                run_queue_processor(config, queue_service, log, max_parallel, live_presets);
+            let result = run_queue_processor(
+                config,
+                queue_service,
+                log,
+                max_parallel,
+                live_presets,
+                &state_tx,
+            );
             let worker_state = match result {
                 Ok(()) => WorkerState::QueueFinished(Ok(())),
                 Err(error) => WorkerState::QueueFinished(Err(error.to_string())),
@@ -1159,7 +1189,6 @@ impl DesktopApp {
             let _ = state_tx.send(worker_state);
         }) {
             self.worker_running = false;
-            self.window.running = false;
             self.window.error = Some(error);
         }
     }
@@ -1227,8 +1256,7 @@ impl DesktopApp {
                     self.worker_running = false;
                     {
                         let w = &mut self.window;
-                        w.running = false;
-                        w.error = None;
+                        w.invalidate_library_sites();
                         w.log.push("Queue finished.");
                     }
                     let cfg = self.window.config.clone();
@@ -1238,12 +1266,59 @@ impl DesktopApp {
                     self.worker_running = false;
                     {
                         let w = &mut self.window;
-                        w.running = false;
                         w.error = Some(error.clone());
                         w.log.push(format!("Queue failed: {}", error));
                     }
                     let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
+                }
+                WorkerState::RescrapeFinished(result) => {
+                    self.window.running = false;
+                    self.window.error = result.err();
+                }
+                WorkerState::ContentFinished {
+                    url,
+                    message,
+                    repair,
+                } => {
+                    self.window.page_download_finished(&url, &message, repair);
+                }
+                WorkerState::LibrarySitesLoaded {
+                    database_path,
+                    result,
+                } => {
+                    if self.window.config.database_path == database_path {
+                        match result {
+                            Ok(sites) => self.window.set_library_sites(sites),
+                            Err(error) => self
+                                .window
+                                .log
+                                .push(format!("Could not read library sources: {error}")),
+                        }
+                    }
+                }
+                WorkerState::QueuedCardLoaded {
+                    database_path,
+                    url,
+                    result,
+                } => {
+                    if self.window.config.database_path == database_path
+                        && self.window.queued_card_lookup.as_ref() == Some(&url)
+                    {
+                        self.window.queued_card_resolved(ctx, result);
+                    }
+                }
+                WorkerState::DownloadSearchRefreshed { seq, result } => {
+                    if seq == self.window.search_seq {
+                        self.window.running = false;
+                        match result {
+                            Ok(page) => self.window.apply_download_refresh(page),
+                            Err(error) => self
+                                .window
+                                .log
+                                .push(format!("Could not refresh downloaded images: {error}")),
+                        }
+                    }
                 }
                 WorkerState::SearchFinished {
                     seq,
@@ -1417,8 +1492,8 @@ impl DesktopApp {
         {
             let window = &mut self.window;
             let rows = window.needs_queue_rows();
-            let details = window.needs_queue_failures();
-            if rows || details {
+            let details = window.queue_failures();
+            if rows || details.is_some() {
                 let range = if rows {
                     window.queue_visible_range.clone()
                 } else {
@@ -1727,8 +1802,72 @@ impl DesktopApp {
                     let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
                 }
+                UiCommand::RetryQueueItem { url } => {
+                    if self.window.config.has_download_folder()
+                        && !self.window.storage_settings_applying()
+                    {
+                        match self.queue_service.retry_failure(&url) {
+                            Ok(true) => {
+                                self.window.download_status.queued(url);
+                                self.window
+                                    .log
+                                    .push("Failed download returned to the queue.");
+                                self.start_processor_if_needed(self.window.config.clone());
+                            }
+                            Ok(false) => self
+                                .window
+                                .log
+                                .push("This download is no longer marked as failed."),
+                            Err(error) => self
+                                .window
+                                .log
+                                .push(format!("Could not retry download: {error}")),
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                UiCommand::RepairPageImages { url } => {
+                    if self.window.config.has_download_folder()
+                        && !self.window.storage_settings_applying()
+                    {
+                        match self.queue_service.enqueue_image_repair(&url) {
+                            Ok(_) => {
+                                self.window.download_status.queued(url);
+                                self.window.log.push("Image repair requested.");
+                                self.start_processor_if_needed(self.window.config.clone());
+                            }
+                            Err(error) => {
+                                self.window.download_status.complete(
+                                    &url,
+                                    &error.to_string(),
+                                    true,
+                                );
+                            }
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                UiCommand::OpenQueuedCard { url } => {
+                    let state_tx = self.state_tx.clone();
+                    let database_path = self.window.config.database_path.clone();
+                    if let Err(error) = spawn_background(move || {
+                        let result = Database::new(&database_path)
+                            .saved_page_location(&url)
+                            .map_err(|error| error.to_string());
+                        let _ = state_tx.send(WorkerState::QueuedCardLoaded {
+                            database_path,
+                            url,
+                            result,
+                        });
+                    }) {
+                        self.window.queued_card_resolved(ctx, Err(error));
+                    }
+                }
                 UiCommand::ClearPendingQueue => {
                     self.queue_service.clear_pending();
+                    self.window
+                        .download_status
+                        .clear_pending(&self.queue_service.snapshot_light().in_progress);
                     {
                         let w = &mut self.window;
                         w.log.push("Pending queue cleared.");
@@ -1767,6 +1906,26 @@ impl DesktopApp {
                     );
                 }
             }
+        }
+
+        if self.window.begin_library_sites_load() {
+            let database_path = self.window.config.database_path.clone();
+            let state_tx = self.state_tx.clone();
+            if let Err(error) = spawn_background(move || {
+                let result = Database::new(&database_path)
+                    .library_sites()
+                    .map_err(|error| error.to_string());
+                let _ = state_tx.send(WorkerState::LibrarySitesLoaded {
+                    database_path,
+                    result,
+                });
+            }) {
+                self.window.log.push(error);
+                self.window.invalidate_library_sites();
+            }
+        }
+        if self.window.take_download_refresh() {
+            self.refresh_downloaded_images();
         }
 
         if let Some(delay) =
@@ -1869,6 +2028,25 @@ enum WorkerState {
         result: Result<UrlQueueReport, String>,
     },
     QueueFinished(Result<(), String>),
+    RescrapeFinished(Result<(), String>),
+    ContentFinished {
+        url: String,
+        message: String,
+        repair: bool,
+    },
+    LibrarySitesLoaded {
+        database_path: String,
+        result: Result<Vec<String>, String>,
+    },
+    QueuedCardLoaded {
+        database_path: String,
+        url: String,
+        result: Result<Option<(i64, bool)>, String>,
+    },
+    DownloadSearchRefreshed {
+        seq: u64,
+        result: Result<SearchResultPage, String>,
+    },
     SearchFinished {
         seq: u64,
         append: bool,
@@ -1930,6 +2108,7 @@ fn run_queue_processor(
     log: UiLog,
     max_parallel: usize,
     live_presets: Arc<RwLock<LivePresets>>,
+    state_tx: &RepaintingSender<WorkerState>,
 ) -> AppResult<()> {
     let runtime = shared_async_runtime()
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
@@ -1942,15 +2121,15 @@ fn run_queue_processor(
         // Each future returns the processed URL plus any newly-discovered URLs
         // (non-empty only for listing pages).
         type BoxedFut = std::pin::Pin<
-            Box<dyn std::future::Future<Output = (String, AppResult<Vec<String>>)> + Send>,
+            Box<dyn std::future::Future<Output = (String, bool, AppResult<Vec<String>>)> + Send>,
         >;
         let mut active: FuturesUnordered<BoxedFut> = FuturesUnordered::new();
 
         loop {
             // Fill up to concurrency limit when not paused.
             while !queue_service.is_paused() && active.len() < concurrency {
-                match queue_service.take_next_url() {
-                    Some(url) => {
+                match queue_service.take_next_job() {
+                    Some((url, repair)) => {
                         let mut config = config.clone();
                         // Read the latest preset tags/categories from the shared
                         // RwLock so changes made in the UI take effect immediately
@@ -1963,6 +2142,14 @@ fn run_queue_processor(
                         let log = log.clone();
                         let scraper_registry = crate::scraper::global_registry().for_job(&mut config);
                         active.push(Box::pin(async move {
+                            let storage = if repair {
+                                tokio::fs::metadata(&base_dir).await.is_ok_and(|metadata| metadata.is_dir())
+                            } else {
+                                tokio::fs::create_dir_all(&base_dir).await.is_ok()
+                            };
+                            if !storage {
+                                return (url, repair, Err(crate::services::url_queue::StorageUnavailable.into()));
+                            }
                             // ── Random throttle delay ─────────────────────────
                             let delay_ms = sample_delay(
                                 config.request_delay_min_ms,
@@ -1985,8 +2172,12 @@ fn run_queue_processor(
                                 base_dir,
                                 thumb_dir,
                             );
-                            let result = service.run_for_url(&config, &url).await;
-                            (url, result)
+                            let result = if repair {
+                                service.repair_page_images(&config, &url).await
+                            } else {
+                                service.run_for_url(&config, &url).await
+                            };
+                            (url, repair, result)
                         }));
                     }
                     None => break,
@@ -2003,7 +2194,7 @@ fn run_queue_processor(
             }
 
             // Wait for any task to complete.
-            if let Some((url, result)) = active.next().await {
+            if let Some((url, repair, result)) = active.next().await {
                 if result.is_ok() {
                     queue_service.mark_finished(&url);
                 }
@@ -2036,10 +2227,18 @@ fn run_queue_processor(
                             }
                         }
                     }
-                    Ok(_) => {} // Content page — images were downloaded directly.
+                    Ok(_) => {
+                        let _ = state_tx.send(WorkerState::ContentFinished {
+                            url, repair, message: "Image download completed.".into()
+                        });
+                    }
                     Err(error) => {
-                        queue_service.mark_failed(&url, &error.to_string());
+                        let kind = crate::services::url_queue::download_failure_kind(error.as_ref());
+                        queue_service.mark_failed_with_kind(&url, &error.to_string(), kind);
                         log.push(format!("Download failed [{}]: {}", url, error));
+                        let _ = state_tx.send(WorkerState::ContentFinished {
+                            url, repair, message: format!("Download incomplete. {error}"),
+                        });
                     }
                 }
             }
@@ -2063,6 +2262,42 @@ fn run_search_page_job(
         app_window::SEARCH_PAGE_SIZE,
         cancellation,
     )
+}
+
+fn reload_search_window(
+    service: &SearchService,
+    refresh: &SearchRefresh,
+    limit: usize,
+    cancellation: &QueryCancellation,
+) -> AppResult<SearchResultPage> {
+    let mut items = Vec::new();
+    let mut cursor = None;
+    loop {
+        let remaining = limit.saturating_sub(items.len()).max(1);
+        let page = match refresh {
+            SearchRefresh::Query(query) => service.search_images_page_lightweight(
+                query,
+                cursor.as_ref(),
+                remaining,
+                cancellation,
+            )?,
+            SearchRefresh::RecentPages(pages) => service.search_recent_pages_page_lightweight(
+                *pages,
+                cursor.as_ref(),
+                remaining,
+                cancellation,
+            )?,
+        };
+        let empty = page.items.is_empty();
+        items.extend(page.items);
+        cursor = page.next_cursor;
+        if empty || cursor.is_none() || items.len() >= limit {
+            return Ok(SearchResultPage {
+                items,
+                next_cursor: cursor,
+            });
+        }
+    }
 }
 
 fn run_import_job(
@@ -3087,6 +3322,300 @@ mod startup_ui_tests {
         let snapshot = app.queue_service.snapshot_light();
         assert_eq!(snapshot.failed_total, 0);
         assert_eq!(snapshot.pending_total, 1);
+    }
+
+    #[test]
+    fn operation_opens_the_saved_card_and_repair_refreshes_it_in_place() {
+        use crate::models::{QueueFailureKind, ScrapedImage, ScrapedItem};
+        let (mut app, _root, context) = test_app(true);
+        let url = "https://demo.example.test/demo-site/galleries/summer-escape-001/";
+        let database = Database::new(&app.window.config.database_path);
+        database.initialize().unwrap();
+        let images = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ScrapedImage {
+                source_url: format!("https://example.test/{name}.png"),
+                preview_url: None,
+                alt_text: None,
+                width: None,
+                height: None,
+                sort_order: index as i64,
+                local_file_path: None,
+            })
+            .collect::<Vec<_>>();
+        let item = database
+            .upsert_scraped_item(&ScrapedItem {
+                site_key: "retired-example-extension".into(),
+                page_url: url.into(),
+                title: "Saved fixture card".into(),
+                raw_html: String::new(),
+                images: images.clone(),
+                attributes: vec![],
+            })
+            .unwrap();
+        let root = app.window.config.effective_download_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let save = |index: usize, file: &str| {
+            image::RgbImage::new(5, 5).save(root.join(file)).unwrap();
+            database
+                .update_image_file_location(
+                    item.page_id,
+                    item.image_ids_by_url[&images[index].source_url],
+                    file,
+                )
+                .unwrap();
+        };
+        save(0, "first.png");
+        app.queue_service.mark_failed_with_kind(
+            url,
+            "Fixture image failed",
+            QueueFailureKind::Download,
+        );
+        app.queue_service.mark_failed_with_kind(
+            "https://example.test/unrelated",
+            "Other credentials missing",
+            QueueFailureKind::Authorization,
+        );
+        app.queue_service.pause();
+
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label(&mut app, &context, &output, "Operations");
+        assert_labels(
+            &output,
+            &["Fixture image failed", "Other credentials missing"],
+        );
+
+        // The oldest row is the selected card. Locate its action under that row.
+        let text = rendered_text(&output);
+        let row = text
+            .iter()
+            .find(|(text, _)| text == "Fixture image failed")
+            .unwrap()
+            .1;
+        let pos = text
+            .iter()
+            .find(|(text, bounds)| text == "Open card" && bounds.top() >= row.bottom())
+            .unwrap()
+            .1
+            .center();
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                &context,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        let output = wait_for_label(&mut app, &context, size, "Images saved · 1 of 2");
+        assert_labels(
+            &output,
+            &[
+                "Showing images from one saved card",
+                "Saved fixture card",
+                "Download missing images",
+            ],
+        );
+        let output = click_label(&mut app, &context, &output, "Download missing images");
+        assert_labels(&output, &["Repair queued"]);
+        assert_eq!(app.queue_service.snapshot_light().pending_total, 1);
+        assert_eq!(app.queue_service.snapshot_light().failed_total, 1);
+
+        // Complete the queued repair as the download worker would.
+        app.queue_service.resume();
+        assert_eq!(app.queue_service.take_next_job(), Some((url.into(), true)));
+        save(1, "second.png");
+        app.queue_service.mark_finished(url);
+        app.state_tx
+            .send(WorkerState::ContentFinished {
+                url: url.into(),
+                message: "Image download completed.".into(),
+                repair: true,
+            })
+            .unwrap();
+        let output = wait_for_label(&mut app, &context, size, "Images saved · 2 of 2");
+        assert_labels(
+            &output,
+            &[
+                "Saved fixture card",
+                "Image download completed.",
+                "Check for missing images",
+            ],
+        );
+    }
+
+    #[test]
+    fn queue_row_retry_leaves_other_failures_and_the_pause_setting_intact() {
+        let (mut app, _root, context) = test_app(true);
+        let url = "https://example.test/only";
+        app.queue_service
+            .mark_failed("https://example.test/other", "Other failure");
+        app.queue_service.mark_failed(url, "Retry this one");
+        app.queue_service.pause();
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label(&mut app, &context, &output, "Operations");
+        let output = click_label(&mut app, &context, &output, "Retry");
+        assert_labels(&output, &["Other failure", "Paused"]);
+        let queue = app.queue_service.snapshot();
+        assert_eq!(queue.pending, [url]);
+        assert_eq!(queue.failed_total, 1);
+        assert!(queue.paused);
+    }
+
+    #[test]
+    fn download_refresh_keeps_results_beyond_one_database_page() {
+        use crate::models::{ScrapedImage, ScrapedItem};
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::new(root.path().join("library.sqlite3"));
+        database.initialize().unwrap();
+        let item = database
+            .upsert_scraped_item(&ScrapedItem {
+                site_key: "fixture".into(),
+                page_url: "https://example.test/page".into(),
+                title: "Large fixture".into(),
+                raw_html: String::new(),
+                attributes: Vec::new(),
+                images: (0..525)
+                    .map(|index| ScrapedImage {
+                        source_url: format!("https://example.test/{index}.png"),
+                        preview_url: None,
+                        alt_text: None,
+                        width: None,
+                        height: None,
+                        sort_order: index,
+                        local_file_path: None,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        let refresh = SearchRefresh::Query(SearchQuery {
+            page_id: Some(item.page_id),
+            ..Default::default()
+        });
+        let page = reload_search_window(
+            &SearchService::new(database),
+            &refresh,
+            520,
+            &QueryCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 520);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|image| image.image_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            520
+        );
+        assert!(page.next_cursor.is_some());
+    }
+
+    #[test]
+    fn both_searches_offer_historical_sites_and_only_apply_submitted_filters() {
+        use crate::models::{MetadataAttribute, ScrapedImage, ScrapedItem};
+        let (mut app, _root, context) = test_app(false);
+        let database = Database::new(&app.window.config.database_path);
+        database.initialize().unwrap();
+        for site in ["retired-example", "other-example"] {
+            database
+                .upsert_scraped_item(&ScrapedItem {
+                    site_key: site.into(),
+                    page_url: format!("https://example.test/{site}/"),
+                    title: format!("Fixture for {site}"),
+                    raw_html: String::new(),
+                    images: vec![ScrapedImage {
+                        source_url: format!("https://example.test/{site}/image.jpg"),
+                        preview_url: None,
+                        alt_text: None,
+                        width: None,
+                        height: None,
+                        sort_order: 0,
+                        local_file_path: None,
+                    }],
+                    attributes: vec![MetadataAttribute {
+                        kind: "magnet".into(),
+                        label: "Magnet".into(),
+                        value: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789"
+                            .into(),
+                        source_url: None,
+                        is_female: None,
+                    }],
+                })
+                .unwrap();
+        }
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label(&mut app, &context, &output, "Search");
+        click_label(&mut app, &context, &output, "All sites");
+        let output = wait_for_label(&mut app, &context, size, "retired-example");
+        let output = click_label(&mut app, &context, &output, "retired-example");
+        assert!(!rendered_text(&output)
+            .iter()
+            .any(|(text, _)| text == "Applied"));
+        click_label(&mut app, &context, &output, "Apply filters");
+        let output = wait_for_label(&mut app, &context, size, "Results (1)");
+        assert_labels(&output, &["Site retired-example ×"]);
+        let output = click_label(&mut app, &context, &output, "retired-example");
+        let output = click_label(&mut app, &context, &output, "other-example");
+        assert_labels(
+            &output,
+            &["Apply filters", "Site retired-example ×", "Results (1)"],
+        );
+        click_label(&mut app, &context, &output, "Tags");
+        let output = render(
+            &mut app,
+            &context,
+            size,
+            vec![egui::Event::Text("no-such-tag".into())],
+        );
+        click_label(&mut app, &context, &output, "Apply filters");
+        let output = wait_for_label(&mut app, &context, size, "Reset filters");
+        click_label(&mut app, &context, &output, "Reset filters");
+        let output = wait_for_label(&mut app, &context, size, "Results (2)");
+
+        click_label(&mut app, &context, &output, "Torrents");
+        let output = wait_for_label(&mut app, &context, size, "2 torrent cards");
+        let output = click_label(&mut app, &context, &output, "All sites");
+        let output = click_label(&mut app, &context, &output, "retired-example");
+        assert_labels(&output, &["2 torrent cards", "Apply filters"]);
+        click_label(&mut app, &context, &output, "Apply filters");
+        let output = wait_for_label(&mut app, &context, size, "1 torrent cards");
+        assert_labels(
+            &output,
+            &["Site retired-example ×", "Fixture for retired-example"],
+        );
+    }
+
+    fn wait_for_label(
+        app: &mut DesktopApp,
+        context: &egui::Context,
+        size: egui::Vec2,
+        label: &str,
+    ) -> egui::FullOutput {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output = render(app, context, size, Vec::new());
+            if rendered_text(&output).iter().any(|(text, _)| text == label) {
+                return output;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Timed out waiting for {label:?} in {:?}",
+                rendered_text(&output)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

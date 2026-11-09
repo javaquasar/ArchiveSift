@@ -12,14 +12,78 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::db::Database;
 use crate::error::QueuePersistenceError;
 use crate::logging::{log_non_fatal_error, DiagnosticCategory};
-use crate::models::{UrlQueueDecision, UrlQueueOutcome, UrlQueueReport};
+use crate::models::{
+    QueueFailure, QueueFailureKind, UrlQueueDecision, UrlQueueOutcome, UrlQueueReport,
+};
 #[cfg(test)]
 use crate::persistence::atomic_write;
 use crate::scraper::ScraperRegistry;
 use crate::AppResult;
 
 const QUEUE_PREVIEW_LIMIT: usize = 6;
+pub(crate) const QUEUE_FAILURE_PAGE_SIZE: usize = 10;
 const URL_ENQUEUE_BATCH_SIZE: usize = 512;
+
+#[derive(Debug)]
+pub(crate) struct StorageUnavailable;
+
+impl std::fmt::Display for StorageUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Library storage unavailable")
+    }
+}
+
+impl std::error::Error for StorageUnavailable {}
+
+pub(crate) fn download_failure_kind(
+    mut error: &(dyn std::error::Error + 'static),
+) -> QueueFailureKind {
+    loop {
+        use crate::error::FileStoreError;
+        if error.is::<StorageUnavailable>()
+            || matches!(
+                error.downcast_ref::<FileStoreError>(),
+                Some(
+                    FileStoreError::CreateParentDir { .. }
+                        | FileStoreError::WriteFile { .. }
+                        | FileStoreError::ReplaceFile { .. }
+                )
+            )
+        {
+            return QueueFailureKind::Storage;
+        }
+        if error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(reqwest::Error::status)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                )
+            })
+        {
+            return QueueFailureKind::Authorization;
+        }
+        let message = error.to_string().to_ascii_lowercase();
+        if [
+            "credential is missing",
+            "authentication required",
+            "authorization required",
+            "login required",
+            "http 401",
+            "http 403",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
+        {
+            return QueueFailureKind::Authorization;
+        }
+        let Some(source) = error.source() else {
+            return QueueFailureKind::Download;
+        };
+        error = source;
+    }
+}
 
 struct QueueStore {
     connection: Mutex<Connection>,
@@ -67,7 +131,7 @@ impl UrlQueueService {
         if let Some(parent) = queue_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let connection = Connection::open(&queue_path).unwrap_or_else(|error| {
+        let mut connection = Connection::open(&queue_path).unwrap_or_else(|error| {
             panic!(
                 "failed to open queue database {}: {error}",
                 queue_path.display()
@@ -86,6 +150,8 @@ impl UrlQueueService {
                     state TEXT NOT NULL CHECK(state IN ('pending', 'in_progress', 'failed')),
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
+                    failure_kind TEXT,
+                    repair_images INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -97,6 +163,51 @@ impl UrlQueueService {
                 "#,
             )
             .unwrap_or_else(|error| panic!("failed to initialize queue database: {error}"));
+        let upgrade = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("failed to lock queue schema");
+        let columns = upgrade
+            .prepare("PRAGMA table_info(queue_items)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<HashSet<_>>>()
+            })
+            .expect("failed to read queue schema");
+        for (column, migration) in [
+            (
+                "failure_kind",
+                "ALTER TABLE queue_items ADD COLUMN failure_kind TEXT",
+            ),
+            (
+                "repair_images",
+                "ALTER TABLE queue_items ADD COLUMN repair_images INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !columns.contains(column) {
+                upgrade
+                    .execute(migration, [])
+                    .expect("failed to upgrade queue schema");
+            }
+        }
+        if !columns.contains("failure_kind") {
+            upgrade
+                .execute_batch(
+                    "UPDATE queue_items SET failure_kind = CASE
+                    WHEN lower(last_error) LIKE '%storage unavailable%'
+                      OR lower(last_error) LIKE '%failed to create download directory%'
+                      OR lower(last_error) LIKE '%failed to write file%' THEN 'storage'
+                    WHEN lower(last_error) LIKE '%credential is missing%'
+                      OR lower(last_error) LIKE '%authentication required%'
+                      OR lower(last_error) LIKE '%login required%'
+                      OR lower(last_error) LIKE '%http 401%'
+                      OR lower(last_error) LIKE '%http 403%' THEN 'authorization'
+                    ELSE 'download'
+                 END WHERE state = 'failed';",
+                )
+                .expect("failed to classify saved queue failures");
+        }
+        upgrade.commit().expect("failed to commit queue schema");
         Self {
             registry,
             live_registry: None,
@@ -148,15 +259,15 @@ impl UrlQueueService {
     /// Returns only the requested pending-URL range plus bounded summary data.
     /// Range bounds are clamped to the current queue length.
     pub fn snapshot_range(&self, range: Range<usize>) -> crate::models::QueueSnapshot {
-        self.snapshot_for_ui(range, false)
+        self.snapshot_for_ui(range, None)
     }
 
     pub(crate) fn snapshot_for_ui(
         &self,
         range: Range<usize>,
-        include_failures: bool,
+        failures: Option<(Option<QueueFailureKind>, usize)>,
     ) -> crate::models::QueueSnapshot {
-        self.snapshot_from_store(range, include_failures)
+        self.snapshot_from_store(range, failures)
             .unwrap_or_default()
     }
 
@@ -169,7 +280,7 @@ impl UrlQueueService {
     fn snapshot_from_store(
         &self,
         requested: Range<usize>,
-        include_failures: bool,
+        failures: Option<(Option<QueueFailureKind>, usize)>,
     ) -> rusqlite::Result<crate::models::QueueSnapshot> {
         let connection = self.store.connection.lock().unwrap();
         // The UI requests this snapshot frequently. Compute both counters in a
@@ -205,18 +316,46 @@ impl UrlQueueService {
         let in_progress = active_statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let failed_preview = if include_failures && failed_total > 0 {
+        let (failed_matches, failed_preview) = if let Some((kind, offset)) =
+            failures.filter(|_| failed_total > 0)
+        {
+            let kind = kind.map(QueueFailureKind::key);
+            let matched: usize = match kind {
+                Some(kind) => connection.query_row(
+                    "SELECT count(*) FROM queue_items WHERE state = 'failed'
+                     AND coalesce(failure_kind, 'download') = ?1",
+                    [kind],
+                    |row| row.get(0),
+                )?,
+                None => failed_total,
+            };
+            let offset = offset
+                .min(matched.saturating_sub(1) / QUEUE_FAILURE_PAGE_SIZE * QUEUE_FAILURE_PAGE_SIZE);
             let mut statement = connection.prepare_cached(
-                "SELECT url, substr(coalesce(last_error, 'Unknown error'), 1, 1024)
+                "SELECT url, substr(coalesce(last_error, 'Unknown error'), 1, 1024), failure_kind
                  FROM queue_items WHERE state = 'failed'
-                 ORDER BY updated_at DESC, id DESC LIMIT 10",
+                 AND (?1 IS NULL OR coalesce(failure_kind, 'download') = ?1)
+                 ORDER BY updated_at DESC, id DESC LIMIT ?2 OFFSET ?3",
             )?;
             let failures = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map(
+                    params![kind, QUEUE_FAILURE_PAGE_SIZE as i64, offset as i64],
+                    |row| {
+                        let kind: Option<String> = row.get(2)?;
+                        Ok(QueueFailure {
+                            url: row.get(0)?,
+                            error: row.get(1)?,
+                            kind: QueueFailureKind::ALL
+                                .into_iter()
+                                .find(|value| Some(value.key()) == kind.as_deref())
+                                .unwrap_or_default(),
+                        })
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            failures
+            (matched, failures)
         } else {
-            Vec::new()
+            (0, Vec::new())
         };
 
         Ok(crate::models::QueueSnapshot {
@@ -224,6 +363,7 @@ impl UrlQueueService {
             in_progress,
             pending_total,
             failed_total,
+            failed_matches,
             failed_preview,
             pending_start,
             pending: load_urls(pending_start, pending_end - pending_start)?,
@@ -268,24 +408,28 @@ impl UrlQueueService {
 
         let mut offset = 0;
         loop {
-            let snapshot = self.snapshot_from_store(offset..offset + PRUNE_BATCH_SIZE, false)?;
+            let snapshot = self.snapshot_from_store(offset..offset + PRUNE_BATCH_SIZE, None)?;
             if snapshot.pending.is_empty() {
                 break;
             }
             let inspected = snapshot.pending.len();
             let processed = database.processed_urls(&snapshot.pending)?;
-            let processed_count = processed.len();
-            if processed_count > 0 {
+            let mut removed = 0;
+            if !processed.is_empty() {
                 let mut connection = self.store.connection.lock().unwrap();
                 let transaction = connection.transaction()?;
                 for url in processed {
-                    transaction.execute("DELETE FROM queue_items WHERE url = ?1", params![url])?;
+                    removed += transaction.execute(
+                        "DELETE FROM queue_items WHERE url = ?1 AND state = 'pending'
+                         AND repair_images = 0 AND attempt_count = 0",
+                        params![url],
+                    )?;
                 }
                 transaction.commit()?;
             }
 
             // Deleted rows shift the next uninspected row towards the front.
-            offset += inspected - processed_count;
+            offset += inspected - removed;
         }
         Ok(())
     }
@@ -483,6 +627,10 @@ impl UrlQueueService {
     }
 
     pub fn take_next_url(&self) -> Option<String> {
+        self.take_next_job().map(|(url, _)| url)
+    }
+
+    pub(crate) fn take_next_job(&self) -> Option<(String, bool)> {
         // Check paused BEFORE taking the lock
         if self.is_paused() {
             return None;
@@ -490,17 +638,17 @@ impl UrlQueueService {
         self.claim_next_url().ok().flatten()
     }
 
-    fn claim_next_url(&self) -> rusqlite::Result<Option<String>> {
+    fn claim_next_url(&self) -> rusqlite::Result<Option<(String, bool)>> {
         let mut connection = self.store.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         let next = transaction
             .query_row(
-                "SELECT id, url FROM queue_items WHERE state = 'pending' ORDER BY id LIMIT 1",
+                "SELECT id, url, repair_images FROM queue_items WHERE state = 'pending' ORDER BY id LIMIT 1",
                 [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)),
             )
             .optional()?;
-        let Some((id, url)) = next else {
+        let Some((id, url, repair)) = next else {
             transaction.commit()?;
             return Ok(None);
         };
@@ -509,7 +657,7 @@ impl UrlQueueService {
             params![id],
         )?;
         transaction.commit()?;
-        Ok(Some(url))
+        Ok(Some((url, repair)))
     }
 
     pub fn mark_finished(&self, url: &str) {
@@ -518,18 +666,46 @@ impl UrlQueueService {
     }
 
     pub fn mark_failed(&self, url: &str, error: &str) {
+        self.mark_failed_with_kind(url, error, QueueFailureKind::Download);
+    }
+
+    pub(crate) fn mark_failed_with_kind(&self, url: &str, error: &str, kind: QueueFailureKind) {
         let connection = self.store.connection.lock().unwrap();
         let _ = connection.execute(
             r#"
-            INSERT INTO queue_items(url, connector, state, attempt_count, last_error)
-            VALUES (?1, ?2, 'failed', 1, ?3)
+            INSERT INTO queue_items(url, connector, state, attempt_count, last_error, failure_kind)
+            VALUES (?1, ?2, 'failed', 1, ?3, ?4)
             ON CONFLICT(url) DO UPDATE SET
                 state = 'failed',
                 last_error = excluded.last_error,
+                failure_kind = excluded.failure_kind,
                 updated_at = CURRENT_TIMESTAMP
             "#,
-            params![url, url_hostname(url), error],
+            params![url, url_hostname(url), error, kind.key()],
         );
+    }
+
+    pub(crate) fn retry_failure(&self, url: &str) -> rusqlite::Result<bool> {
+        let connection = self.store.connection.lock().unwrap();
+        Ok(connection.execute(
+            "UPDATE queue_items SET state = 'pending', updated_at = CURRENT_TIMESTAMP
+             WHERE state = 'failed' AND url = ?1",
+            [url],
+        )? == 1)
+    }
+
+    pub(crate) fn enqueue_image_repair(&self, url: &str) -> AppResult<bool> {
+        // A saved page has a canonical URL. Preserve it when queuing a repair.
+        if !self.registry().supports_url(url) {
+            return Err("Enable the extension for this source before retrying images.".into());
+        }
+        let connection = self.store.connection.lock().unwrap();
+        Ok(connection.execute(
+            "INSERT INTO queue_items(url, connector, state, repair_images) VALUES (?1, ?2, 'pending', 1)
+             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 1,
+                 updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
+            params![url, url_hostname(url)],
+        )? == 1)
     }
 
     pub fn retry_failed(&self) -> usize {
@@ -1212,6 +1388,89 @@ mod tests {
         assert!(svc.has_pending_work());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_processed_page_can_queue_one_repair_and_restore_it_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("queue.sqlite3");
+        let (database, database_path) = temp_db();
+        mark_processed(&database_path, CONTENT_URL);
+        let open = || {
+            UrlQueueService::with_registry_and_queue_path(
+                ScraperRegistry::with_public_scrapers(),
+                &path,
+            )
+        };
+        let service = open();
+        assert!(service.enqueue_image_repair(CONTENT_URL).unwrap());
+        assert!(!service.enqueue_image_repair(CONTENT_URL).unwrap());
+        assert!(service
+            .enqueue_image_repair("https://unregistered.example.test/")
+            .is_err());
+        service.prune_processed(&database).unwrap();
+        assert_eq!(service.take_next_job(), Some((CONTENT_URL.into(), true)));
+        assert!(!service.enqueue_image_repair(CONTENT_URL).unwrap());
+        drop(service);
+
+        let restored = open();
+        restored.prune_processed(&database).unwrap();
+        assert_eq!(restored.take_next_job(), Some((CONTENT_URL.into(), true)));
+        restored.mark_failed_with_kind(
+            CONTENT_URL,
+            "Library storage unavailable",
+            QueueFailureKind::Storage,
+        );
+        assert!(restored.retry_failure(CONTENT_URL).unwrap());
+        assert!(!restored.retry_failure(CONTENT_URL).unwrap());
+        assert_eq!(restored.take_next_job(), Some((CONTENT_URL.into(), true)));
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn legacy_failures_are_migrated_and_filtering_precedes_pagination() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("queue.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(
+                "CREATE TABLE queue_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL UNIQUE, connector TEXT NOT NULL,
+                    state TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+                 INSERT INTO queue_items(url, connector, state, last_error)
+                 VALUES ('https://example.test/auth', 'example.test', 'failed', 'HTTP 401');"
+            ).unwrap();
+        }
+        let service = UrlQueueService::with_registry_and_queue_path(
+            ScraperRegistry::with_public_scrapers(),
+            &path,
+        );
+        for id in 0..QUEUE_FAILURE_PAGE_SIZE + 1 {
+            service.mark_failed(&format!("https://example.test/{id}"), "Network error");
+        }
+        let auth = service.snapshot_for_ui(0..0, Some((Some(QueueFailureKind::Authorization), 0)));
+        assert_eq!(auth.failed_total, QUEUE_FAILURE_PAGE_SIZE + 2);
+        assert_eq!(auth.failed_matches, 1);
+        assert_eq!(auth.failed_preview[0].url, "https://example.test/auth");
+        assert_eq!(auth.failed_preview[0].kind, QueueFailureKind::Authorization);
+        let download = service.snapshot_for_ui(
+            0..0,
+            Some((Some(QueueFailureKind::Download), QUEUE_FAILURE_PAGE_SIZE)),
+        );
+        assert_eq!(download.failed_preview.len(), 1);
+        assert_eq!(download.failed_preview[0].url, "https://example.test/0");
+        assert!(service.retry_failure(&auth.failed_preview[0].url).unwrap());
+        assert_eq!(
+            service.snapshot_light().failed_total,
+            QUEUE_FAILURE_PAGE_SIZE + 1
+        );
+        assert_eq!(service.snapshot_light().pending_total, 1);
+        assert_eq!(
+            download_failure_kind(&StorageUnavailable),
+            QueueFailureKind::Storage
+        );
     }
 
     #[test]

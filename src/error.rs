@@ -3,6 +3,25 @@ use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
 #[derive(Debug)]
+pub(crate) struct IncompleteImages {
+    pub failed: usize,
+    pub total: usize,
+    pub cause: Box<dyn Error + Send + Sync>,
+}
+
+impl Display for IncompleteImages {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} of {} images could not be downloaded. Retry this page to download missing images; saved files are retained.", self.failed, self.total)
+    }
+}
+
+impl Error for IncompleteImages {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+#[derive(Debug)]
 pub enum HttpClientError {
     RequestFailed { url: String, source: reqwest::Error },
     ResponseTooLarge { url: String, max_bytes: usize },

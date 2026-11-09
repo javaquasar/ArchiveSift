@@ -1,6 +1,6 @@
 use super::MetadataAttribute;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TorrentQuery {
     pub text: String,
     pub site_key: String,

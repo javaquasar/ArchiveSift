@@ -911,6 +911,18 @@ impl Database {
     }
 
     pub fn upsert_scraped_item(&self, page: &ScrapedItem) -> AppResult<PersistedItem> {
+        self.persist_scraped_item(page, false)
+    }
+
+    pub(crate) fn upsert_repair_images(&self, page: &ScrapedItem) -> AppResult<PersistedItem> {
+        self.persist_scraped_item(page, true)
+    }
+
+    fn persist_scraped_item(
+        &self,
+        page: &ScrapedItem,
+        images_only: bool,
+    ) -> AppResult<PersistedItem> {
         let mut connection = self.writer_connection()?;
         let transaction =
             connection
@@ -919,19 +931,24 @@ impl Database {
                     operation: "upsert_scraped_item",
                     source,
                 })?;
-        let page_id = upsert_source_page(&transaction, page)?;
+        let page_id = if images_only {
+            transaction.query_row(
+                "SELECT id FROM source_pages WHERE page_url = ?1",
+                [&page.page_url],
+                |row| row.get(0),
+            )?
+        } else {
+            let page_id = upsert_source_page(&transaction, page)?;
+            transaction
+                .execute(
+                    "DELETE FROM page_attributes WHERE page_id = ?1",
+                    params![page_id],
+                )
+                .map_err(|source| DatabaseError::ExecuteStatement {
+                    operation: "delete_page_attributes_for_page",
+                    source,
+                })?;
 
-        transaction
-            .execute(
-                "DELETE FROM page_attributes WHERE page_id = ?1",
-                params![page_id],
-            )
-            .map_err(|source| DatabaseError::ExecuteStatement {
-                operation: "delete_page_attributes_for_page",
-                source,
-            })?;
-
-        {
             let mut link_attribute = transaction
                 .prepare_cached(
                     "INSERT OR IGNORE INTO page_attributes (page_id, attribute_id) VALUES (?1, ?2)",
@@ -949,7 +966,8 @@ impl Database {
                         source,
                     })?;
             }
-        }
+            page_id
+        };
 
         let mut image_ids_by_url = HashMap::new();
         let requested_sources = page
@@ -1003,7 +1021,14 @@ impl Database {
             }
         }
 
-        torrents::after_scrape(&transaction, page, page_id)?;
+        if images_only {
+            transaction.execute(
+                "UPDATE torrent_cards SET revision=revision+1 WHERE page_id=?1",
+                [page_id],
+            )?;
+        } else {
+            torrents::after_scrape(&transaction, page, page_id)?;
+        }
         refresh_page_search_index(&transaction, page_id)?;
         refresh_page_counters(&transaction, page_id)?;
 
@@ -1233,6 +1258,73 @@ impl Database {
             })?);
         }
         Ok(result)
+    }
+
+    pub(crate) fn page_repair_images(&self, page_id: i64) -> AppResult<Vec<(i64, ScrapedImage)>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT i.id, i.source_url, i.preview_url, i.alt_text, i.width, i.height,
+                    pi.sort_order, pi.local_file_path
+             FROM page_images pi JOIN images i ON i.id = pi.image_id WHERE pi.page_id = ?1",
+        )?;
+        let images = statement
+            .query_map([page_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    ScrapedImage {
+                        source_url: row.get(1)?,
+                        preview_url: row.get(2)?,
+                        alt_text: row.get(3)?,
+                        width: row.get(4)?,
+                        height: row.get(5)?,
+                        sort_order: row.get(6)?,
+                        local_file_path: row.get(7)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(images)
+    }
+
+    pub(crate) fn page_image_paths(&self, page_id: i64) -> AppResult<Vec<Option<String>>> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare_cached("SELECT local_file_path FROM page_images WHERE page_id = ?1")?;
+        let paths = statement
+            .query_map([page_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paths)
+    }
+
+    pub(crate) fn library_sites(&self) -> AppResult<Vec<String>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT DISTINCT site_key FROM source_pages WHERE site_key <> '' ORDER BY site_key",
+        )?;
+        let sites = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sites)
+    }
+
+    pub(crate) fn saved_page_location(&self, url: &str) -> AppResult<Option<(i64, bool)>> {
+        let connection = self.connect()?;
+        let alternative = if url.contains('?') {
+            url.to_owned()
+        } else if let Some(url) = url.strip_suffix('/') {
+            url.to_owned()
+        } else {
+            format!("{url}/")
+        };
+        Ok(connection
+            .query_row(
+                "SELECT sp.id, EXISTS(SELECT 1 FROM torrent_cards t WHERE t.page_id = sp.id)
+             FROM source_pages sp WHERE sp.page_url IN (?1, ?2)
+             ORDER BY sp.page_url = ?1 DESC LIMIT 1",
+                params![url, alternative],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
     }
 
     pub fn archived_page_html(&self, page_id: i64) -> AppResult<Option<String>> {

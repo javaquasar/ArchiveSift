@@ -7,6 +7,7 @@ use eframe::egui::TextureHandle;
 
 use super::account_settings::AccountSettingsEditor;
 use super::creator_filter::CreatorFilter;
+use super::download_status::DownloadStatus;
 use super::icon::application_viewport;
 use super::preview_loader::{
     ImageLoadMode, ImageLoadTimings, OriginalLoader, PreviewLoader, PreviewSource,
@@ -19,8 +20,8 @@ use crate::app::{AppConfig, PreviewOpenMode};
 use crate::fs::structured::actor_folder_name;
 use crate::models::{
     DateBrowseDirection, DateGroup, DateGroupCursor, DateGroupPage, DeleteMode, PageKind,
-    SearchCursor, SearchImageResult, SearchQuery, SearchResultPage, UrlQueueDecision,
-    UrlQueueOutcome, UrlQueueReport,
+    QueueFailureKind, SearchCursor, SearchImageResult, SearchQuery, SearchResultPage,
+    UrlQueueDecision, UrlQueueOutcome, UrlQueueReport,
 };
 use crate::scraper::ScraperRegistry;
 use crate::ui::{truncate, SearchRefresh, UiCommand, UiLog};
@@ -180,10 +181,18 @@ pub struct AppWindow {
     scrape_options_open: bool,
     operations_open: bool,
     operation_tab: OperationTab,
+    failure_kind: Option<QueueFailureKind>,
+    failure_offset: usize,
+    pub(super) queued_card_lookup: Option<String>,
+    queue_card_feedback: Option<String>,
     raw_settings: Option<super::raw_settings::RawSettingsEditor>,
     account_settings: Option<AccountSettingsEditor>,
     extensions_manager: super::extensions_manager::ExtensionsManagerUi,
     search_form: SearchForm,
+    applied_search: SearchQuery,
+    library_sites: Option<Vec<String>>,
+    pub(super) download_status: DownloadStatus,
+    download_refresh: bool,
     search_filters_open: bool,
     search_detail_open: bool,
     torrent_mode: bool,
@@ -331,10 +340,18 @@ impl AppWindow {
             scrape_options_open: false,
             operations_open: false,
             operation_tab: OperationTab::Queue,
+            failure_kind: None,
+            failure_offset: 0,
+            queued_card_lookup: None,
+            queue_card_feedback: None,
             raw_settings: None,
             account_settings: None,
             extensions_manager: Default::default(),
             search_form: SearchForm::default(),
+            applied_search: SearchQuery::default(),
+            library_sites: None,
+            download_status: DownloadStatus::default(),
+            download_refresh: false,
             search_filters_open: false,
             search_detail_open: false,
             torrent_mode: false,
@@ -428,15 +445,19 @@ impl AppWindow {
     /// When date-browse mode is active the refresh is scoped to the current
     /// page so that metadata edits (gender, favorites, tags …) do not navigate
     /// away from the group being viewed.
-    fn search_refresh(&self) -> SearchRefresh {
+    pub(super) fn search_refresh(&self) -> SearchRefresh {
         if self.recent_pages_active {
             SearchRefresh::RecentPages(self.recent_pages_limit)
         } else {
-            let mut query = self.search_form.to_query();
             if self.date_browse_active {
-                query.page_id = self.date_browse_current.as_ref().map(|group| group.page_id);
+                SearchRefresh::Query(SearchQuery {
+                    page_id: self.date_browse_current.as_ref().map(|group| group.page_id),
+                    site_key: self.date_browse_site_key.clone(),
+                    ..Default::default()
+                })
+            } else {
+                SearchRefresh::Query(self.applied_search.clone())
             }
-            SearchRefresh::Query(query)
         }
     }
 
@@ -474,6 +495,13 @@ impl AppWindow {
         self.search_next_cursor = page.next_cursor;
         if self.selected_result.is_none() && !self.search_results.is_empty() {
             self.selected_result = Some(0);
+        }
+        if !append
+            && !self.date_browse_active
+            && !self.recent_pages_active
+            && self.applied_search.page_id.is_some()
+        {
+            self.search_detail_open = self.selected_result.is_some();
         }
     }
 
@@ -762,6 +790,9 @@ impl AppWindow {
         });
 
         // Overlays (rendered outside central panel so they sit on top).
+        if let Some((title, text)) = self.torrent_library.take_description() {
+            self.description_popup = Some(DescriptionPopup { title, text });
+        }
         if let Some(ids) = self.torrent_library.take_handoff() {
             if !self.storage_settings.applying {
                 self.peerlume.prepare(ctx, &self.config, ids);
@@ -1390,8 +1421,89 @@ impl AppWindow {
         self.queue_window_open || self.active_tab == Tab::Scrape
     }
 
-    pub(super) fn needs_queue_failures(&self) -> bool {
-        self.operations_open && self.operation_tab == OperationTab::Queue
+    pub(super) fn queue_failures(&self) -> Option<(Option<QueueFailureKind>, usize)> {
+        (self.operations_open && self.operation_tab == OperationTab::Queue)
+            .then_some((self.failure_kind, self.failure_offset))
+    }
+
+    pub(super) fn set_library_sites(&mut self, sites: Vec<String>) {
+        self.library_sites = Some(sites);
+    }
+
+    pub(super) fn begin_library_sites_load(&mut self) -> bool {
+        if self.active_tab != Tab::Search || self.library_sites.is_some() {
+            return false;
+        }
+        self.library_sites = Some(Vec::new());
+        true
+    }
+
+    pub(super) fn invalidate_library_sites(&mut self) {
+        self.library_sites = None;
+    }
+
+    pub(super) fn page_download_finished(&mut self, url: &str, message: &str, show_result: bool) {
+        self.download_status.complete(url, message, show_result);
+        self.torrent_library.page_download_finished(url);
+        if self
+            .search_results
+            .iter()
+            .any(|image| image.page_url() == url)
+        {
+            self.download_refresh = true;
+        }
+    }
+
+    pub(super) fn take_download_refresh(&mut self) -> bool {
+        !self.running && !self.date_browse_loading && std::mem::take(&mut self.download_refresh)
+    }
+
+    pub(super) fn apply_download_refresh(&mut self, page: SearchResultPage) {
+        self.preview_cache.clear();
+        self.preview_loader.advance_generation();
+        self.original_loader.advance_generation();
+        self.viewer_original_cache.clear();
+        self.refresh_search_page(page);
+        // The background refresh uses the lightweight search projection.
+        self.hydrated_image_ids.clear();
+    }
+
+    pub(super) fn search_result_limit(&self) -> usize {
+        self.search_results.len().max(SEARCH_PAGE_SIZE)
+    }
+
+    pub(super) fn queued_card_resolved(
+        &mut self,
+        ctx: &egui::Context,
+        result: Result<Option<(i64, bool)>, String>,
+    ) {
+        self.queued_card_lookup = None;
+        if !self.operations_open {
+            return;
+        }
+        match result {
+            Ok(Some((id, torrent))) => {
+                self.operations_open = false;
+                self.active_tab = Tab::Search;
+                self.torrent_mode = torrent;
+                if torrent {
+                    self.torrent_library.open_card(ctx, &self.config, id);
+                } else {
+                    self.search_form = SearchForm::default();
+                    self.clear_search_suggestions();
+                    self.search_detail_open = false;
+                    self.run_image_query(SearchQuery {
+                        page_id: Some(id),
+                        ..Default::default()
+                    });
+                }
+                ctx.request_repaint();
+            }
+            Ok(None) => {
+                self.queue_card_feedback = Some("No card has been saved for this URL yet.".into())
+            }
+            Err(error) => self.queue_card_feedback = Some(error),
+        }
     }
 
     fn render_queue_rows(&mut self, ui: &mut egui::Ui) {
@@ -1531,13 +1643,109 @@ impl AppWindow {
                             ui.weak("No failed downloads.");
                         } else {
                             ui.label(format!("Recent failures · {} total", snapshot.failed_total));
+                            let mut kind = self.failure_kind;
+                            ui.horizontal_wrapped(|ui| {
+                                egui::ComboBox::from_id_salt("queue_failure_reason")
+                                    .selected_text(
+                                        kind.map_or("All reasons", QueueFailureKind::label),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut kind, None, "All reasons");
+                                        for value in QueueFailureKind::ALL {
+                                            ui.selectable_value(
+                                                &mut kind,
+                                                Some(value),
+                                                value.label(),
+                                            );
+                                        }
+                                    });
+                                if kind != self.failure_kind {
+                                    self.failure_kind = kind;
+                                    self.failure_offset = 0;
+                                    ui.ctx().request_repaint();
+                                } else {
+                                    let page_size =
+                                        crate::services::url_queue::QUEUE_FAILURE_PAGE_SIZE;
+                                    self.failure_offset = self.failure_offset.min(
+                                        snapshot.failed_matches.saturating_sub(1) / page_size
+                                            * page_size,
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            self.failure_offset > 0,
+                                            egui::Button::new("Previous errors"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.failure_offset -= page_size;
+                                        ui.ctx().request_repaint();
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.failure_offset + page_size
+                                                < snapshot.failed_matches,
+                                            egui::Button::new("Next errors"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.failure_offset += page_size;
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            });
+                            if snapshot.failed_preview.is_empty() {
+                                ui.weak("No failures match this reason.");
+                            }
+                            if let Some(feedback) = &self.queue_card_feedback {
+                                ui.label(feedback);
+                            }
                             egui::ScrollArea::vertical()
                                 .max_height(260.0)
                                 .show(ui, |ui| {
-                                    for (url, error) in &snapshot.failed_preview {
-                                        ui.add(egui::Label::new(url).truncate()).on_hover_text(url);
-                                        ui.add(egui::Label::new(error).wrap());
-                                        ui.separator();
+                                    for failure in &snapshot.failed_preview {
+                                        ui.push_id(&failure.url, |ui| {
+                                            ui.add(egui::Label::new(&failure.url).truncate())
+                                                .on_hover_text(&failure.url);
+                                            ui.strong(failure.kind.label());
+                                            ui.add(egui::Label::new(&failure.error).wrap());
+                                            ui.horizontal_wrapped(|ui| {
+                                                let storage_ready = !self.storage_settings.applying;
+                                                if ui
+                                                    .add_enabled(
+                                                        storage_ready
+                                                            && self.config.has_download_folder(),
+                                                        egui::Button::new("Retry"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.pending_command =
+                                                        Some(UiCommand::RetryQueueItem {
+                                                            url: failure.url.clone(),
+                                                        });
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        storage_ready
+                                                            && !self.running
+                                                            && !self.date_browse_loading
+                                                            && self.queued_card_lookup.is_none()
+                                                            && self.torrent_library.can_open_card(),
+                                                        egui::Button::new("Open card"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.queued_card_lookup =
+                                                        Some(failure.url.clone());
+                                                    self.queue_card_feedback = None;
+                                                    self.pending_command =
+                                                        Some(UiCommand::OpenQueuedCard {
+                                                            url: failure.url.clone(),
+                                                        });
+                                                }
+                                                ui.hyperlink_to("Open source", &failure.url);
+                                            });
+                                            ui.separator();
+                                        });
                                     }
                                 });
                         }
@@ -1587,7 +1795,12 @@ impl AppWindow {
             self.viewer_delete_confirm = None;
         }
         if self.torrent_mode {
-            self.torrent_library.render(ui, &self.config);
+            self.torrent_library.render_with_downloads(
+                ui,
+                &self.config,
+                self.library_sites.as_deref().unwrap_or_default(),
+                &mut self.download_status,
+            );
             return;
         }
         // ── Keyboard shortcuts for date-group navigation ──────────────────────
@@ -1751,7 +1964,11 @@ impl AppWindow {
         // Share the immutable snapshot across closures. Arc::clone is O(1),
         // unlike cloning every search result and its metadata on every frame.
         let results = clone_search_results_snapshot(&self.search_results);
-        let base_dir = self.config.download_folder.clone();
+        let base_dir = self
+            .config
+            .effective_download_dir()
+            .to_string_lossy()
+            .into_owned();
         let mut metadata_to_request = HashSet::new();
 
         let avail = ui.available_size();
@@ -1763,8 +1980,20 @@ impl AppWindow {
                     |ui| {
                         ui.set_width(results_w);
                         ui.heading(&results_heading);
-                if results.is_empty() {
+                if results.is_empty() && (self.running || self.date_browse_loading) {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading images…");
+                    });
+                } else if results.is_empty() {
                     ui.label("No matching images. Try a broader search.");
+                    if self.applied_search != SearchQuery::default() || self.date_browse_active || self.recent_pages_active {
+                        if ui.add_enabled(!self.running, egui::Button::new("Reset filters")).clicked() {
+                            self.search_form = SearchForm::default();
+                            self.clear_search_suggestions();
+                            self.start_image_search();
+                        }
+                    }
                 } else {
                     let total_rows = (results.len() + cols - 1) / cols;
                     egui::ScrollArea::vertical()
@@ -1955,6 +2184,9 @@ impl AppWindow {
                             }
                             ui.add(egui::Label::new(egui::RichText::new(result.page_title()).heading()).wrap().selectable(true));
                             ui.hyperlink_to("Open scene/page", result.page_url());
+                            if self.download_status.render(ui, &self.config, result.page_id(), result.page_url()) {
+                                self.pending_command = Some(UiCommand::RepairPageImages { url: result.page_url().to_owned() });
+                            }
                             ui.collapsing("Links and paths", |ui| {
                                 ui.add(egui::Label::new(result.page_url()).wrap().selectable(true));
                                 ui.add(egui::Label::new(&result.source_url).wrap().selectable(true));
@@ -2338,14 +2570,22 @@ impl AppWindow {
     // ── Search filters ────────────────────────────────────────────────────────
 
     fn start_image_search(&mut self) {
+        self.run_image_query(self.search_form.to_query());
+    }
+
+    fn run_image_query(&mut self, query: SearchQuery) {
         self.error = None;
+        if self.applied_search != query || self.date_browse_active || self.recent_pages_active {
+            self.set_search_results(Vec::new());
+        }
         self.recent_pages_active = false;
         self.date_browse_active = false;
         self.date_browse_loading = false;
         self.search_seq += 1;
+        self.applied_search = query.clone();
         self.pending_command = Some(UiCommand::Search {
             database_path: self.config.database_path.clone(),
-            query: self.search_form.to_query(),
+            query,
             seq: self.search_seq,
             cursor: None,
             append: false,
@@ -2369,34 +2609,21 @@ impl AppWindow {
 
     fn render_image_search_controls(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_width();
-        let query = self.search_form.to_query();
-        let filter_count = usize::from(query.site_key.is_some())
-            + query.tags.len()
-            + query.actors.len()
-            + query.creators.len()
-            + query.categories.len()
-            + query.studios.len()
-            + query.channels.len()
-            + usize::from(query.favorites_only);
+        let draft = self.search_form.to_query();
+        let count = image_filter_count(&draft);
+        let dirty = draft != self.applied_search;
         ui.horizontal_wrapped(|ui| {
             let text = ui.add(
                 egui::TextEdit::singleline(&mut self.search_form.text)
                     .hint_text("Search images")
                     .desired_width((available * 0.32).clamp(115.0, 320.0)),
             );
-            egui::ComboBox::from_id_salt("search_site_filter")
-                .width(108.0)
-                .selected_text(if self.search_form.site_key.is_empty() {
-                    "All sites".to_owned()
-                } else {
-                    truncate(&self.search_form.site_key, 18)
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.search_form.site_key, String::new(), "All sites");
-                    for key in ScraperRegistry::with_all_scrapers().list_site_keys() {
-                        ui.selectable_value(&mut self.search_form.site_key, key.to_owned(), key);
-                    }
-                });
+            site_selector(
+                ui,
+                "search_site_filter",
+                &mut self.search_form.site_key,
+                self.library_sites.as_deref().unwrap_or_default(),
+            );
             let tags = ui.add(
                 egui::TextEdit::singleline(&mut self.search_form.tags)
                     .hint_text("Tags")
@@ -2416,13 +2643,16 @@ impl AppWindow {
             let enter = (text.lost_focus() || tags.lost_focus())
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui
-                .add_enabled(!self.running, egui::Button::new("Run Search"))
+                .add_enabled(
+                    !self.running,
+                    egui::Button::new(if dirty { "Apply filters" } else { "Run Search" }),
+                )
                 .clicked()
                 || (!self.running && enter)
             {
                 self.start_image_search();
             }
-            if ui.button(format!("Filters ({filter_count})")).clicked() {
+            if ui.button(format!("Filters ({count})")).clicked() {
                 self.search_filters_open = !self.search_filters_open;
             }
             ui.menu_button("Browse", |ui| {
@@ -2460,10 +2690,21 @@ impl AppWindow {
             render_suggestions(ui, &mut self.search_form.tags, &mut self.tag_suggestions);
         }
 
-        if filter_count > 0 && !self.recent_pages_active {
+        let query = match self.search_refresh() {
+            SearchRefresh::Query(query) => query,
+            SearchRefresh::RecentPages(_) => return,
+        };
+        let filter_count = image_filter_count(&query) + usize::from(!query.text.is_empty());
+        if query.page_id.is_some() && !self.date_browse_active {
+            ui.weak("Showing images from one saved card");
+        }
+        if filter_count > 0 {
             let mut removed = false;
-            ui.add_enabled_ui(!self.running, |ui| {
+            let chips_enabled = !self.running
+                && (self.date_browse_active || self.search_form.to_query() == self.applied_search);
+            ui.add_enabled_ui(chips_enabled, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.weak("Applied");
                     let mut remaining = 6;
                     if let Some(site) = &query.site_key {
                         if filter_chip(ui, "Site", site, &mut remaining) {
@@ -2472,6 +2713,12 @@ impl AppWindow {
                         }
                     }
                     if !self.date_browse_active {
+                        if !query.text.is_empty()
+                            && filter_chip(ui, "Text", &query.text, &mut remaining)
+                        {
+                            self.search_form.text.clear();
+                            removed = true;
+                        }
                         for (label, field, values) in [
                             ("Tag", &mut self.search_form.tags, &query.tags),
                             ("Actor", &mut self.search_form.actors, &query.actors),
@@ -2828,7 +3075,11 @@ impl AppWindow {
         let viewer_recent_tags = self.viewer_recent_tags.clone();
         let mut viewer_add_tags: Option<Vec<String>> = None;
         let mut viewer_suggest_query: Option<String> = None;
-        let base_dir = self.config.download_folder.clone();
+        let base_dir = self
+            .config
+            .effective_download_dir()
+            .to_string_lossy()
+            .into_owned();
         // We DO need the preview cache and the viewer delete state inside the
         // viewport; borrow them explicitly so the closure captures &mut to the
         // individual fields rather than to all of self.
@@ -5322,6 +5573,34 @@ pub(super) fn filter_chip(
     ui.small_button(format!("{label} {} ×", truncate(value, 21)))
         .on_hover_text(format!("Remove {label} filter: {value}"))
         .clicked()
+}
+
+fn image_filter_count(query: &SearchQuery) -> usize {
+    usize::from(query.site_key.is_some())
+        + query.tags.len()
+        + query.actors.len()
+        + query.creators.len()
+        + query.categories.len()
+        + query.studios.len()
+        + query.channels.len()
+        + usize::from(query.favorites_only)
+}
+
+pub(super) fn site_selector(ui: &mut egui::Ui, id: &str, selected: &mut String, sites: &[String]) {
+    let label = if selected.is_empty() {
+        "All sites".to_owned()
+    } else {
+        truncate(selected, 18)
+    };
+    egui::ComboBox::from_id_salt(id)
+        .width(108.0)
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(selected, String::new(), "All sites");
+            for key in sites {
+                ui.selectable_value(selected, key.clone(), key);
+            }
+        });
 }
 
 pub(super) fn filter_value_chips(
