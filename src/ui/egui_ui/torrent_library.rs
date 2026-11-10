@@ -67,6 +67,7 @@ struct Suggestions {
 }
 enum Outcome {
     Recovered,
+    FolderLocated(std::path::PathBuf),
     Loaded(TorrentSummaryPage, Suggestions, Option<TorrentCard>),
     Selected(TorrentCard),
     Planned(TorrentMovePlan),
@@ -240,6 +241,13 @@ impl TorrentLibraryUi {
                     self.receiver = None;
                     match result {
                         Ok(Outcome::Recovered) => (),
+                        Ok(Outcome::FolderLocated(folder)) => {
+                            self.status = None;
+                            if let Err(error) = super::app_window::open_folder(&folder) {
+                                self.error =
+                                    Some(format!("Could not open {}: {error}", folder.display()));
+                            }
+                        }
                         Err(error) => {
                             if self.recovering {
                                 self.startup_error = Some(error.clone());
@@ -499,6 +507,7 @@ impl TorrentLibraryUi {
             .max_height(height)
             .show(ui, |ui| {
                 let mut choose = None;
+                let mut open_folder = None;
                 for card in &self.page.cards {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         let mut checked = self.checked_cards.contains(&card.page_id);
@@ -532,11 +541,30 @@ impl TorrentLibraryUi {
                                 &card.primary_studio
                             }
                         ));
-                        ui.label(format!(
-                            "{} attachments · {} images",
-                            card.attachment_count, card.image_count
-                        ));
+                        ui.horizontal_wrapped(|ui| {
+                            let image_count = match card.image_count {
+                                0 => "No images".into(),
+                                1 => "1 image".into(),
+                                count => format!("{count} images"),
+                            };
+                            let attachment_count = match card.attachment_count {
+                                0 => "No attachments".into(),
+                                1 => "1 attachment".into(),
+                                count => format!("{count} attachments"),
+                            };
+                            ui.weak(format!("{attachment_count} · {image_count}"));
+                            if folder_button(
+                                ui,
+                                config,
+                                !self.busy && !self.editing && self.plan.is_none(),
+                            ) {
+                                open_folder = Some(card.page_id);
+                            }
+                        });
                     });
+                }
+                if let Some(id) = open_folder {
+                    self.locate_folder(ui.ctx(), config, id);
                 }
                 if let Some(id) = choose {
                     if self
@@ -754,6 +782,9 @@ impl TorrentLibraryUi {
             }
         });
         ui.horizontal_wrapped(|ui| {
+            if folder_button(ui, config, !self.busy) {
+                self.locate_folder(ui.ctx(), config, card.page_id);
+            }
             if ui
                 .add_enabled(
                     !self.busy && config.peerlume.enabled,
@@ -818,11 +849,6 @@ impl TorrentLibraryUi {
         ui.collapsing("Files", |ui| {
             if let Some(directory) = &card.directory {
                 ui.add(egui::Label::new(directory).wrap().selectable(true));
-                if ui.button("Open folder").clicked() {
-                    super::app_window::open_folder(
-                        &config.effective_download_dir().join(directory),
-                    );
-                }
             }
             for attachment in &card.attachments {
                 ui.horizontal_wrapped(|ui| {
@@ -845,6 +871,9 @@ impl TorrentLibraryUi {
     }
 
     fn render_gallery(&mut self, ui: &mut egui::Ui, config: &AppConfig, card: &TorrentCard) {
+        if card.images.is_empty() {
+            return;
+        }
         let primary = if self.editing {
             self.edit
                 .primary_image_id
@@ -889,6 +918,20 @@ impl TorrentLibraryUi {
                     });
                 }
             });
+    }
+
+    fn locate_folder(&mut self, ctx: &egui::Context, config: &AppConfig, page_id: i64) {
+        let library = TorrentLibrary::new(
+            Database::new(&config.database_path),
+            config.effective_download_dir(),
+        );
+        self.status = Some("Locating saved folder…".into());
+        self.job(ctx, move |_, _| {
+            library
+                .local_folder(page_id)
+                .map(Outcome::FolderLocated)
+                .map_err(|error| error.to_string())
+        });
     }
 
     fn render_editor(&mut self, ui: &mut egui::Ui, config: &AppConfig, card: &Arc<TorrentCard>) {
@@ -1343,6 +1386,20 @@ impl TorrentLibraryUi {
     }
 }
 
+fn folder_button(ui: &mut egui::Ui, config: &AppConfig, enabled: bool) -> bool {
+    let configured = config.has_download_folder();
+    let response = ui
+        .add_enabled(enabled && configured, egui::Button::new("Open folder"))
+        .on_hover_text("Open the folder containing this release's local files");
+    if !configured {
+        response
+            .on_disabled_hover_text("Set the download folder in Settings → Storage.")
+            .clicked()
+    } else {
+        response.clicked()
+    }
+}
+
 fn values_editor(
     ui: &mut egui::Ui,
     label: &str,
@@ -1639,6 +1696,47 @@ mod tests {
         click(&mut editor, &config, &ctx, "Cancel edits");
         assert!(!editor.editing);
         assert!(editor.inputs.iter().all(String::is_empty));
+    }
+
+    #[test]
+    fn a_card_without_images_exposes_its_folder_from_the_list_and_details() {
+        let (_root, config, _db, mut editor, ctx) = fixture();
+        let card = editor.selected.as_ref().unwrap();
+        assert!(card.images.is_empty());
+        let expected = config
+            .effective_download_dir()
+            .join(card.directory.as_ref().unwrap());
+        for details_open in [false, true] {
+            editor.details_open = details_open;
+            render(&mut editor, &config, &ctx, vec![]);
+            let output = render(&mut editor, &config, &ctx, vec![]);
+            let labels = texts(&output);
+            assert!(labels
+                .iter()
+                .any(|(label, _)| label == "1 attachment · No images"));
+            let buttons = labels
+                .into_iter()
+                .filter(|(label, _)| label == "Open folder")
+                .map(|(_, pos)| pos)
+                .collect::<Vec<_>>();
+            assert_eq!(buttons.len(), if details_open { 2 } else { 1 });
+            let position = buttons
+                .into_iter()
+                .max_by(|first, second| first.x.total_cmp(&second.x))
+                .unwrap();
+            click_at(&mut editor, &config, &ctx, position);
+            let message = editor
+                .receiver
+                .take()
+                .expect("the visible Open folder button starts the folder lookup")
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                matches!(message, Message::Finished(Ok(Outcome::FolderLocated(path))) if path == expected)
+            );
+            editor.busy = false;
+            editor.status = None;
+        }
     }
 
     #[test]

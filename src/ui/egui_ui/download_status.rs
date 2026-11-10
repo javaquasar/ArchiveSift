@@ -130,13 +130,19 @@ impl DownloadStatus {
         let mut repair = false;
         ui.horizontal_wrapped(|ui| match &self.files {
             Some(Ok(ImageFiles::Available { saved, total })) => {
-                ui.label(format!("Images saved · {saved} of {total}"));
+                if *total == 0 {
+                    ui.weak("No images found");
+                } else {
+                    ui.label(format!("Images saved · {saved} of {total}"));
+                }
                 let pending = self.is_pending(url);
                 repair = ui
                     .add_enabled(
                         !pending && config.has_download_folder(),
                         egui::Button::new(if pending {
                             "Repair queued"
+                        } else if *total == 0 {
+                            "Check for images"
                         } else if saved < total {
                             "Download missing images"
                         } else {

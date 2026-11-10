@@ -60,6 +60,58 @@ impl TorrentLibrary {
         }
     }
 
+    pub(crate) fn local_folder(&self, page_id: i64) -> AppResult<PathBuf> {
+        if self.base_dir.as_os_str().is_empty() {
+            return Err("Choose the library download folder in Settings → Storage.".into());
+        }
+        let display_root = std::path::absolute(&self.base_dir)?;
+        let root = display_root.canonicalize().map_err(|error| {
+            format!(
+                "Library storage unavailable ({}): {error}",
+                display_root.display()
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(format!(
+                "Library storage is not a directory: {}",
+                display_root.display()
+            )
+            .into());
+        }
+        let card = self.database.torrent_card(page_id)?;
+        let resolve = |stored: &str| {
+            let native = PathBuf::from(stored.replace('\\', "/"));
+            if native.is_absolute() {
+                return native
+                    .canonicalize()
+                    .ok()
+                    .filter(|path| path.starts_with(&root));
+            }
+            checked_path(&root, stored).ok()
+        };
+        let managed = card
+            .directory
+            .as_deref()
+            .and_then(resolve)
+            .filter(|path| path.is_dir());
+        let file_folder = |stored: &str| {
+            resolve(stored)
+                .filter(|path| path.is_file())
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+        };
+        let folder = managed.or_else(|| {
+            card.attachments.iter()
+                .filter(|attachment| attachment.filename.to_ascii_lowercase().ends_with(".torrent"))
+                .find_map(|attachment| file_folder(&attachment.local_file_path))
+        }).or_else(|| {
+            card.attachments.iter().find_map(|attachment| file_folder(&attachment.local_file_path))
+        }).or_else(|| {
+            card.images.iter().filter_map(|image| image.local_file_path.as_deref()).find_map(file_folder)
+        }).ok_or("No local folder or saved file was found for this card. Check the download location.")?;
+        // Keep the configured drive or share spelling when handing the path to the desktop.
+        Ok(display_root.join(folder.strip_prefix(&root)?))
+    }
+
     pub fn prepare(
         &self,
         page_id: i64,
@@ -941,6 +993,58 @@ mod tests {
             &serde_json::to_string(plan).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn legacy_cards_open_the_saved_torrent_or_magnet_folder_without_images() {
+        let (root, db, service, plan) = fixture();
+        let card = db.torrent_card(plan.page_id).unwrap();
+        let managed = service.base_dir.join(card.directory.as_ref().unwrap());
+        assert_eq!(service.local_folder(card.page_id).unwrap(), managed);
+
+        rusqlite::Connection::open(root.path().join("library.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE torrent_cards SET directory=NULL WHERE page_id=?1",
+                [card.page_id],
+            )
+            .unwrap();
+        let torrent_dir = service.base_dir.join("separate torrent folder");
+        fs::create_dir(&torrent_dir).unwrap();
+        let torrent = torrent_dir.join("release.torrent");
+        fs::write(&torrent, "fixture torrent").unwrap();
+        db.save_page_attachment(
+            card.page_id,
+            "fixture-torrent",
+            "release.torrent",
+            &torrent.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(service.local_folder(card.page_id).unwrap(), torrent_dir);
+        fs::remove_file(torrent).unwrap();
+        assert_eq!(service.local_folder(card.page_id).unwrap(), managed);
+
+        fs::remove_file(service.base_dir.join(&card.attachments[0].local_file_path)).unwrap();
+        let outside = root.path().join("outside.torrent");
+        fs::write(&outside, "another folder's file").unwrap();
+        db.save_page_attachment(
+            card.page_id,
+            "outside",
+            "outside.torrent",
+            "../outside.torrent",
+        )
+        .unwrap();
+        assert!(service
+            .local_folder(card.page_id)
+            .unwrap_err()
+            .to_string()
+            .contains("No local folder"));
+        let offline = TorrentLibrary::new(db, root.path().join("unavailable"));
+        assert!(offline
+            .local_folder(card.page_id)
+            .unwrap_err()
+            .to_string()
+            .contains("Library storage unavailable"));
     }
 
     #[test]

@@ -5935,22 +5935,17 @@ fn containing_folder(path: &Path) -> &Path {
 }
 
 fn open_containing_folder(path: &Path) {
-    open_folder(containing_folder(path));
+    let _ = open_folder(containing_folder(path));
 }
 
-pub(super) fn open_folder(folder: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer.exe")
-            .arg(folder)
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(folder).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
-    }
+pub(super) fn open_folder(folder: &Path) -> std::io::Result<()> {
+    let command = if cfg!(target_os = "windows") {
+        "explorer.exe"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(command).arg(folder).spawn()?;
+    Ok(())
 }
