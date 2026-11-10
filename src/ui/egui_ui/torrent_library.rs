@@ -11,6 +11,7 @@ use crate::app::AppConfig;
 use crate::db::Database;
 use crate::models::{
     TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentQuery, TorrentSummaryPage,
+    TORRENT_UNAVAILABLE_NOTICE,
 };
 use crate::services::torrent_library::{
     generated_directory, MoveProgress, TorrentLibrary, TorrentMovePlan,
@@ -98,6 +99,7 @@ pub(super) struct TorrentLibraryUi {
     suggestions: Suggestions,
     refresh_suggestions: bool,
     organize: bool,
+    organize_available: bool,
     plan: Option<Arc<TorrentMovePlan>>,
     receiver: Option<Receiver<Message>>,
     pub(super) busy: bool,
@@ -138,6 +140,7 @@ impl Default for TorrentLibraryUi {
             suggestions: Suggestions::default(),
             refresh_suggestions: true,
             organize: false,
+            organize_available: false,
             plan: None,
             receiver: None,
             busy: false,
@@ -311,6 +314,7 @@ impl TorrentLibraryUi {
         self.actor_input.clear();
         self.actor_suggestions.clear();
         self.folder_name = card.directory_name().unwrap_or("").to_owned();
+        self.organize_available = needs_organization(&card);
         self.selected = Some(card);
         self.details_open = true;
         self.editing = false;
@@ -812,6 +816,13 @@ impl TorrentLibraryUi {
                 url: card.page_url.clone(),
             });
         }
+        if let Some(notice) = card
+            .attributes
+            .iter()
+            .find(|a| a.kind == "notice" && a.label == TORRENT_UNAVAILABLE_NOTICE)
+        {
+            ui.label(egui::RichText::new(&notice.value).color(ui.visuals().warn_fg_color));
+        }
         for (kind, label) in [
             ("description", "Description"),
             ("full_description", "Full description"),
@@ -1064,7 +1075,7 @@ impl TorrentLibraryUi {
                 &mut self.inputs[2],
                 &self.suggestions.categories,
             );
-            if card.directory.is_none() {
+            if self.organize_available {
                 ui.checkbox(
                     &mut self.organize,
                     "Organize existing files into a studio folder",
@@ -1398,6 +1409,29 @@ fn folder_button(ui: &mut egui::Ui, config: &AppConfig, enabled: bool) -> bool {
     } else {
         response.clicked()
     }
+}
+
+fn needs_organization(card: &TorrentCard) -> bool {
+    let Some(directory) = &card.directory else {
+        return true;
+    };
+    let prefix =
+        format!("{}/", directory.replace('\\', "/").trim_end_matches('/')).to_ascii_lowercase();
+    card.images
+        .iter()
+        .filter_map(|image| image.local_file_path.as_deref())
+        .chain(
+            card.attachments
+                .iter()
+                .map(|attachment| attachment.local_file_path.as_str()),
+        )
+        .filter(|path| !path.is_empty())
+        .any(|path| {
+            !path
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .starts_with(&prefix)
+        })
 }
 
 fn values_editor(

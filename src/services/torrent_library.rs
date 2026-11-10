@@ -336,7 +336,7 @@ impl TorrentLibrary {
         {
             return Err("description export destination changed; prepare a new edit".into());
         }
-        if !plan.files.is_empty() {
+        if !plan.files.is_empty() && plan.from_directory != plan.to_directory {
             if let Some(from) = &plan.from_directory {
                 let directory = checked_path(&plan.base_dir, from)?;
                 if directory.is_dir() {

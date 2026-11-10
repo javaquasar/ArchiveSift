@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::{
     TorrentAttachment, TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentPage,
-    TorrentQuery, TorrentSummary, TorrentSummaryPage,
+    TorrentQuery, TorrentSummary, TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE,
 };
 
 pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
@@ -58,6 +58,42 @@ pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_torrent_cards_primary_image ON torrent_cards(primary_image_id) WHERE primary_image_id IS NOT NULL;
          INSERT OR IGNORE INTO app_schema_migrations(migration_key) VALUES('torrent-primary-image-v1');",
     )?;
+    // Earlier builds stored these releases as ordinary image pages. Give
+    // them a studio destination without touching already downloaded files.
+    let missing = {
+        let mut query = tx.prepare(
+            "SELECT DISTINCT sp.id, sp.site_key, sp.page_url, sp.title
+             FROM attributes a JOIN page_attributes pa ON pa.attribute_id=a.id
+             JOIN source_pages sp ON sp.id=pa.page_id
+             LEFT JOIN torrent_cards tc ON tc.page_id=sp.id
+             WHERE a.kind='notice' AND a.label=?1 AND tc.page_id IS NULL",
+        )?;
+        let rows = query
+            .query_map([TORRENT_UNAVAILABLE_NOTICE], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let ids = missing.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>();
+    let mut metadata = batch_load_page_attributes(&tx, &ids)?;
+    for (page_id, site, url, title) in missing {
+        register_studio_card(
+            &tx,
+            page_id,
+            &site,
+            &url,
+            &title,
+            &metadata.remove(&page_id).unwrap_or_default(),
+        )?;
+        apply_overrides(&tx, page_id)?;
+        refresh_page_search_index(&tx, page_id)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -67,34 +103,54 @@ pub(super) fn after_scrape(
     page: &ScrapedItem,
     page_id: i64,
 ) -> AppResult<()> {
-    if page
-        .attributes
-        .iter()
-        .any(|a| matches!(a.kind.as_str(), "attachment" | "magnet"))
-    {
-        let studio = page
-            .attribute_values("studio")
-            .find(|s| !s.trim().is_empty())
-            .unwrap_or("");
-        let title = page
-            .attribute_values("content_title")
-            .find(|s| !s.trim().is_empty())
-            .unwrap_or(&page.title);
-        let directory = crate::fs::torrent::torrent_directory_with_year(
-            &page.site_key,
-            studio,
-            title,
-            &page.page_url,
+    if page.attributes.iter().any(|a| {
+        matches!(a.kind.as_str(), "attachment" | "magnet")
+            || (a.kind == "notice" && a.label == TORRENT_UNAVAILABLE_NOTICE)
+    }) {
+        register_studio_card(
+            tx,
             page_id,
-            crate::fs::torrent::production_year(&page.attributes),
-        );
-        tx.execute("INSERT OR IGNORE INTO torrent_cards(page_id,primary_studio,directory) VALUES(?1,?2,?3)", params![page_id,studio,directory.to_string_lossy()])?;
+            &page.site_key,
+            &page.page_url,
+            &page.title,
+            &page.attributes,
+        )?;
     }
     tx.execute(
         "UPDATE torrent_cards SET revision=revision+1 WHERE page_id=?1",
         [page_id],
     )?;
     apply_overrides(tx, page_id)
+}
+
+fn register_studio_card(
+    tx: &Transaction<'_>,
+    page_id: i64,
+    site: &str,
+    url: &str,
+    title: &str,
+    attributes: &[MetadataAttribute],
+) -> AppResult<()> {
+    let value = |kind: &str| {
+        attributes
+            .iter()
+            .find(|a| a.kind == kind && !a.value.trim().is_empty())
+            .map(|a| a.value.as_str())
+    };
+    let studio = value("studio").unwrap_or_default();
+    let directory = crate::fs::torrent::torrent_directory_with_year(
+        site,
+        studio,
+        value("content_title").unwrap_or(title),
+        url,
+        page_id,
+        crate::fs::torrent::production_year(attributes),
+    );
+    tx.execute(
+        "INSERT OR IGNORE INTO torrent_cards(page_id,primary_studio,directory) VALUES(?1,?2,?3)",
+        params![page_id, studio, directory.to_string_lossy()],
+    )?;
+    Ok(())
 }
 
 fn apply_overrides(tx: &Transaction<'_>, page_id: i64) -> AppResult<()> {
@@ -304,6 +360,105 @@ fn read_card(connection: &Connection, page_id: i64) -> AppResult<TorrentCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previously_unclassified_releases_can_be_organized_into_their_recorded_studio() {
+        use crate::services::torrent_library::TorrentLibrary;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("legacy.sqlite3");
+        let base = root.path().join("downloads");
+        let db = Database::new(&path);
+        db.initialize().unwrap();
+        let mut page = ScrapedItem {
+            site_key: "example-source".into(),
+            page_url: "https://example.test/release/42".into(),
+            title: "Legacy release".into(),
+            raw_html: String::new(),
+            images: vec![ScrapedImage {
+                source_url: "https://example.test/image.jpg".into(),
+                preview_url: None,
+                alt_text: None,
+                width: None,
+                height: None,
+                sort_order: 0,
+                local_file_path: None,
+            }],
+            attributes: [
+                ("studio", "Studio", "Archive Studio"),
+                ("actor", "Actor", "Example Actor"),
+                (
+                    "notice",
+                    TORRENT_UNAVAILABLE_NOTICE,
+                    "The release has no visible download link.",
+                ),
+            ]
+            .into_iter()
+            .map(|(kind, label, value)| MetadataAttribute {
+                kind: kind.into(),
+                label: label.into(),
+                value: value.into(),
+                source_url: None,
+                is_female: None,
+            })
+            .collect(),
+        };
+        let persisted = db.upsert_scraped_item(&page).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM torrent_cards WHERE page_id=?1",
+                [persisted.page_id],
+            )
+            .unwrap();
+        let legacy = PathBuf::from("example-source/example_actor/legacy/001.jpg");
+        std::fs::create_dir_all(base.join(legacy.parent().unwrap())).unwrap();
+        std::fs::write(base.join(&legacy), b"legacy image").unwrap();
+        db.update_image_file_location(
+            persisted.page_id,
+            persisted.image_ids_by_url[&page.images[0].source_url],
+            &legacy.to_string_lossy(),
+        )
+        .unwrap();
+
+        page.page_url = "https://example.test/gallery/1".into();
+        page.attributes.last_mut().unwrap().label = "Image preview fallback".into();
+        page.attributes.last_mut().unwrap().value = "The preview was retained.".into();
+        let gallery_id = db.upsert_scraped_item(&page).unwrap().page_id;
+        initialize(&mut connection).unwrap();
+        initialize(&mut connection).unwrap();
+        assert!(!db.is_torrent_page(gallery_id).unwrap());
+        let card = db.torrent_card(persisted.page_id).unwrap();
+        assert_eq!(card.primary_studio, "Archive Studio");
+        assert_eq!(
+            card.images[0].local_file_path.as_deref(),
+            Some(legacy.to_string_lossy().as_ref())
+        );
+        assert!(base.join(&legacy).is_file());
+
+        let directory = base.join(card.directory.as_ref().unwrap());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("description.txt"),
+            b"Already in the studio directory",
+        )
+        .unwrap();
+        let library = TorrentLibrary::new(db.clone(), base.clone());
+        let plan = library
+            .prepare(card.page_id, card.revision, TorrentEdit::from(&card), true)
+            .unwrap();
+        assert_eq!(plan.to_directory, card.directory);
+        assert_eq!(plan.files.len(), 1);
+        let saved = library.apply(plan, |_| {}).unwrap();
+        let saved_path = base.join(saved.images[0].local_file_path.as_ref().unwrap());
+        assert!(saved_path.starts_with(directory.join("images")));
+        assert_eq!(std::fs::read(saved_path).unwrap(), b"legacy image");
+        assert_eq!(
+            std::fs::read(directory.join("description.txt")).unwrap(),
+            b"Already in the studio directory"
+        );
+        assert!(!base.join(legacy).exists());
+    }
 
     #[test]
     fn primary_image_migration_preserves_existing_cards_and_is_repeatable() {

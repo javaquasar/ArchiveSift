@@ -198,6 +198,10 @@ with the built-in pipeline.
 
 ## Content attachments without changing API 1.0
 
+When an adapter recognizes a torrent release but the source hides its download
+link, it can return a `notice` attribute labeled `Torrent unavailable`. The host
+uses the studio layout for that card and saves the available images and description.
+
 An attribute with `kind: "attachment"` declares a binary file. `label` is its
 suggested filename; `value` is its stable download URL; `source_url` is the same
 HTTP(S) URL. The host validates that URL against the package's network origins,

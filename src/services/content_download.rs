@@ -291,9 +291,21 @@ impl
                 let image_id = image_ids_by_url.get(&image.source_url)?;
                 let mut request =
                     build_download_request(image, page, page_id, *image_id, &self.strategy);
-                let existing_path = existing.get(image_id).filter(|p| !p.is_empty());
-                if let Some(path) = existing_path {
-                    request.relative_path = path.into();
+                let existing_path = existing
+                    .get(image_id)
+                    .filter(|p| !p.is_empty())
+                    .map(|path| {
+                        PathBuf::from(path.replace('\\', "/"))
+                            .components()
+                            .collect::<PathBuf>()
+                    })
+                    .filter(|path| {
+                        directory.as_ref().is_none_or(|directory| {
+                            path.starts_with(directory) || self.base_dir.join(path).is_file()
+                        })
+                    });
+                if let Some(path) = &existing_path {
+                    request.relative_path = path.clone();
                 } else if let Some(directory) = &directory {
                     let filename = request.relative_path.file_name()?.to_owned();
                     request.relative_path = directory.join("images").join(filename);
@@ -692,6 +704,85 @@ mod tests {
             requests[0].image_url,
             "https://cdn.example.test/media/known.jpg"
         );
+    }
+
+    #[tokio::test]
+    async fn a_release_without_a_torrent_link_uses_the_studio_directory_for_new_files() {
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::new(root.path().join("archive.sqlite3"));
+        database.initialize().unwrap();
+        let base = root.path().join("downloads");
+        let service = ContentDownloadService::new(
+            ScraperRegistry::new(),
+            database.clone(),
+            FileDownloadStore::new(),
+            ConsoleUi::new(),
+            StructuredDirectoryStrategy,
+            base.clone(),
+            root.path().join("thumbs"),
+        );
+        let mut page = sample_page();
+        page.images = vec![
+            sample_image("https://example.test/first.png"),
+            sample_image("https://example.test/second.png"),
+        ];
+        for (kind, label, value) in [
+            ("actor", "Actor", "Example Actor"),
+            ("studio", "Studio", "First Studio"),
+            ("studio", "Studio", "Second Studio"),
+            (
+                "notice",
+                crate::models::TORRENT_UNAVAILABLE_NOTICE,
+                "Sign in to access the torrent link.",
+            ),
+        ] {
+            page.attributes.push(crate::models::MetadataAttribute {
+                kind: kind.into(),
+                label: label.into(),
+                value: value.into(),
+                source_url: None,
+                is_female: None,
+            });
+        }
+        let persisted = database.upsert_scraped_item(&page).unwrap();
+        let card = database.torrent_card(persisted.page_id).unwrap();
+        let studio_dir = PathBuf::from(card.directory.unwrap());
+        assert_eq!(card.primary_studio, "First Studio");
+        assert!(studio_dir
+            .components()
+            .any(|part| part.as_os_str() == "First Studio"));
+        super::super::attachments::save_description(persisted.page_id, &database, &base)
+            .await
+            .unwrap();
+        assert!(base.join(&studio_dir).join("description.txt").is_file());
+        let make_requests = || {
+            service
+                .build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)
+                .unwrap()
+        };
+        assert!(make_requests()
+            .iter()
+            .all(|r| r.relative_path.starts_with(studio_dir.join("images"))));
+
+        let existing = PathBuf::from("example-source/example_actor/release/first.png");
+        let missing = PathBuf::from("example-source/example_actor/release/second.png");
+        std::fs::create_dir_all(base.join(existing.parent().unwrap())).unwrap();
+        std::fs::write(base.join(&existing), b"saved image").unwrap();
+        for (image, path) in page.images.iter().zip([&existing, &missing]) {
+            database
+                .update_image_file_location(
+                    persisted.page_id,
+                    persisted.image_ids_by_url[&image.source_url],
+                    &path.to_string_lossy(),
+                )
+                .unwrap();
+        }
+        let requests = make_requests();
+        assert_eq!(requests[0].relative_path, existing);
+        assert!(requests[1]
+            .relative_path
+            .starts_with(studio_dir.join("images")));
+        assert!(!base.join(missing).exists());
     }
 
     #[tokio::test]

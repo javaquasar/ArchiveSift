@@ -1,6 +1,8 @@
 use super::MetadataAttribute;
 use std::collections::BTreeMap;
 
+pub(crate) const TORRENT_UNAVAILABLE_NOTICE: &str = "Torrent unavailable";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TorrentQuery {
     pub text: String,
