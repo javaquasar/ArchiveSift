@@ -15,17 +15,23 @@ fn valid_year(value: &str) -> Option<&str> {
     Some(year)
 }
 
-pub fn production_year(attributes: &[MetadataAttribute]) -> Option<&str> {
-    for kind in ["production_date", "date", "year", "release_date"] {
-        if let Some(year) = attributes
+pub(crate) const RELEASE_DATE_KINDS: [&str; 4] =
+    ["production_date", "date", "year", "release_date"];
+
+pub(crate) fn production_date(attributes: &[MetadataAttribute]) -> Option<&str> {
+    for kind in RELEASE_DATE_KINDS {
+        if let Some(attribute) = attributes
             .iter()
-            .filter(|attribute| attribute.kind == kind)
-            .find_map(|attribute| valid_year(&attribute.value))
+            .find(|attribute| attribute.kind == kind && valid_year(&attribute.value).is_some())
         {
-            return Some(year);
+            return Some(attribute.value.trim());
         }
     }
     None
+}
+
+pub fn production_year(attributes: &[MetadataAttribute]) -> Option<&str> {
+    production_date(attributes).and_then(valid_year)
 }
 
 /// Portable components, including Windows device names, even when built on Unix.

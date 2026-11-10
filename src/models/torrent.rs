@@ -1,4 +1,5 @@
 use super::MetadataAttribute;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TorrentQuery {
@@ -63,12 +64,86 @@ impl TorrentCard {
             .collect()
     }
 
-    pub fn content_title(&self) -> &str {
+    pub fn value(&self, kind: &str) -> &str {
         self.attributes
             .iter()
-            .find(|a| a.kind == "content_title" && !a.value.trim().is_empty())
-            .map(|a| a.value.as_str())
-            .unwrap_or(&self.title)
+            .find(|a| a.kind == kind && !a.value.trim().is_empty())
+            .map_or("", |attribute| attribute.value.as_str())
+    }
+
+    pub fn content_title(&self) -> &str {
+        match self.value("content_title") {
+            "" => &self.title,
+            title => title,
+        }
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TorrentField {
+    Title,
+    Release,
+    Duration,
+    OriginalLanguage,
+    TranslationLanguage,
+    Series,
+    Episode,
+    StudioCode,
+}
+
+impl TorrentField {
+    pub const ALL: [Self; 8] = [
+        Self::Title,
+        Self::Release,
+        Self::Duration,
+        Self::OriginalLanguage,
+        Self::TranslationLanguage,
+        Self::Series,
+        Self::Episode,
+        Self::StudioCode,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Title => "Catalog title",
+            Self::Release => "Release date / year",
+            Self::Duration => "Duration",
+            Self::OriginalLanguage => "Original language",
+            Self::TranslationLanguage => "Translation language",
+            Self::Series => "Series",
+            Self::Episode => "Part / episode",
+            Self::StudioCode => "Studio code",
+        }
+    }
+
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Title => "content_title",
+            Self::Release => "date",
+            Self::Duration => "duration",
+            Self::OriginalLanguage => "language",
+            Self::TranslationLanguage => "translation_language",
+            Self::Series => "series",
+            Self::Episode => "episode",
+            Self::StudioCode => "studio_code",
+        }
+    }
+
+    pub fn value(self, card: &TorrentCard) -> &str {
+        match self {
+            Self::Release => crate::fs::torrent::production_date(&card.attributes)
+                .or_else(|| {
+                    crate::fs::torrent::RELEASE_DATE_KINDS
+                        .into_iter()
+                        .map(|kind| card.value(kind))
+                        .find(|value| !value.is_empty())
+                })
+                .unwrap_or_default(),
+            _ => card.value(self.kind()),
+        }
     }
 }
 
@@ -82,6 +157,18 @@ pub struct TorrentEdit {
     pub studios: Vec<String>,
     pub tags: Vec<String>,
     pub categories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actors: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directors: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_description: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: BTreeMap<TorrentField, String>,
+    #[serde(default)]
+    pub regenerate_folder: bool,
 }
 
 impl From<&TorrentCard> for TorrentEdit {
@@ -93,6 +180,7 @@ impl From<&TorrentCard> for TorrentEdit {
             studios: card.values("studio"),
             tags: card.values("tag"),
             categories: card.values("category"),
+            ..Self::default()
         }
     }
 }

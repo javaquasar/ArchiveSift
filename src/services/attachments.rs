@@ -4,17 +4,64 @@ use std::path::{Path, PathBuf};
 use sha1::Digest;
 
 use crate::db::{Database, FileDownloadStore};
-use crate::models::ScrapedItem;
+use crate::models::{ScrapedItem, TorrentCard};
 use crate::scraper::ContentScraper;
 use crate::AppResult;
 
-const DESCRIPTION_SOURCE: &str = "archivesift:description";
-const DESCRIPTION_FILENAME: &str = "description.txt";
+pub(super) const DESCRIPTION_SOURCE: &str = "archivesift:description";
+pub(super) const DESCRIPTION_FILENAME: &str = "description.txt";
+
+pub(super) fn description_path(card: &TorrentCard, directory: Option<&str>) -> PathBuf {
+    if let Some(existing) = card
+        .attachments
+        .iter()
+        .find(|a| a.source_url == DESCRIPTION_SOURCE)
+    {
+        return PathBuf::from(existing.local_file_path.replace('\\', "/"));
+    }
+    if let Some(directory) = directory {
+        return PathBuf::from(directory.replace('\\', "/")).join(DESCRIPTION_FILENAME);
+    }
+    card.attachments
+        .iter()
+        .find(|a| a.filename.to_ascii_lowercase().ends_with(".torrent"))
+        .or_else(|| card.attachments.first())
+        .map(|attachment| {
+            PathBuf::from(attachment.local_file_path.replace('\\', "/"))
+                .with_file_name(DESCRIPTION_FILENAME)
+        })
+        .unwrap_or_else(|| {
+            relative_path(
+                &card.site_key,
+                card.page_id,
+                DESCRIPTION_SOURCE,
+                DESCRIPTION_FILENAME,
+            )
+            .with_file_name(DESCRIPTION_FILENAME)
+        })
+}
+
+pub(super) fn description_text(card: &TorrentCard) -> String {
+    let description = card.value("full_description");
+    let description = if description.is_empty() {
+        card.value("description")
+    } else {
+        description
+    };
+    let mut text = card.title.clone();
+    if !description.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(description);
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
 
 /// Export page-level text once, independently of image and torrent downloads.
 /// The caller holds the page lock and file lease through the complete operation.
 pub(crate) async fn save_description(
-    page: &ScrapedItem,
     page_id: i64,
     database: &Database,
     base_dir: &Path,
@@ -22,50 +69,17 @@ pub(crate) async fn save_description(
     if !database.is_torrent_page(page_id)? {
         return Ok(());
     }
-    let existing = database.attachment_path(page_id, DESCRIPTION_SOURCE)?;
-    let relative = match &existing {
-        Some(path) => path.clone(),
-        None => match database.torrent_directory(page_id)? {
-            Some(directory) => directory.join(DESCRIPTION_FILENAME),
-            None => {
-                // Legacy cards have no managed directory. Keep the export next to
-                // their torrent or magnet, and track it for a later confirmed move.
-                let card = database.torrent_card(page_id)?;
-                let attachment = card
-                    .attachments
-                    .iter()
-                    .find(|a| a.filename.to_ascii_lowercase().ends_with(".torrent"))
-                    .or_else(|| card.attachments.first());
-                match attachment {
-                    Some(attachment) => {
-                        PathBuf::from(attachment.local_file_path.replace('\\', "/"))
-                            .with_file_name(DESCRIPTION_FILENAME)
-                    }
-                    None => relative_path(page, page_id, DESCRIPTION_SOURCE, DESCRIPTION_FILENAME)
-                        .with_file_name(DESCRIPTION_FILENAME),
-                }
-            }
-        },
-    };
-    let description = page
-        .attribute_values("full_description")
-        .find(|text| !text.trim().is_empty())
-        .or_else(|| {
-            page.attribute_values("description")
-                .find(|text| !text.trim().is_empty())
-        });
-    let mut text = page.title.clone();
-    if let Some(description) = description {
-        text.push_str("\n\n");
-        text.push_str(description);
-    }
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    let card = database.torrent_card(page_id)?;
+    let existing = card
+        .attachments
+        .iter()
+        .any(|a| a.source_url == DESCRIPTION_SOURCE);
+    let relative = description_path(&card, card.directory.as_deref());
+    let text = description_text(&card);
     tokio::fs::create_dir_all(base_dir).await?;
     let root = tokio::fs::canonicalize(base_dir).await?;
     let path = super::torrent_library::checked_path(&root, &relative.to_string_lossy())?;
-    if existing.is_none() && path.try_exists()? {
+    if !existing && path.try_exists()? {
         // An identical unregistered export can be left by a failed DB write.
         // Other pre-existing text files belong to the user and must be retained.
         if tokio::fs::metadata(&path).await?.len() != text.len() as u64
@@ -254,7 +268,7 @@ pub(crate) fn torrent_magnet(bytes: &[u8]) -> AppResult<String> {
     Ok(magnet)
 }
 
-fn relative_path(page: &ScrapedItem, page_id: i64, source: &str, name: &str) -> PathBuf {
+fn relative_path(site_key: &str, page_id: i64, source: &str, name: &str) -> PathBuf {
     let clean = |s: &str| {
         s.chars()
             .map(|c| {
@@ -270,7 +284,7 @@ fn relative_path(page: &ScrapedItem, page_id: i64, source: &str, name: &str) -> 
             .to_string()
     };
     let hash = sha2::Sha256::digest(source.as_bytes());
-    PathBuf::from(clean(&page.site_key))
+    PathBuf::from(clean(site_key))
         .join("attachments")
         .join(page_id.to_string())
         .join(format!("{:.12}_{}", format!("{hash:x}"), clean(name)))
@@ -286,7 +300,7 @@ fn stored_relative_path(
     if let Some(path) = database.attachment_path(page_id, source)? {
         return Ok(path);
     }
-    let old = relative_path(page, page_id, source, name);
+    let old = relative_path(&page.site_key, page_id, source, name);
     Ok(match database.torrent_directory(page_id)? {
         Some(directory) => directory.join(old.file_name().ok_or("attachment has no filename")?),
         None => old,

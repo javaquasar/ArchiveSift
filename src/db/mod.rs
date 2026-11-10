@@ -2838,9 +2838,11 @@ fn batch_load_page_attributes(
     for page_batch in page_ids.chunks(SQLITE_ID_BATCH_SIZE) {
         let sql = format!(
             r#"
-            SELECT pa.page_id, a.kind, a.label, a.value, a.source_url, a.is_female
+            SELECT pa.page_id, a.kind, a.label, COALESCE(o.value, a.value), a.source_url, a.is_female
             FROM page_attributes pa
             INNER JOIN attributes a ON a.id = pa.attribute_id
+            LEFT JOIN page_attribute_overrides o ON o.page_id=pa.page_id AND o.kind=a.kind
+                AND o.normalized_value=a.normalized_value AND o.removed=0
             WHERE pa.page_id IN ({})
             ORDER BY pa.page_id, a.kind, a.value
             "#,

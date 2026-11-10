@@ -209,13 +209,8 @@ impl
                     .collect::<Vec<_>>(),
             )?;
 
-            super::attachments::save_description(
-                &page,
-                persisted.page_id,
-                &self.database,
-                &self.base_dir,
-            )
-            .await?;
+            super::attachments::save_description(persisted.page_id, &self.database, &self.base_dir)
+                .await?;
         }
 
         let requests =

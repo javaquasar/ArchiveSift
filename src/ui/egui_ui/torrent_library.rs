@@ -9,8 +9,12 @@ use super::preview_loader::{ImageLoadMode, PreviewLoader, PreviewSource};
 use super::texture_cache::SizedLruCache;
 use crate::app::AppConfig;
 use crate::db::Database;
-use crate::models::{TorrentCard, TorrentEdit, TorrentImage, TorrentQuery, TorrentSummaryPage};
-use crate::services::torrent_library::{MoveProgress, TorrentLibrary, TorrentMovePlan};
+use crate::models::{
+    TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentQuery, TorrentSummaryPage,
+};
+use crate::services::torrent_library::{
+    generated_directory, MoveProgress, TorrentLibrary, TorrentMovePlan,
+};
 use eframe::egui;
 
 #[derive(Default)]
@@ -88,10 +92,12 @@ pub(super) struct TorrentLibraryUi {
     edit: TorrentEdit,
     folder_name: String,
     inputs: [String; 3],
+    actor_input: String,
+    actor_suggestions: Vec<String>,
     suggestions: Suggestions,
     refresh_suggestions: bool,
     organize: bool,
-    plan: Option<TorrentMovePlan>,
+    plan: Option<Arc<TorrentMovePlan>>,
     receiver: Option<Receiver<Message>>,
     pub(super) busy: bool,
     loaded: bool,
@@ -126,6 +132,8 @@ impl Default for TorrentLibraryUi {
             edit: TorrentEdit::default(),
             folder_name: String::new(),
             inputs: Default::default(),
+            actor_input: String::new(),
+            actor_suggestions: Vec::new(),
             suggestions: Suggestions::default(),
             refresh_suggestions: true,
             organize: false,
@@ -200,6 +208,12 @@ impl TorrentLibraryUi {
             .set_suggestions(database, query, values);
     }
 
+    pub(super) fn set_actor_suggestions(&mut self, query: &str, suggestions: &[String]) {
+        if self.editing && self.actor_input.trim() == query {
+            self.actor_suggestions = suggestions.to_vec();
+        }
+    }
+
     pub(super) fn recover_on_start(&mut self, ctx: &egui::Context, config: &AppConfig) {
         self.recovering = true;
         let library = TorrentLibrary::new(
@@ -252,7 +266,7 @@ impl TorrentLibraryUi {
                             self.status = None;
                         }
                         Ok(Outcome::Planned(plan)) => {
-                            self.plan = Some(plan);
+                            self.plan = Some(Arc::new(plan));
                             self.status = None;
                         }
                         Ok(Outcome::Saved(card)) => {
@@ -278,6 +292,16 @@ impl TorrentLibraryUi {
     fn select(&mut self, card: impl Into<Arc<TorrentCard>>) {
         let card = card.into();
         self.edit = TorrentEdit::from(card.as_ref());
+        self.edit.actors = Some(card.values("actor"));
+        self.edit.directors = Some(card.values("director"));
+        self.edit.description = Some(card.value("description").into());
+        self.edit.full_description = Some(card.value("full_description").into());
+        self.edit.details = TorrentField::ALL
+            .into_iter()
+            .map(|field| (field, field.value(&card).to_owned()))
+            .collect();
+        self.actor_input.clear();
+        self.actor_suggestions.clear();
         self.folder_name = card.directory_name().unwrap_or("").to_owned();
         self.selected = Some(card);
         self.details_open = true;
@@ -290,7 +314,19 @@ impl TorrentLibraryUi {
 
     fn draft_edit(&self, card: &TorrentCard) -> TorrentEdit {
         let mut edit = self.edit.clone();
-        if self.folder_name != card.directory_name().unwrap_or("") {
+        edit.details
+            .retain(|field, value| value.trim() != field.value(card));
+        edit.actors = edit.actors.filter(|values| *values != card.values("actor"));
+        edit.directors = edit
+            .directors
+            .filter(|values| *values != card.values("director"));
+        edit.description = edit
+            .description
+            .filter(|value| value != card.value("description"));
+        edit.full_description = edit
+            .full_description
+            .filter(|value| value != card.value("full_description"));
+        if !edit.regenerate_folder && self.folder_name != card.directory_name().unwrap_or("") {
             edit.folder_name = Some(self.folder_name.clone());
         }
         edit
@@ -756,10 +792,16 @@ impl TorrentLibraryUi {
             }
         }
         self.render_gallery(ui, config, &card);
+        for field in TorrentField::ALL
+            .into_iter()
+            .filter(|field| *field != TorrentField::Title)
+        {
+            let value = field.value(&card);
+            if !value.is_empty() {
+                ui.label(format!("{} · {}", field.label(), value));
+            }
+        }
         for kind in [
-            "date",
-            "release_date",
-            "duration",
             "actor",
             "director",
             "author",
@@ -888,16 +930,57 @@ impl TorrentLibraryUi {
         }
         ui.separator();
         ui.add_enabled_ui(!self.busy && self.plan.is_none(), |ui| {
+            ui.collapsing("Catalog metadata", |ui| {
+                for field in TorrentField::ALL {
+                    ui.label(field.label());
+                    let hint = match field {
+                        TorrentField::Release => "YYYY or YYYY-MM-DD",
+                        TorrentField::Duration => "HH:MM:SS",
+                        _ => "",
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(self.edit.details.entry(field).or_default())
+                            .hint_text(hint)
+                            .desired_width(f32::INFINITY)
+                            .char_limit(512),
+                    );
+                }
+            });
+            ui.collapsing("Descriptions and people", |ui| {
+                self.render_descriptions_and_people(ui, config)
+            });
+        });
+        ui.add_enabled_ui(!self.busy && self.plan.is_none(), |ui| {
             self.render_gallery(ui, config, card);
         });
         ui.add_enabled_ui(!self.busy && self.plan.is_none(), |ui| {
             ui.label("Folder name");
-            ui.add(
+            ui.add_enabled(
+                !self.edit.regenerate_folder,
                 egui::TextEdit::singleline(&mut self.folder_name)
                     .desired_width(f32::INFINITY)
                     .hint_text("Generated from title and year")
                     .char_limit(120),
             );
+            ui.checkbox(
+                &mut self.edit.regenerate_folder,
+                "Rename folder using catalog title and year",
+            );
+            if self.edit.regenerate_folder
+                || [TorrentField::Title, TorrentField::Release]
+                    .into_iter()
+                    .any(|field| {
+                        self.edit
+                            .details
+                            .get(&field)
+                            .is_some_and(|value| value.trim() != field.value(card))
+                    })
+            {
+                let suggested = generated_directory(card, &self.edit);
+                if let Some(name) = suggested.file_name() {
+                    ui.weak(format!("Suggested folder · {}", name.to_string_lossy()));
+                }
+            }
             ui.weak(
                 "Review and save previews the new folder. Confirm and move transfers all files.",
             );
@@ -919,7 +1002,7 @@ impl TorrentLibraryUi {
                 });
             values_editor(
                 ui,
-                "Studios",
+                "Studios / companies",
                 &mut self.edit.studios,
                 &mut self.inputs[0],
                 &self.suggestions.studios,
@@ -950,6 +1033,118 @@ impl TorrentLibraryUi {
                 );
             }
         });
+    }
+
+    fn render_descriptions_and_people(&mut self, ui: &mut egui::Ui, config: &AppConfig) {
+        for (label, text, rows) in [
+            ("Description", &mut self.edit.description, 3),
+            ("Full description", &mut self.edit.full_description, 8),
+        ] {
+            ui.label(label);
+            ui.add(
+                egui::TextEdit::multiline(text.get_or_insert_with(String::new))
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(rows),
+            );
+        }
+        ui.label("Actors");
+        let actors = self.edit.actors.get_or_insert_with(Vec::new);
+        if actors.is_empty() {
+            ui.weak("No actors listed.");
+        }
+        let mut removed = None;
+        for (index, actor) in actors.iter_mut().enumerate() {
+            ui.push_id(("actor", index), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(actor)
+                            .char_limit(256)
+                            .hint_text("Actor name"),
+                    );
+                    if ui.small_button(format!("Remove {actor}")).clicked() {
+                        removed = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = removed {
+            actors.remove(index);
+        }
+        let mut choice = None;
+        ui.horizontal_wrapped(|ui| {
+            let input = ui.add(
+                egui::TextEdit::singleline(&mut self.actor_input)
+                    .hint_text("Find or enter an actor")
+                    .char_limit(256),
+            );
+            if input.changed() {
+                self.actor_suggestions.clear();
+                if !self.actor_input.trim().is_empty() {
+                    self.pending_command = Some(crate::ui::UiCommand::SuggestActors {
+                        database_path: config.database_path.clone(),
+                        query: self.actor_input.trim().to_owned(),
+                    });
+                }
+            }
+            let can_add = actors.len() < 200 && !self.actor_input.trim().is_empty();
+            if ui
+                .add_enabled(can_add, egui::Button::new("Add actor"))
+                .clicked()
+                || (can_add
+                    && input.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                choice = Some(self.actor_input.trim().to_owned());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for actor in self
+                .actor_suggestions
+                .iter()
+                .filter(|name| !actors.iter().any(|actor| actor.eq_ignore_ascii_case(name)))
+                .take(8)
+            {
+                if ui
+                    .add_enabled(actors.len() < 200, egui::Button::new(actor))
+                    .clicked()
+                {
+                    choice = Some(actor.clone());
+                }
+            }
+        });
+        if let Some(actor) = choice {
+            if !actors.iter().any(|name| name.eq_ignore_ascii_case(&actor)) {
+                actors.push(actor);
+            }
+            self.actor_input.clear();
+            self.actor_suggestions.clear();
+        }
+        ui.label("Directors");
+        let directors = self.edit.directors.get_or_insert_with(Vec::new);
+        let mut removed = None;
+        for (index, name) in directors.iter_mut().enumerate() {
+            ui.push_id(index, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Director name")
+                            .char_limit(256),
+                    );
+                    if ui.small_button("Remove director").clicked() {
+                        removed = Some(index);
+                    }
+                });
+            });
+        }
+        if let Some(index) = removed {
+            directors.remove(index);
+        }
+        if ui
+            .add_enabled(directors.len() < 200, egui::Button::new("Add director"))
+            .clicked()
+        {
+            directors.push(String::new());
+        }
     }
 
     fn confirm(&mut self, ctx: &egui::Context, config: &AppConfig) {
@@ -1018,6 +1213,9 @@ impl TorrentLibraryUi {
                     plan.files.len(),
                     plan.files.iter().map(|f| f.size).sum::<u64>()
                 ));
+                if plan.description_export.is_some() {
+                    ui.label("Update description.txt");
+                }
                 egui::ScrollArea::vertical()
                     .max_height(200.0)
                     .show(ui, |ui| {
@@ -1039,7 +1237,7 @@ impl TorrentLibraryUi {
                                 Database::new(&config.database_path),
                                 config.effective_download_dir(),
                             );
-                            let plan = plan.clone();
+                            let plan = plan.as_ref().clone();
                             self.job(ctx, move |tx, ctx| {
                                 library
                                     .apply(plan, |p| {
@@ -1256,6 +1454,20 @@ mod tests {
                     source_url: None,
                     is_female: None,
                 },
+                MetadataAttribute {
+                    kind: "actor".into(),
+                    label: "Actor".into(),
+                    value: "Fixture Actor".into(),
+                    source_url: None,
+                    is_female: None,
+                },
+                MetadataAttribute {
+                    kind: "director".into(),
+                    label: "Director".into(),
+                    value: "Fixture Director".into(),
+                    source_url: None,
+                    is_female: None,
+                },
             ],
         };
         let id = db.upsert_scraped_item(&page).unwrap().page_id;
@@ -1409,7 +1621,7 @@ mod tests {
             "Full torrent heading [2025]",
             "Primary studio",
             "Folder name",
-            "Studios",
+            "Studios / companies",
             "Tags",
             "Categories",
             "Review and save",
@@ -1427,6 +1639,83 @@ mod tests {
         click(&mut editor, &config, &ctx, "Cancel edits");
         assert!(!editor.editing);
         assert!(editor.inputs.iter().all(String::is_empty));
+    }
+
+    #[test]
+    fn people_and_description_controls_edit_a_draft_until_confirmation() {
+        let (_root, config, db, mut editor, ctx) = fixture();
+        click(&mut editor, &config, &ctx, "Edit");
+        click(&mut editor, &config, &ctx, "Descriptions and people");
+        let _ = render(&mut editor, &config, &ctx, vec![]);
+        click(&mut editor, &config, &ctx, "Remove Fixture Actor");
+        click(&mut editor, &config, &ctx, "Remove director");
+        click(&mut editor, &config, &ctx, "Add director");
+        assert_eq!(editor.edit.directors.as_deref(), Some(&[String::new()][..]));
+        editor.edit.directors.as_mut().unwrap()[0] = "New Director".into();
+        editor.edit.full_description = Some("Edited through the card.".into());
+        let id = editor.selected.as_ref().unwrap().page_id;
+        assert_eq!(
+            db.torrent_card(id).unwrap().values("actor"),
+            ["Fixture Actor"]
+        );
+        click(&mut editor, &config, &ctx, "Review and save");
+        finish(&mut editor);
+        assert!(editor.plan.as_ref().unwrap().description_export.is_some());
+        click(&mut editor, &config, &ctx, "Confirm and save");
+        assert!(finish(&mut editor));
+        let saved = db.torrent_card(id).unwrap();
+        assert!(saved.values("actor").is_empty());
+        assert_eq!(saved.values("director"), ["New Director"]);
+        assert_eq!(saved.value("full_description"), "Edited through the card.");
+    }
+
+    #[test]
+    fn catalog_editor_previews_the_folder_and_adds_an_actor_from_suggestions() {
+        let (_root, config, _db, mut editor, ctx) = fixture();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        click(&mut editor, &config, &ctx, "Edit");
+        click(&mut editor, &config, &ctx, "Catalog metadata");
+        let output = render(&mut editor, &config, &ctx, vec![]);
+        let labels = texts(&output);
+        for field in TorrentField::ALL {
+            assert!(labels.iter().any(|(label, _)| label == field.label()));
+        }
+        editor
+            .edit
+            .details
+            .insert(TorrentField::Title, "Renamed fixture".into());
+        editor
+            .edit
+            .details
+            .insert(TorrentField::Release, "2024".into());
+        click(&mut editor, &config, &ctx, "Catalog metadata");
+        let output = render(&mut editor, &config, &ctx, vec![]);
+        assert!(texts(&output)
+            .iter()
+            .any(|(label, _)| label.starts_with("Suggested folder · Renamed fixture (2024)")));
+        assert!(!editor.edit.regenerate_folder);
+
+        click(&mut editor, &config, &ctx, "Descriptions and people");
+        click(&mut editor, &config, &ctx, "Find or enter an actor");
+        render(
+            &mut editor,
+            &config,
+            &ctx,
+            vec![egui::Event::Text("Sug".into())],
+        );
+        assert!(matches!(
+            editor.take_command(),
+            Some(crate::ui::UiCommand::SuggestActors { query, .. }) if query == "Sug"
+        ));
+        editor.set_actor_suggestions("Stale", &["Unrelated Actor".into()]);
+        assert!(editor.actor_suggestions.is_empty());
+        editor.set_actor_suggestions("Sug", &["Suggested Actor".into()]);
+        click(&mut editor, &config, &ctx, "Suggested Actor");
+        assert_eq!(
+            editor.edit.actors.as_ref().unwrap(),
+            &["Fixture Actor", "Suggested Actor"]
+        );
+        assert!(editor.actor_input.is_empty());
     }
 
     #[test]

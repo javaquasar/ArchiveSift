@@ -650,6 +650,8 @@ impl AppWindow {
     }
 
     pub fn set_actor_suggestions(&mut self, query: &str, suggestions: Vec<String>) {
+        self.torrent_library
+            .set_actor_suggestions(query, &suggestions);
         if last_comma_token(&self.search_form.actors) == query {
             self.actor_suggestions = suggestions.clone();
         }
@@ -2202,8 +2204,11 @@ impl AppWindow {
                             if let Some(source) = result.display_source() {
                                 ui.label(format!("Source: {}", source));
                             }
-                            if let Some(date) = result.attributes.iter().find(|attribute| attribute.kind == "date") {
-                                ui.label(format!("Date: {}", date.value));
+                            let date = crate::fs::torrent::production_date(&result.attributes).or_else(|| {
+                                result.attributes.iter().find(|attribute| attribute.kind == "date").map(|date| date.value.as_str())
+                            });
+                            if let Some(date) = date {
+                                ui.label(format!("Date: {date}"));
                             }
                             if result.attributes.iter().any(|attribute| matches!(attribute.kind.as_str(), "studio_code" | "duration" | "director")) {
                                 ui.horizontal_wrapped(|ui| {

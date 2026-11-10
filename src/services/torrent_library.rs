@@ -7,9 +7,12 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::attachments::{
+    description_path, description_text, DESCRIPTION_FILENAME, DESCRIPTION_SOURCE,
+};
 use crate::db::Database;
 use crate::fs::torrent::{production_year, safe_component, torrent_directory_with_year};
-use crate::models::{TorrentCard, TorrentEdit};
+use crate::models::{TorrentCard, TorrentEdit, TorrentField};
 use crate::AppResult;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,6 +37,8 @@ pub struct TorrentMovePlan {
     page_url: String,
     image_paths: Vec<(i64, String)>,
     attachment_paths: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_export: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,27 +84,21 @@ impl TorrentLibrary {
         validate_primary_image(&card, &edit)?;
         let studio_changed = edit.primary_studio != card.primary_studio;
         let name_changed = edit.folder_name != card.folder_name;
-        let move_files = organize || studio_changed || name_changed;
+        let move_files = organize || studio_changed || name_changed || edit.regenerate_folder;
         let target = if move_files {
-            let generated = torrent_directory_with_year(
-                &card.site_key,
-                &edit.primary_studio,
-                card.content_title(),
-                &card.page_url,
-                card.page_id,
-                production_year(&card.attributes),
-            );
+            let generated = generated_directory(&card, &edit);
             // A rename keeps the current parent; studio changes explicitly
             // organize the card and retain its chosen folder name.
-            let mut directory = if name_changed && !organize && !studio_changed {
-                card.directory
-                    .as_deref()
-                    .map(portable_path)
-                    .transpose()?
-                    .unwrap_or_else(|| generated.clone())
-            } else {
-                generated.clone()
-            };
+            let mut directory =
+                if (name_changed || edit.regenerate_folder) && !organize && !studio_changed {
+                    card.directory
+                        .as_deref()
+                        .map(portable_path)
+                        .transpose()?
+                        .unwrap_or_else(|| generated.clone())
+                } else {
+                    generated.clone()
+                };
             directory.set_file_name(
                 edit.folder_name
                     .as_deref()
@@ -120,8 +119,10 @@ impl TorrentLibrary {
             page_url: card.page_url.clone(),
             image_paths: vec![],
             attachment_paths: vec![],
+            description_export: None,
         };
         if !move_files {
+            plan.description_export = self.plan_description_export(&plan, &card)?;
             return Ok(plan);
         }
         let target = plan.to_directory.as_ref().unwrap();
@@ -209,7 +210,53 @@ impl TorrentLibrary {
                 );
             }
         }
+        plan.description_export = self.plan_description_export(&plan, &card)?;
         Ok(plan)
+    }
+
+    fn plan_description_export(
+        &self,
+        plan: &TorrentMovePlan,
+        card: &TorrentCard,
+    ) -> AppResult<Option<String>> {
+        let changed = [
+            ("description", plan.edit.description.as_deref()),
+            ("full_description", plan.edit.full_description.as_deref()),
+        ]
+        .iter()
+        .any(|(kind, value)| value.is_some_and(|value| value != card.value(kind)));
+        if !changed || self.base_dir.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let tracked = card
+            .attachments
+            .iter()
+            .any(|file| file.source_url == DESCRIPTION_SOURCE);
+        let relative = plan
+            .attachment_paths
+            .iter()
+            .find(|(source, _)| source == DESCRIPTION_SOURCE)
+            .map(|(_, path)| portable_path(path))
+            .unwrap_or_else(|| Ok(description_path(card, plan.to_directory.as_deref())))?;
+        let relative = relative.to_string_lossy().into_owned();
+        let destination = checked_path(&plan.base_dir, &relative)?;
+        if !tracked
+            && (destination.try_exists()?
+                || plan.files.iter().any(|file| {
+                    file.to
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&relative.replace('\\', "/"))
+                }))
+        {
+            return Err("An unregistered description.txt already exists. Rename it before saving the description.".into());
+        }
+        if self
+            .database
+            .archive_path_is_shared(card.page_id, &relative)?
+        {
+            return Err("The description file is shared with another card. Move this card to its own folder before editing the description.".into());
+        }
+        Ok(Some(relative))
     }
 
     pub fn apply(
@@ -232,6 +279,11 @@ impl TorrentLibrary {
             return Err("card changed; prepare and confirm a new move".into());
         }
         validate_primary_image(&card, &plan.edit)?;
+        if plan.description_export.is_some()
+            && self.plan_description_export(&plan, &card)? != plan.description_export
+        {
+            return Err("description export destination changed; prepare a new edit".into());
+        }
         if !plan.files.is_empty() {
             if let Some(from) = &plan.from_directory {
                 let directory = checked_path(&plan.base_dir, from)?;
@@ -417,15 +469,60 @@ impl TorrentLibrary {
     }
 
     fn cleanup(&self, plan: &TorrentMovePlan) -> AppResult<()> {
+        let description = plan
+            .description_export
+            .as_deref()
+            .map(|relative| -> AppResult<_> {
+                let card = self.database.torrent_card(plan.page_id)?;
+                let path = checked_path(&plan.base_dir, relative)?;
+                let text = description_text(&card);
+                let already_written = path.try_exists()?
+                    && fs::metadata(&path)?.len() == text.len() as u64
+                    && fs::read(&path)? == text.as_bytes();
+                let tracked = card
+                    .attachments
+                    .iter()
+                    .any(|file| file.source_url == DESCRIPTION_SOURCE);
+                Ok((relative, path, text, already_written, tracked))
+            })
+            .transpose()?;
         for file in &plan.files {
             let from = checked_path(&plan.base_dir, &file.from)?;
             let to = checked_path(&plan.base_dir, &file.to)?;
-            verify(&to, file)?;
+            // Recovery can find the new text if the export completed before the journal cleared.
+            if !description
+                .as_ref()
+                .is_some_and(|(_, path, _, written, _)| *written && path == &to)
+            {
+                verify(&to, file)?;
+            }
             if from.try_exists()? && !file.retain_source {
                 verify(&from, file)?;
                 fs::remove_file(&from)?;
             }
             prune_empty(from.parent(), &plan.base_dir);
+        }
+        if let Some((relative, path, text, already_written, tracked)) = description {
+            if !already_written {
+                let parent = path.parent().ok_or("description path has no parent")?;
+                fs::create_dir_all(parent)?;
+                let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+                temp.write_all(text.as_bytes())?;
+                temp.as_file().sync_all()?;
+                if tracked {
+                    temp.persist(&path)?;
+                } else {
+                    temp.persist_noclobber(&path)?;
+                }
+            }
+            if !tracked {
+                self.database.save_page_attachment(
+                    plan.page_id,
+                    DESCRIPTION_SOURCE,
+                    DESCRIPTION_FILENAME,
+                    relative,
+                )?;
+            }
         }
         Ok(())
     }
@@ -457,14 +554,90 @@ fn validate_primary_image(card: &TorrentCard, edit: &TorrentEdit) -> AppResult<(
     Ok(())
 }
 
+pub(crate) fn generated_directory(card: &TorrentCard, edit: &TorrentEdit) -> PathBuf {
+    let title = match edit.details.get(&TorrentField::Title) {
+        Some(title) if title.trim().is_empty() => &card.title,
+        Some(title) => title,
+        None => card.content_title(),
+    };
+    let year = match edit.details.get(&TorrentField::Release) {
+        Some(release) if release.trim() != TorrentField::Release.value(card) => {
+            release.trim().get(..4)
+        }
+        _ => production_year(&card.attributes),
+    };
+    torrent_directory_with_year(
+        &card.site_key,
+        &edit.primary_studio,
+        title,
+        &card.page_url,
+        card.page_id,
+        year,
+    )
+}
+
+fn valid_release_date(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let number = |part: &str, width| {
+        (part.len() == width && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse::<u32>().ok())
+            .flatten()
+    };
+    let Some(year) = parts
+        .next()
+        .and_then(|part| number(part, 4))
+        .filter(|year| *year >= 1000)
+    else {
+        return false;
+    };
+    let Some(month) = parts.next() else {
+        return true;
+    };
+    let (Some(month), Some(day), None) = (
+        number(month, 2),
+        parts.next().and_then(|part| number(part, 2)),
+        parts.next(),
+    ) else {
+        return false;
+    };
+    let last_day = match month {
+        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => 0,
+    };
+    (1..=last_day).contains(&day)
+}
+
+fn valid_duration(value: &str) -> bool {
+    let mut parts = value.split(':');
+    let valid = |part: &str, max, widths: std::ops::RangeInclusive<usize>| {
+        widths.contains(&part.len())
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && part.parse::<u32>().is_ok_and(|number| number <= max)
+    };
+    parts.next().is_some_and(|part| valid(part, 9999, 2..=4))
+        && parts.next().is_some_and(|part| valid(part, 59, 2..=2))
+        && parts.next().is_some_and(|part| valid(part, 59, 2..=2))
+        && parts.next().is_none()
+}
+
 fn normalize_edit(mut edit: TorrentEdit) -> AppResult<TorrentEdit> {
+    if edit.regenerate_folder {
+        edit.folder_name = None;
+    }
     if let Some(name) = &edit.folder_name {
         if name.is_empty() || name.len() > 240 || safe_component(name, "", 120) != *name {
             return Err("folder name must be a single valid Windows/Linux name (up to 120 characters and 240 UTF-8 bytes), without reserved names, trailing dots or spaces".into());
         }
     }
     edit.primary_studio = edit.primary_studio.trim().into();
-    for values in [&mut edit.studios, &mut edit.tags, &mut edit.categories] {
+    for values in [&mut edit.studios, &mut edit.tags, &mut edit.categories]
+        .into_iter()
+        .chain(edit.actors.iter_mut())
+        .chain(edit.directors.iter_mut())
+    {
         let mut seen = HashSet::new();
         *values = values
             .iter()
@@ -479,6 +652,42 @@ fn normalize_edit(mut edit: TorrentEdit) -> AppResult<TorrentEdit> {
                 .any(|v| v.chars().count() > 256 || v.chars().any(char::is_control))
         {
             return Err("metadata values must be at most 256 characters (200 per field)".into());
+        }
+    }
+    for description in edit
+        .description
+        .iter_mut()
+        .chain(edit.full_description.iter_mut())
+    {
+        if description.len() > 1024 * 1024 || description.contains('\0') {
+            return Err("description must be at most 1 MiB and contain no NUL characters".into());
+        }
+        if description.trim().is_empty() {
+            description.clear();
+        }
+    }
+    for (&field, value) in &mut edit.details {
+        *value = value.trim().to_owned();
+        if value.is_empty() {
+            continue;
+        }
+        if value.chars().count() > 512 || value.chars().any(char::is_control) {
+            return Err(format!(
+                "{} must be at most 512 characters and contain no control characters",
+                field.label()
+            )
+            .into());
+        }
+        match field {
+            TorrentField::Release if !valid_release_date(value) => {
+                return Err("Enter a year (YYYY) or a valid date (YYYY-MM-DD).".into())
+            }
+            TorrentField::Duration if !valid_duration(value) => {
+                return Err(
+                    "Enter duration as HH:MM:SS, with minutes and seconds from 00 to 59.".into(),
+                )
+            }
+            _ => (),
         }
     }
     if edit.primary_studio.chars().count() > 256
@@ -660,6 +869,29 @@ mod tests {
     use super::*;
     use crate::models::{MetadataAttribute, ScrapedItem};
 
+    #[test]
+    fn catalog_dates_and_durations_validate_when_changed() {
+        for (field, input, expected) in [
+            (TorrentField::Release, " 2025 ", Some("2025")),
+            (TorrentField::Release, "2000-02-29", Some("2000-02-29")),
+            (TorrentField::Release, "1900-02-29", None),
+            (TorrentField::Release, "2025-04-31", None),
+            (TorrentField::Release, "2025-4-02", None),
+            (TorrentField::Release, "", Some("")),
+            (TorrentField::Duration, " 01:20:08 ", Some("01:20:08")),
+            (TorrentField::Duration, "00:60:08", None),
+            (TorrentField::Duration, "99:10", None),
+            (TorrentField::Duration, "", Some("")),
+        ] {
+            let mut edit = TorrentEdit::default();
+            edit.details.insert(field, input.into());
+            let actual = normalize_edit(edit)
+                .ok()
+                .and_then(|mut edit| edit.details.remove(&field));
+            assert_eq!(actual.as_deref(), expected, "{input}");
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, Database, TorrentLibrary, TorrentMovePlan) {
         let root = tempfile::tempdir().unwrap();
         let base = root.path().join("files");
@@ -803,6 +1035,38 @@ mod tests {
             "Other studio"
         );
         assert!(db.torrent_journals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restart_accepts_the_new_description_after_a_committed_rename() {
+        let (_root, db, service, original_plan) = fixture();
+        let card = db.torrent_card(original_plan.page_id).unwrap();
+        let source = Path::new(card.directory.as_ref().unwrap()).join(DESCRIPTION_FILENAME);
+        fs::write(original_plan.base_dir.join(&source), "Previous export").unwrap();
+        db.save_page_attachment(
+            card.page_id,
+            DESCRIPTION_SOURCE,
+            DESCRIPTION_FILENAME,
+            &source.to_string_lossy(),
+        )
+        .unwrap();
+        let edit = TorrentEdit {
+            full_description: Some("Replacement text.".into()),
+            ..original_plan.edit
+        };
+        let plan = service
+            .prepare(card.page_id, card.revision, edit, false)
+            .unwrap();
+        begin(&db, &plan);
+        service.transfer_and_commit(&plan, &|_| {}).unwrap();
+        service.cleanup(&plan).unwrap();
+        assert_eq!(db.torrent_journals().unwrap().len(), 1);
+        service.recover().unwrap();
+        assert!(db.torrent_journals().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(plan.base_dir.join(plan.description_export.unwrap())).unwrap(),
+            "Fixture\n\nReplacement text.\n"
+        );
     }
 
     #[test]

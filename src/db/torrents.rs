@@ -1,7 +1,7 @@
 use super::*;
 use crate::models::{
-    TorrentAttachment, TorrentCard, TorrentEdit, TorrentImage, TorrentPage, TorrentQuery,
-    TorrentSummary, TorrentSummaryPage,
+    TorrentAttachment, TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentPage,
+    TorrentQuery, TorrentSummary, TorrentSummaryPage,
 };
 
 pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
@@ -98,9 +98,13 @@ pub(super) fn after_scrape(
 }
 
 fn apply_overrides(tx: &Transaction<'_>, page_id: i64) -> AppResult<()> {
-    tx.execute("DELETE FROM page_attributes WHERE page_id=?1 AND attribute_id IN (
+    tx.execute(
+        "DELETE FROM page_attributes WHERE page_id=?1 AND attribute_id IN (
         SELECT a.id FROM attributes a JOIN page_attribute_overrides o
-        ON o.kind=a.kind AND o.normalized_value=a.normalized_value WHERE o.page_id=?1 AND o.removed=1)", [page_id])?;
+        ON o.kind=a.kind AND (o.normalized_value=a.normalized_value OR o.normalized_value='')
+        WHERE o.page_id=?1 AND o.removed=1)",
+        [page_id],
+    )?;
     let mut q = tx.prepare(
         "SELECT kind,value FROM page_attribute_overrides WHERE page_id=?1 AND removed=0",
     )?;
@@ -111,16 +115,26 @@ fn apply_overrides(tx: &Transaction<'_>, page_id: i64) -> AppResult<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(q);
     for (kind, value) in additions {
-        let id = upsert_attribute(
-            tx,
-            &MetadataAttribute {
-                label: kind.clone(),
-                kind,
-                value,
-                source_url: None,
-                is_female: None,
-            },
-        )?;
+        let existing = tx
+            .query_row(
+                "SELECT id FROM attributes WHERE kind=?1 AND normalized_value=?2",
+                params![kind, value.trim().to_ascii_lowercase()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => id,
+            None => upsert_attribute(
+                tx,
+                &MetadataAttribute {
+                    label: kind.clone(),
+                    kind,
+                    value,
+                    source_url: None,
+                    is_female: None,
+                },
+            )?,
+        };
         tx.execute(
             "INSERT OR IGNORE INTO page_attributes(page_id,attribute_id) VALUES(?1,?2)",
             params![page_id, id],
@@ -148,6 +162,32 @@ fn apply_overrides(tx: &Transaction<'_>, page_id: i64) -> AppResult<()> {
         tx.execute(
             "INSERT OR IGNORE INTO page_attributes(page_id,attribute_id) VALUES(?1,?2)",
             params![page_id, id],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_field(
+    tx: &Transaction<'_>,
+    page_id: i64,
+    kind: &str,
+    values: &[String],
+) -> AppResult<()> {
+    tx.execute(
+        "DELETE FROM page_attribute_overrides WHERE page_id=?1 AND kind=?2",
+        params![page_id, kind],
+    )?;
+    // An empty key with removed=1 suppresses the entire scraped field.
+    tx.execute(
+        "INSERT INTO page_attribute_overrides(page_id,kind,normalized_value,value,removed)
+                VALUES(?1,?2,'','',1)",
+        params![page_id, kind],
+    )?;
+    for value in values.iter().filter(|value| !value.trim().is_empty()) {
+        tx.execute(
+            "INSERT INTO page_attribute_overrides(page_id,kind,normalized_value,value,removed)
+                    VALUES(?1,?2,?3,?4,0)",
+            params![page_id, kind, value.trim().to_ascii_lowercase(), value],
         )?;
     }
     Ok(())
@@ -379,7 +419,9 @@ impl Database {
         let placeholders = vec!["?"; ids.len()].join(",");
         let mut statement = connection.prepare(&format!(
             "SELECT sp.id,sp.site_key,tc.primary_studio,
-             COALESCE((SELECT a.value FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+             COALESCE((SELECT value FROM page_attribute_overrides
+               WHERE page_id=sp.id AND kind='content_title' AND removed=0 LIMIT 1),
+               (SELECT a.value FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
                WHERE pa.page_id=sp.id AND a.kind='content_title' AND trim(a.value)<>'' ORDER BY a.id LIMIT 1),sp.title),
              (SELECT COUNT(*) FROM page_images pi WHERE pi.page_id=sp.id),
              (SELECT COUNT(*) FROM page_attachments f WHERE f.page_id=sp.id)
@@ -542,20 +584,64 @@ impl Database {
             ("studio", &edit.studios),
             ("tag", &edit.tags),
             ("category", &edit.categories),
-        ] {
+        ]
+        .into_iter()
+        .chain(edit.actors.iter().map(|actors| ("actor", actors)))
+        {
             let old = card.values(kind);
             let normalize = |s: &str| s.trim().to_ascii_lowercase();
-            for value in old
-                .iter()
-                .filter(|v| !new.iter().any(|n| normalize(n) == normalize(v)))
-            {
+            for value in old.iter().filter(|v| {
+                !normalize(v).is_empty() && !new.iter().any(|n| normalize(n) == normalize(v))
+            }) {
                 tx.execute("INSERT INTO page_attribute_overrides(page_id,kind,normalized_value,value,removed) VALUES(?1,?2,?3,?4,1) ON CONFLICT(page_id,kind,normalized_value) DO UPDATE SET removed=1,value=excluded.value", params![page_id,kind,normalize(value),value])?;
             }
-            for value in new
-                .iter()
-                .filter(|v| !old.iter().any(|o| normalize(o) == normalize(v)))
-            {
+            for value in new.iter().filter(|v| {
+                !old.iter().any(|o| {
+                    if kind == "actor" {
+                        o == *v
+                    } else {
+                        normalize(o) == normalize(v)
+                    }
+                })
+            }) {
                 tx.execute("INSERT INTO page_attribute_overrides(page_id,kind,normalized_value,value,removed) VALUES(?1,?2,?3,?4,0) ON CONFLICT(page_id,kind,normalized_value) DO UPDATE SET removed=0,value=excluded.value", params![page_id,kind,normalize(value),value])?;
+            }
+        }
+        if let Some(directors) = edit
+            .directors
+            .as_ref()
+            .filter(|values| **values != card.values("director"))
+        {
+            replace_field(&tx, page_id, "director", directors)?;
+        }
+        for (kind, value) in [
+            ("description", &edit.description),
+            ("full_description", &edit.full_description),
+        ] {
+            if let Some(value) = value
+                .as_ref()
+                .filter(|value| value.as_str() != card.value(kind))
+            {
+                replace_field(&tx, page_id, kind, std::slice::from_ref(value))?;
+            }
+        }
+        for (&field, value) in &edit.details {
+            if field.value(&card) == value {
+                continue;
+            }
+            let values = std::slice::from_ref(value);
+            if field == TorrentField::Release {
+                let active_kind = if value.len() == 4 { "year" } else { "date" };
+                for kind in crate::fs::torrent::RELEASE_DATE_KINDS {
+                    replace_field(
+                        &tx,
+                        page_id,
+                        kind,
+                        if kind == active_kind { values } else { &[] },
+                    )?;
+                }
+            } else {
+                replace_field(&tx, page_id, field.kind(), values)?;
             }
         }
         tx.execute("UPDATE torrent_cards SET primary_studio=?2,directory=?3,primary_image_id=?4,folder_name=?5,revision=revision+1 WHERE page_id=?1", params![page_id,edit.primary_studio,directory,edit.primary_image_id,edit.folder_name])?;

@@ -3,7 +3,8 @@ use archive_sift::{
     db::{Database, FileDownloadStore},
     fs::StructuredDirectoryStrategy,
     models::{
-        AttachmentData, MetadataAttribute, ScrapedItem, TorrentCard, TorrentEdit, TorrentQuery,
+        AttachmentData, MetadataAttribute, ScrapedItem, TorrentCard, TorrentEdit, TorrentField,
+        TorrentQuery,
     },
     scraper::{ContentScraper, ScraperRegistry},
     services::{torrent_library::TorrentLibrary, ContentDownloadService},
@@ -174,6 +175,220 @@ impl Fixture {
             page.title,
             page.attribute_values("full_description").next().unwrap()
         )
+    }
+
+    async fn save_edit(&self, edit: TorrentEdit) -> TorrentCard {
+        let card = self.card();
+        let library = TorrentLibrary::new(self.db.clone(), self.config.effective_download_dir());
+        tokio::task::spawn_blocking(move || {
+            let plan = library
+                .prepare(card.page_id, card.revision, edit, false)
+                .unwrap();
+            library.apply(plan, |_| {}).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn metadata_edits_survive_a_rescrape_and_keep_the_export_in_the_moved_folder() {
+    let mut parsed = page();
+    parsed.attributes.extend([
+        attribute("actor", "Keep Actor"),
+        attribute("actor", "Remove Actor"),
+        attribute("director", "Old Director"),
+    ]);
+    let fixture = Fixture::new(parsed.clone());
+    fixture.service.run(&fixture.config).await.unwrap();
+    let before = fixture.card();
+    let original_file = fixture.description();
+    let mut other = parsed.clone();
+    other.page_url = "https://example.test/topic?t=43".into();
+    let other = fixture.db.upsert_scraped_item(&other).unwrap().page_id;
+    let mut edit = TorrentEdit::from(&before);
+    edit.primary_studio = "New Company".into();
+    edit.studios.push("New Company".into());
+    edit.actors = Some(vec!["Keep Actor".into()]);
+    edit.directors = Some(vec!["OLD DIRECTOR".into(), "New Director".into()]);
+    edit.description = Some("Revised synopsis.".into());
+    edit.full_description = Some("Edited full description.\n\nSecond paragraph.".into());
+
+    let library = TorrentLibrary::new(fixture.db.clone(), fixture.config.effective_download_dir());
+    let revision = before.revision;
+    let page_id = before.page_id;
+    let saved = tokio::task::spawn_blocking(move || {
+        let plan = library.prepare(page_id, revision, edit, false).unwrap();
+        assert!(plan.description_export.is_some());
+        assert!(!plan.files.is_empty());
+        library.apply(plan, |_| {}).unwrap()
+    })
+    .await
+    .unwrap();
+    let directory = fixture
+        .config
+        .effective_download_dir()
+        .join(saved.directory.as_ref().unwrap());
+    let export = directory.join("description.txt");
+    let expected = format!(
+        "{}\n\nEdited full description.\n\nSecond paragraph.\n",
+        parsed.title
+    );
+    assert_eq!(std::fs::read_to_string(&export).unwrap(), expected);
+    assert!(!original_file.exists());
+    assert_eq!(saved.values("director"), ["New Director", "OLD DIRECTOR"]);
+    assert_eq!(
+        fixture.db.torrent_card(other).unwrap().values("director"),
+        ["Old Director"]
+    );
+    assert_eq!(saved.values("actor"), ["Keep Actor"]);
+    assert_eq!(saved.primary_studio, "New Company");
+    assert!(saved.values("studio").contains(&"New Company".to_owned()));
+
+    {
+        let mut page = fixture.page.write().unwrap();
+        page.attributes.retain(|a| {
+            !matches!(
+                a.kind.as_str(),
+                "description" | "full_description" | "director"
+            )
+        });
+        page.attributes.extend([
+            attribute("description", "Fresh remote synopsis."),
+            attribute("full_description", "Fresh remote description."),
+            attribute("director", "Fresh Remote Director"),
+            attribute("actor", "Newly Listed Actor"),
+        ]);
+    }
+    fixture.service.run(&fixture.config).await.unwrap();
+    let saved = fixture.db.torrent_card(page_id).unwrap();
+    assert_eq!(saved.value("description"), "Revised synopsis.");
+    assert_eq!(saved.values("actor"), ["Keep Actor", "Newly Listed Actor"]);
+    assert_eq!(saved.values("director"), ["New Director", "OLD DIRECTOR"]);
+    assert_eq!(std::fs::read_to_string(&export).unwrap(), expected);
+    let matching = fixture
+        .db
+        .search_torrents(&TorrentQuery {
+            creators: vec!["new director".into()],
+            text: "Edited full description".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(matching.cards.len(), 1);
+    assert_eq!(matching.cards[0].page_id, page_id);
+}
+
+#[tokio::test]
+async fn clearing_the_full_description_falls_back_to_the_synopsis_on_future_downloads() {
+    let fixture = Fixture::new(page());
+    fixture.service.run(&fixture.config).await.unwrap();
+    let before = fixture.card();
+    let edit = TorrentEdit {
+        full_description: Some(String::new()),
+        ..TorrentEdit::from(&before)
+    };
+    let saved = fixture.save_edit(edit).await;
+    assert!(saved.value("full_description").is_empty());
+    let expected = format!("{}\n\nShort synopsis.\n", before.title);
+    assert_eq!(
+        std::fs::read_to_string(fixture.description()).unwrap(),
+        expected
+    );
+    fixture.service.run(&fixture.config).await.unwrap();
+    assert!(fixture.card().value("full_description").is_empty());
+    assert_eq!(
+        std::fs::read_to_string(fixture.description()).unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn catalog_fields_override_scraped_values_and_rename_only_when_requested() {
+    let mut parsed = page();
+    parsed.attributes.extend([
+        attribute("production_date", "2024-05-12"),
+        attribute("release_date", "2025-08-14"),
+        attribute("duration", "00:30:15"),
+        attribute("actor", "Known Actor"),
+    ]);
+    let fixture = Fixture::new(parsed);
+    fixture.service.run(&fixture.config).await.unwrap();
+    let before = fixture.card();
+    let original = fixture.description();
+    let mut edit = TorrentEdit::from(&before);
+    edit.details.extend(
+        [
+            (TorrentField::Title, "SHORT FOLDER TITLE"),
+            (TorrentField::Release, "2000-02-29"),
+            (TorrentField::Duration, "01:25:32"),
+            (TorrentField::OriginalLanguage, "English"),
+            (TorrentField::TranslationLanguage, "German"),
+            (TorrentField::Series, "Example collection"),
+            (TorrentField::Episode, "Part 2"),
+            (TorrentField::StudioCode, "EX-42"),
+        ]
+        .into_iter()
+        .map(|(field, value)| (field, value.to_owned())),
+    );
+    edit.actors = Some(vec!["KNOWN ACTOR".into(), "Another Actor".into()]);
+    let saved = fixture.save_edit(edit).await;
+    assert_eq!(saved.directory, before.directory);
+    assert_eq!(saved.title, before.title);
+    assert_eq!(saved.content_title(), "SHORT FOLDER TITLE");
+    assert_eq!(
+        fixture
+            .db
+            .search_torrent_summaries(&TorrentQuery::default())
+            .unwrap()
+            .cards[0]
+            .content_title,
+        "SHORT FOLDER TITLE"
+    );
+    assert_eq!(saved.value("date"), "2000-02-29");
+    assert_eq!(saved.value("duration"), "01:25:32");
+    assert_eq!(saved.values("actor"), ["Another Actor", "KNOWN ACTOR"]);
+    assert_eq!(saved.value("language"), "English");
+    assert_eq!(saved.value("translation_language"), "German");
+    assert_eq!(saved.value("series"), "Example collection");
+    assert_eq!(saved.value("episode"), "Part 2");
+    assert_eq!(saved.value("studio_code"), "EX-42");
+    assert!(original.is_file());
+
+    let mut edit = TorrentEdit::from(&saved);
+    edit.regenerate_folder = true;
+    edit.details
+        .insert(TorrentField::Title, "Corrected title".into());
+    edit.details.insert(TorrentField::Release, "2001".into());
+    let renamed = fixture.save_edit(edit).await;
+    assert!(renamed
+        .directory_name()
+        .unwrap()
+        .starts_with("Corrected title (2001)"));
+    assert!(renamed.folder_name.is_none());
+    assert!(!original.exists());
+    let export = fixture.description();
+    assert!(export.is_file());
+    fixture.service.run(&fixture.config).await.unwrap();
+    let latest = fixture.card();
+    assert_eq!(latest.directory, renamed.directory);
+    assert_eq!(latest.content_title(), "Corrected title");
+    assert_eq!(latest.value("year"), "2001");
+    assert!(latest.value("production_date").is_empty());
+    assert!(latest.value("release_date").is_empty());
+    assert_eq!(latest.value("duration"), "01:25:32");
+    assert_eq!(latest.values("actor"), ["Another Actor", "KNOWN ACTOR"]);
+    assert!(std::fs::read_to_string(export)
+        .unwrap()
+        .starts_with(&before.title));
+    for (year, expected) in [("2001", 1), ("2024", 0), ("2025", 0)] {
+        let matched = fixture
+            .db
+            .search_torrent_summaries(&TorrentQuery {
+                year: year.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(matched.total, expected);
     }
 }
 
@@ -390,6 +605,22 @@ async fn conflicting_user_file_is_preserved_until_it_is_renamed() {
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("description.txt");
     std::fs::write(&path, "User notes — keep these.").unwrap();
+    let card = fixture.card();
+    let library = TorrentLibrary::new(fixture.db.clone(), fixture.config.effective_download_dir());
+    let edit = TorrentEdit {
+        description: Some("Local edit".into()),
+        ..TorrentEdit::from(&card)
+    };
+    let rejected = tokio::task::spawn_blocking(move || {
+        library.prepare(card.page_id, card.revision, edit, false)
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(rejected
+        .to_string()
+        .contains("unregistered description.txt"));
+    assert_eq!(fixture.card().value("description"), "Short synopsis.");
     let error = fixture.service.run(&fixture.config).await.unwrap_err();
     assert!(error.to_string().contains("description.txt already exists"));
     assert_eq!(
