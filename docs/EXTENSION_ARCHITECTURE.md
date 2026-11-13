@@ -233,6 +233,14 @@ These attribute conventions preserve the WIT/JSON wire contract. Older hosts
 retain the metadata but do not download attachments. Parsers requiring file
 downloads must be installed with a host that implements this convention.
 
+For torrent releases, an optional `image_section` attribute groups related
+images. Its `label` is the section title, its `value` is a JSON array of
+zero-based indices in the final `images` list, and `source_url` is unset.
+Attributes are ordered by section appearance. ArchiveSift sanitizes the title
+and saves the images under `images/<number> - <title>/`. An image belongs to
+its first declared section. On retry or image repair, previously saved files
+directly under `images/` are moved using the torrent move journal.
+
 HTTP text responses honor an explicit `charset` in Content-Type, including
 Windows-1251. Response byte limits are checked before text decoding.
 Image downloads reject document MIME types and inspect a small raster signature

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use futures::{stream, StreamExt};
@@ -178,6 +179,7 @@ impl
             Ok(lease)
         })
         .await??;
+        let image_sections = take_image_sections(&mut page);
         self.log_content_discovery(&page);
 
         let mut persisted = if images_only {
@@ -213,8 +215,32 @@ impl
                 .await?;
         }
 
-        let requests =
-            self.build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)?;
+        let sections_by_id: HashMap<_, _> = image_sections
+            .into_iter()
+            .filter_map(|(url, folder)| {
+                persisted.image_ids_by_url.get(&url).map(|id| (*id, folder))
+            })
+            .collect();
+        let sections_by_id = if sections_by_id.is_empty() {
+            sections_by_id
+        } else {
+            let library = super::torrent_library::TorrentLibrary::new(
+                self.database.clone(),
+                self.base_dir.clone(),
+            );
+            let page_id = persisted.page_id;
+            tokio::task::spawn_blocking(move || -> AppResult<_> {
+                library.organize_image_sections_locked(page_id, &sections_by_id)?;
+                Ok(sections_by_id)
+            })
+            .await??
+        };
+        let requests = self.build_download_requests(
+            &page,
+            persisted.page_id,
+            &persisted.image_ids_by_url,
+            &sections_by_id,
+        )?;
         let image_result = self
             .execute_downloads(
                 requests,
@@ -277,6 +303,7 @@ impl
         page: &ScrapedItem,
         page_id: i64,
         image_ids_by_url: &std::collections::HashMap<String, i64>,
+        sections_by_id: &HashMap<i64, String>,
     ) -> AppResult<Vec<DownloadRequest>> {
         let directory = self.database.torrent_directory(page_id)?;
         let existing = self
@@ -301,14 +328,22 @@ impl
                     })
                     .filter(|path| {
                         directory.as_ref().is_none_or(|directory| {
-                            path.starts_with(directory) || self.base_dir.join(path).is_file()
+                            (path.starts_with(directory)
+                                && sections_by_id.get(image_id).is_none_or(|section| {
+                                    path.starts_with(directory.join("images").join(section))
+                                }))
+                                || self.base_dir.join(path).is_file()
                         })
                     });
                 if let Some(path) = &existing_path {
                     request.relative_path = path.clone();
                 } else if let Some(directory) = &directory {
                     let filename = request.relative_path.file_name()?.to_owned();
-                    request.relative_path = directory.join("images").join(filename);
+                    let mut images = directory.join("images");
+                    if let Some(section) = sections_by_id.get(image_id) {
+                        images.push(section);
+                    }
+                    request.relative_path = images.join(filename);
                 }
                 if existing_path.is_none()
                     && image
@@ -396,7 +431,7 @@ impl
                 }
             }
         }
-        let mut absolute = self.base_dir.join(&request.relative_path);
+        let absolute = self.base_dir.join(&request.relative_path);
         let absolute_str = absolute.to_string_lossy();
 
         if self.file_store.exists(&absolute_str) {
@@ -435,18 +470,6 @@ impl
         ) {
             return Err("image download returned a document instead of an image".into());
         }
-        if request.relative_path.extension().is_none() {
-            let extension = image_extension_from_content_type(
-                response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok()),
-            );
-            request.relative_path.set_extension(extension);
-            absolute = self.base_dir.join(&request.relative_path);
-        }
-        let absolute_str = absolute.to_string_lossy();
-        self.ui.print_output_file(&absolute_str);
         // Sniff only a small prefix; replay received chunks without copying the
         // full response, preserving streaming and atomic file finalization.
         let mut stream = response.bytes_stream();
@@ -460,9 +483,35 @@ impl
             header.extend(chunk.iter().take(32 - header.len()));
             chunks.push(chunk);
         }
-        if image::guess_format(&header).is_err() {
-            return Err("image response has an invalid image header".into());
+        let format = image::guess_format(&header)
+            .map_err(|_| "image response has an invalid image header")?;
+        if format == image::ImageFormat::Gif
+            && !request
+                .relative_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+        {
+            let mut destination = request.relative_path.with_extension("gif");
+            if self.base_dir.join(&destination).try_exists()? {
+                let mut stem = destination
+                    .file_stem()
+                    .ok_or("GIF destination has no filename")?
+                    .to_os_string();
+                stem.push(format!("_{}.gif", request.image_id));
+                destination.set_file_name(stem);
+                if self.base_dir.join(&destination).try_exists()? {
+                    return Err("GIF destination already exists".into());
+                }
+            }
+            request.relative_path = destination;
+        } else if request.relative_path.extension().is_none() {
+            request
+                .relative_path
+                .set_extension(image_extension_from_content_type(&content_type));
         }
+        let absolute = self.base_dir.join(&request.relative_path);
+        let absolute_str = absolute.to_string_lossy();
+        self.ui.print_output_file(&absolute_str);
         let stream = stream::iter(chunks.into_iter().map(Ok::<_, reqwest::Error>)).chain(stream);
         let write_result = self
             .file_store
@@ -495,14 +544,32 @@ impl
     }
 }
 
-fn image_extension_from_content_type(content_type: Option<&str>) -> &'static str {
-    match content_type
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-    {
+fn take_image_sections(page: &mut ScrapedItem) -> HashMap<String, String> {
+    let mut sections = HashMap::new();
+    let mut ordinal = 0;
+    page.attributes.retain(|attribute| {
+        if attribute.kind != "image_section" {
+            return true;
+        }
+        if let Ok(indices) = serde_json::from_str::<Vec<usize>>(&attribute.value) {
+            ordinal += 1;
+            let name = crate::fs::torrent::safe_component(&attribute.label, "Section", 60);
+            let folder = format!("{ordinal:02} - {name}");
+            for index in indices {
+                if let Some(image) = page.images.get(index) {
+                    sections
+                        .entry(image.source_url.clone())
+                        .or_insert_with(|| folder.clone());
+                }
+            }
+        }
+        false
+    });
+    sections
+}
+
+fn image_extension_from_content_type(content_type: &str) -> &'static str {
+    match content_type {
         "image/png" => "png",
         "image/webp" => "webp",
         "image/gif" => "gif",
@@ -543,15 +610,9 @@ mod tests {
 
     #[test]
     fn extensionless_images_use_response_mime_type() {
-        assert_eq!(
-            image_extension_from_content_type(Some("image/png; charset=binary")),
-            "png"
-        );
-        assert_eq!(
-            image_extension_from_content_type(Some("image/webp")),
-            "webp"
-        );
-        assert_eq!(image_extension_from_content_type(None), "jpg");
+        assert_eq!(image_extension_from_content_type("image/png"), "png");
+        assert_eq!(image_extension_from_content_type("image/webp"), "webp");
+        assert_eq!(image_extension_from_content_type(""), "jpg");
     }
 
     use std::path::{Path, PathBuf};
@@ -694,7 +755,7 @@ mod tests {
         )]);
 
         let requests = service
-            .build_download_requests(&page, 11, &image_ids_by_url)
+            .build_download_requests(&page, 11, &image_ids_by_url, &HashMap::new())
             .unwrap();
 
         assert_eq!(requests.len(), 1);
@@ -757,7 +818,12 @@ mod tests {
         assert!(base.join(&studio_dir).join("description.txt").is_file());
         let make_requests = || {
             service
-                .build_download_requests(&page, persisted.page_id, &persisted.image_ids_by_url)
+                .build_download_requests(
+                    &page,
+                    persisted.page_id,
+                    &persisted.image_ids_by_url,
+                    &HashMap::new(),
+                )
                 .unwrap()
         };
         assert!(make_requests()
@@ -783,6 +849,92 @@ mod tests {
             .relative_path
             .starts_with(studio_dir.join("images")));
         assert!(!base.join(missing).exists());
+
+        page.attributes.push(crate::models::MetadataAttribute {
+            kind: "image_section".into(),
+            label: "../Scene: two".into(),
+            value: "[1,99]".into(),
+            source_url: None,
+            is_female: None,
+        });
+        let sections = take_image_sections(&mut page);
+        assert_eq!(sections.len(), 1);
+        assert!(!page.attributes.iter().any(|a| a.kind == "image_section"));
+        let second = &page.images[1].source_url;
+        let requests = service
+            .build_download_requests(
+                &page,
+                persisted.page_id,
+                &persisted.image_ids_by_url,
+                &HashMap::from([(persisted.image_ids_by_url[second], sections[second].clone())]),
+            )
+            .unwrap();
+        assert_eq!(requests[0].relative_path, existing);
+        assert!(requests[1]
+            .relative_path
+            .starts_with(studio_dir.join("images").join("01 - _Scene_ two")));
+    }
+
+    #[tokio::test]
+    async fn downloads_animated_gifs_with_their_original_bytes_and_extension() {
+        use image::{AnimationDecoder, Frame, Rgba, RgbaImage};
+        use std::io::{BufReader, Cursor};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut gif = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+            for color in [Rgba([255, 0, 0, 255]), Rgba([0, 255, 0, 255])] {
+                encoder
+                    .encode_frame(Frame::new(RgbaImage::from_pixel(4, 4, color)))
+                    .unwrap();
+            }
+        }
+        for (name, mime) in [
+            ("direct.gif", "image/gif"),
+            ("opaque", "application/octet-stream"),
+            ("preview.jpg", "image/gif"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let bytes = gif.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.read(&mut [0; 4096]).await.unwrap();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(&bytes).await.unwrap();
+            });
+            let service = ContentDownloadService::new(
+                ScraperRegistry::new(),
+                Database::new(root.path().join("archive.sqlite3")),
+                FileDownloadStore::new(),
+                ConsoleUi::new(),
+                StructuredDirectoryStrategy,
+                root.path().join("downloads"),
+                root.path().join("thumbs"),
+            );
+            let request = DownloadRequest {
+                image_url: format!("http://{address}/{name}"),
+                image_id: 1,
+                page_id: 1,
+                relative_path: Path::new("scene").join(name),
+            };
+            let result = service.download_one(request, None, false).await.unwrap();
+            let path = PathBuf::from(result.file_path);
+            assert_eq!(path.extension().unwrap(), "gif");
+            let saved = std::fs::read(service.base_dir.join(path)).unwrap();
+            assert_eq!(saved, gif);
+            let decoder =
+                image::codecs::gif::GifDecoder::new(BufReader::new(Cursor::new(saved))).unwrap();
+            assert_eq!(decoder.into_frames().collect_frames().unwrap().len(), 2);
+            assert!(Path::new(&result.thumbnail_path.unwrap()).is_file());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1054,8 +1206,17 @@ mod tests {
                 // Repair preserves the saved title and sidecars and also retries
                 // the known image even when a fresh parse omits its URL.
                 scraper.page.title = "Changed remote title".into();
-                scraper.page.attributes.clear();
+                scraper.page.attributes = vec![crate::models::MetadataAttribute {
+                    kind: "image_section".into(),
+                    label: "Scene 1".into(),
+                    value: "[0]".into(),
+                    source_url: None,
+                    is_female: None,
+                }];
                 scraper.page.images.pop();
+                let ready_path = folder.join("images").join("001_ready.png");
+                let ready_file = service.base_dir.join(&ready_path);
+                let ready_bytes = std::fs::read(&ready_file).unwrap();
                 service.scraper_registry.register(Box::new(scraper));
                 let result = service.repair_page_images(&config, &page.page_url).await;
                 let card = service.database.torrent_card(page_id).unwrap();
@@ -1063,6 +1224,20 @@ mod tests {
                 assert_eq!(saved_attachments.len(), 2);
                 assert_eq!(read_attachments(), saved_attachments);
                 assert_eq!(attachment_calls.load(Ordering::SeqCst), 1);
+                let grouped = folder
+                    .join("images")
+                    .join("01 - Scene 1")
+                    .join("001_ready.png");
+                assert!(!ready_file.exists());
+                assert_eq!(
+                    std::fs::read(service.base_dir.join(&grouped)).unwrap(),
+                    ready_bytes
+                );
+                assert!(card
+                    .images
+                    .iter()
+                    .any(|image| { image.local_file_path.as_deref() == grouped.to_str() }));
+                assert!(service.database.torrent_journals().unwrap().is_empty());
                 assert!(
                     std::fs::metadata(service.base_dir.join(empty))
                         .unwrap()

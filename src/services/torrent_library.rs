@@ -323,6 +323,79 @@ impl TorrentLibrary {
             .try_content_lease(&plan.page_url)?
             .ok_or("this card is being updated by another application instance")?;
         self.recover_page_locked(&plan.page_url)?;
+        self.apply_locked(plan, progress)
+    }
+
+    /// The download service holds the page lock and lease while organizing its images.
+    pub(crate) fn organize_image_sections_locked(
+        &self,
+        page_id: i64,
+        sections: &HashMap<i64, String>,
+    ) -> AppResult<()> {
+        let Some(directory) = self.database.torrent_directory(page_id)? else {
+            return Ok(());
+        };
+        let card = self.database.torrent_card(page_id)?;
+        let mut plan = TorrentMovePlan {
+            page_id,
+            revision: card.revision,
+            edit: TorrentEdit::from(&card),
+            from_directory: card.directory.clone(),
+            to_directory: card.directory.clone(),
+            files: Vec::new(),
+            base_dir: self.absolute_root()?,
+            page_url: card.page_url.clone(),
+            image_paths: Vec::new(),
+            attachment_paths: Vec::new(),
+            description_export: None,
+        };
+        let images = directory.join("images");
+        let mut sources = HashSet::new();
+        let mut destinations = HashSet::new();
+        for image in &card.images {
+            let (Some(section), Some(stored)) = (
+                sections.get(&image.image_id),
+                image.local_file_path.as_deref(),
+            ) else {
+                continue;
+            };
+            let from = portable_path(stored)?;
+            if from.parent() != Some(images.as_path()) {
+                continue;
+            }
+            let source = checked_path(&plan.base_dir, stored)?;
+            if !source.is_file() || source.metadata()?.len() == 0 {
+                continue;
+            }
+            let filename = from.file_name().ok_or("image has no filename")?;
+            let to = images.join(section).join(filename);
+            let from = from.to_string_lossy().into_owned();
+            let to = to.to_string_lossy().into_owned();
+            if !sources.insert(from.to_lowercase()) || !destinations.insert(to.to_lowercase()) {
+                return Err("image sections contain conflicting paths; no files were moved".into());
+            }
+            let retain_source = self.database.archive_path_is_shared(page_id, &from)?;
+            let (size, sha256) = fingerprint(&source)?;
+            plan.image_paths.push((image.image_id, to.clone()));
+            plan.files.push(PlannedFile {
+                from,
+                to,
+                size,
+                sha256,
+                retain_source,
+            });
+        }
+        if !plan.files.is_empty() {
+            self.apply_locked(plan, |_| {})?;
+        }
+        Ok(())
+    }
+
+    fn apply_locked(
+        &self,
+        plan: TorrentMovePlan,
+        progress: impl Fn(MoveProgress),
+    ) -> AppResult<TorrentCard> {
         if self.absolute_root()? != plan.base_dir {
             return Err("download folder changed; prepare a new move".into());
         }
