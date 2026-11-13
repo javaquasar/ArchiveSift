@@ -35,7 +35,6 @@ use crate::models::{
     DateBrowseDirection, DateGroupCursor, DateGroupPage, DeleteMode, SearchCursor,
     SearchImageResult, SearchQuery, SearchResultPage, UrlQueueReport,
 };
-use crate::scraper::ScraperRegistry;
 use crate::services::url_queue;
 use crate::services::{
     ContentDownloadService, SearchService, SettingsService, StorageSettings, UrlQueueService,
@@ -1117,40 +1116,21 @@ impl DesktopApp {
         }
     }
 
-    fn start_rescrape(
-        &mut self,
-        database_path: String,
-        download_dir: String,
-        url: String,
-        max_concurrent_downloads: usize,
-    ) {
-        self.cancel_metadata();
-        let window = &mut self.window;
-        if download_dir.trim().is_empty() {
-            window.error = Some("Select a download directory to enable scraping.".to_string());
+    fn start_rescrape(&mut self, url: String) {
+        if !self.window.config.has_download_folder() {
+            self.window.error = Some("Select a download directory to enable scraping.".into());
             return;
         }
-        window.running = true;
-        window.log.push(format!("Re-scraping: {}", url));
-
-        let state_tx = self.state_tx.clone();
-        let log = window.log.clone();
-        if let Err(error) = spawn_background(move || {
-            let result = run_rescrape(
-                database_path,
-                download_dir,
-                url,
-                max_concurrent_downloads,
-                log,
-            );
-            let worker_state = match result {
-                Ok(()) => WorkerState::RescrapeFinished(Ok(())),
-                Err(error) => WorkerState::RescrapeFinished(Err(error.to_string())),
-            };
-            let _ = state_tx.send(worker_state);
-        }) {
-            self.window.running = false;
-            self.window.error = Some(error);
+        if self.window.storage_settings_applying() {
+            return;
+        }
+        match self.queue_service.enqueue_rescrape(&url) {
+            Ok(()) => {
+                self.window.log.push(format!("Re-scrape queued: {url}"));
+                self.window.download_status.queued(url);
+                self.start_processor_if_needed(self.window.config.clone());
+            }
+            Err(error) => self.window.error = Some(error.to_string()),
         }
     }
 
@@ -1271,10 +1251,6 @@ impl DesktopApp {
                     }
                     let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
-                }
-                WorkerState::RescrapeFinished(result) => {
-                    self.window.running = false;
-                    self.window.error = result.err();
                 }
                 WorkerState::ContentFinished {
                     url,
@@ -1767,14 +1743,7 @@ impl DesktopApp {
                     mode,
                     refresh,
                 } => self.start_delete_images(database_path, base_dir, image_ids, mode, refresh),
-                UiCommand::RescrapeUrl {
-                    database_path,
-                    download_dir,
-                    url,
-                    max_concurrent_downloads,
-                } => {
-                    self.start_rescrape(database_path, download_dir, url, max_concurrent_downloads)
-                }
+                UiCommand::RescrapeUrl { url } => self.start_rescrape(url),
                 UiCommand::PauseQueue => {
                     self.queue_service.pause();
                     {
@@ -1791,16 +1760,24 @@ impl DesktopApp {
                     let cfg = self.window.config.clone();
                     self.start_processor_if_needed(cfg);
                 }
-                UiCommand::RetryFailedQueue => {
-                    let retried = self.queue_service.retry_failed();
-                    self.queue_service.resume();
+                UiCommand::RetryFailedBatch { kind, limit } => {
+                    if self.window.config.has_download_folder()
+                        && !self.window.storage_settings_applying()
                     {
-                        let w = &mut self.window;
-                        w.log
-                            .push(format!("Retrying {retried} failed queue item(s)."));
+                        match self.queue_service.retry_failed_batch(kind, limit) {
+                            Ok(retried) => {
+                                self.window.log.push(format!(
+                                    "Returned {retried} failed download(s) to the queue."
+                                ));
+                                self.start_processor_if_needed(self.window.config.clone());
+                            }
+                            Err(error) => self
+                                .window
+                                .log
+                                .push(format!("Could not retry failed downloads: {error}")),
+                        }
+                        ctx.request_repaint();
                     }
-                    let cfg = self.window.config.clone();
-                    self.start_processor_if_needed(cfg);
                 }
                 UiCommand::RetryQueueItem { url } => {
                     if self.window.config.has_download_folder()
@@ -1833,7 +1810,7 @@ impl DesktopApp {
                         match self.queue_service.enqueue_image_repair(&url) {
                             Ok(_) => {
                                 self.window.download_status.queued(url);
-                                self.window.log.push("Image repair requested.");
+                                self.window.log.push("Download check queued.");
                                 self.start_processor_if_needed(self.window.config.clone());
                             }
                             Err(error) => {
@@ -2028,7 +2005,6 @@ enum WorkerState {
         result: Result<UrlQueueReport, String>,
     },
     QueueFinished(Result<(), String>),
-    RescrapeFinished(Result<(), String>),
     ContentFinished {
         url: String,
         message: String,
@@ -2471,38 +2447,6 @@ fn run_set_actor_gender(
     let service = SearchService::new(database);
     service.set_actor_gender_only(&actor_name, is_female)?;
     service.load_images_by_ids(&image_ids)
-}
-
-fn run_rescrape(
-    database_path: String,
-    download_dir: String,
-    url: String,
-    max_concurrent_downloads: usize,
-    log: UiLog,
-) -> AppResult<()> {
-    let runtime = shared_async_runtime()
-        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
-    runtime.block_on(async move {
-        let scraper_registry = ScraperRegistry::with_all_scrapers();
-        let database = Database::new(&database_path);
-        let store = FileDownloadStore::new();
-        let ui = ConsoleUi::from_log(log);
-        let base_dir = PathBuf::from(&download_dir);
-        let mut config = AppConfig::load().unwrap_or_default();
-        config.database_path = database_path;
-        config.max_concurrent_downloads = max_concurrent_downloads;
-        let thumb_dir = config.thumb_dir();
-        let service = ContentDownloadService::new(
-            scraper_registry,
-            database,
-            store,
-            ui,
-            StructuredDirectoryStrategy,
-            base_dir,
-            thumb_dir,
-        );
-        service.run_for_url(&config, &url).await.map(|_| ())
-    })
 }
 
 fn run_delete_images(
@@ -3303,25 +3247,32 @@ mod startup_ui_tests {
 
     #[test]
     fn operations_shows_persisted_queue_error_and_retry_after_switching_tabs() {
-        let (mut app, _root, context) = test_app(false);
+        let (mut app, _root, context) = test_app(true);
+        let url = "https://example.test/fixture";
         app.queue_service
-            .mark_failed("https://example.test/fixture", "Fixture download failed");
+            .mark_failed(url, "Fixture download failed");
+        app.queue_service.pause();
         let size = egui::vec2(800.0, 600.0);
         let output = render(&mut app, &context, size, Vec::new());
         let output = click_label_at_size(&mut app, &context, &output, "Search", size);
         assert_labels(
             &output,
-            &["0 active · 0 pending · 1 failed", "Retry failed"],
+            &["0 active · 0 pending · 1 failed", "Failed downloads"],
         );
-        let output = click_label_at_size(&mut app, &context, &output, "Operations", size);
+        let output = click_label_at_size(&mut app, &context, &output, "Failed downloads", size);
         assert_labels(
             &output,
-            &["Recent failures · 1 total", "Fixture download failed"],
+            &[
+                "1 failed downloads",
+                "Fixture download failed",
+                "Batch size",
+            ],
         );
-        let _ = click_label_at_size(&mut app, &context, &output, "Retry failed", size);
+        let _ = click_label_at_size(&mut app, &context, &output, "Retry 1", size);
         let snapshot = app.queue_service.snapshot_light();
         assert_eq!(snapshot.failed_total, 0);
         assert_eq!(snapshot.pending_total, 1);
+        assert!(snapshot.paused);
     }
 
     #[test]
@@ -3367,6 +3318,7 @@ mod startup_ui_tests {
                 .unwrap();
         };
         save(0, "first.png");
+        app.queue_service.enqueue_image_repair(url).unwrap();
         app.queue_service.mark_failed_with_kind(
             url,
             "Fixture image failed",
@@ -3381,7 +3333,7 @@ mod startup_ui_tests {
 
         let size = egui::vec2(1900.0, 1400.0);
         let output = render(&mut app, &context, size, Vec::new());
-        let output = click_label(&mut app, &context, &output, "Operations");
+        let output = click_label(&mut app, &context, &output, "Failed downloads");
         assert_labels(
             &output,
             &["Fixture image failed", "Other credentials missing"],
@@ -3463,7 +3415,7 @@ mod startup_ui_tests {
         app.queue_service.pause();
         let size = egui::vec2(1900.0, 1400.0);
         let output = render(&mut app, &context, size, Vec::new());
-        let output = click_label(&mut app, &context, &output, "Operations");
+        let output = click_label(&mut app, &context, &output, "Failed downloads");
         let output = click_label(&mut app, &context, &output, "Retry");
         assert_labels(&output, &["Other failure", "Paused"]);
         let queue = app.queue_service.snapshot();
@@ -3687,12 +3639,7 @@ mod startup_ui_tests {
         assert!(app.window.error.is_some());
         app.start_import_url_file("missing.txt".to_string());
         assert!(!app.window.import_running);
-        app.start_rescrape(
-            config.database_path.clone(),
-            String::new(),
-            String::new(),
-            1,
-        );
+        app.start_rescrape(String::new());
         assert!(!app.window.running);
 
         app.window.config.clipboard_listener_enabled = true;

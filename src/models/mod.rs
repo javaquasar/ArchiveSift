@@ -250,17 +250,27 @@ pub struct QueueSnapshot {
 pub enum QueueFailureKind {
     Storage,
     Authorization,
+    RateLimit,
+    Attachment,
     #[default]
     Download,
 }
 
 impl QueueFailureKind {
-    pub const ALL: [Self; 3] = [Self::Storage, Self::Authorization, Self::Download];
+    pub const ALL: [Self; 5] = [
+        Self::Storage,
+        Self::Authorization,
+        Self::RateLimit,
+        Self::Attachment,
+        Self::Download,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Storage => "Storage",
             Self::Authorization => "Authorization",
+            Self::RateLimit => "Download limit",
+            Self::Attachment => "Attachment",
             Self::Download => "Download",
         }
     }
@@ -269,6 +279,8 @@ impl QueueFailureKind {
         match self {
             Self::Storage => "storage",
             Self::Authorization => "authorization",
+            Self::RateLimit => "rate_limit",
+            Self::Attachment => "attachment",
             Self::Download => "download",
         }
     }

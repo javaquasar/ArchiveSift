@@ -22,6 +22,45 @@ impl Error for IncompleteImages {
 }
 
 #[derive(Debug)]
+pub(crate) struct IncompleteAttachments {
+    pub failures: Vec<(String, Box<dyn Error + Send + Sync>)>,
+}
+
+impl Display for IncompleteAttachments {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Could not save {} attachment(s).", self.failures.len())?;
+        for (name, error) in self.failures.iter().take(3) {
+            write!(f, " {name}: {error}.")?;
+        }
+        Ok(())
+    }
+}
+
+impl Error for IncompleteAttachments {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.failures.first().map(|(_, error)| error.as_ref() as _)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IncompleteContent {
+    pub images: Box<dyn Error + Send + Sync>,
+    pub attachments: Box<dyn Error + Send + Sync>,
+}
+
+impl Display for IncompleteContent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} Attachment download also failed: {}",
+            self.images, self.attachments
+        )
+    }
+}
+
+impl Error for IncompleteContent {}
+
+#[derive(Debug)]
 pub enum HttpClientError {
     RequestFailed { url: String, source: reqwest::Error },
     ResponseTooLarge { url: String, max_bytes: usize },

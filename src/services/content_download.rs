@@ -266,9 +266,11 @@ impl
             (Ok(()), result) => result?,
             (Err(error), Ok(())) => return Err(error),
             (Err(images), Err(attachments)) => {
-                return Err(
-                    format!("{images} Attachment download also failed: {attachments}").into(),
-                );
+                return Err(crate::error::IncompleteContent {
+                    images,
+                    attachments,
+                }
+                .into());
             }
         }
 
@@ -1024,7 +1026,7 @@ mod tests {
         }
         fn fetch_attachment<'a>(
             &'a self,
-            _: &'a str,
+            url: &'a str,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = AppResult<crate::models::AttachmentData>>
@@ -1035,6 +1037,15 @@ mod tests {
             Box::pin(async move {
                 self.attachment_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if url.ends_with(".torrent") {
+                    if self.attachment_fails {
+                        return Err("HTTP 429 Too Many Requests".into());
+                    }
+                    return Ok(crate::models::AttachmentData {
+                        bytes: b"d4:infod6:lengthi1e4:name4:demoee".to_vec(),
+                        content_type: "application/x-bittorrent".into(),
+                    });
+                }
                 if self.attachment_fails {
                     return Err("fixture attachment unavailable".into());
                 }
@@ -1044,6 +1055,130 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn quota_failure_saves_other_files_and_can_retry_after_a_restart() {
+        use crate::models::{MetadataAttribute, QueueFailureKind, TORRENT_UNAVAILABLE_NOTICE};
+        use crate::services::url_queue::{download_failure_kind, UrlQueueService};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::new(root.path().join("library.db"));
+        let base = root.path().join("downloads");
+        let mut page = sample_page();
+        let attribute =
+            |kind: &str, label: &str, value: &str, source: Option<&str>| MetadataAttribute {
+                kind: kind.into(),
+                label: label.into(),
+                value: value.into(),
+                source_url: source.map(str::to_owned),
+                is_female: None,
+            };
+        let torrent_url = "https://example.test/release.torrent";
+        let torrent = attribute(
+            "attachment",
+            "release.torrent",
+            torrent_url,
+            Some(torrent_url),
+        );
+        let magnet = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
+        page.attributes = vec![torrent.clone(), attribute("magnet", "Magnet", magnet, None)];
+        let url = page.page_url.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = |page, attachment_fails| {
+            let mut registry = ScraperRegistry::new();
+            registry.register(Box::new(RetryFixtureScraper {
+                page,
+                attachment_calls: calls.clone(),
+                attachment_fails,
+            }));
+            ContentDownloadService::new(
+                registry,
+                database.clone(),
+                FileDownloadStore::new(),
+                ConsoleUi::new(),
+                StructuredDirectoryStrategy,
+                base.clone(),
+                root.path().join("thumbs"),
+            )
+        };
+        let open_queue = || {
+            UrlQueueService::with_registry_and_queue_path(
+                ScraperRegistry::with_public_scrapers(),
+                root.path().join("queue.sqlite3"),
+            )
+        };
+        let config = AppConfig::default();
+        let error = service(page.clone(), true)
+            .run_for_url(&config, &url)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            download_failure_kind(error.as_ref()),
+            QueueFailureKind::RateLimit
+        );
+        let queue = open_queue();
+        queue.mark_failed_with_kind(&url, &error.to_string(), QueueFailureKind::RateLimit);
+        drop(queue);
+        let mut card = database
+            .search_torrents(&Default::default())
+            .unwrap()
+            .cards
+            .remove(0);
+        assert_eq!(card.attachments.len(), 2);
+        assert!(card
+            .attachments
+            .iter()
+            .all(|file| base.join(&file.local_file_path).is_file()));
+        assert!(card
+            .attachments
+            .iter()
+            .any(|file| file.filename == "Magnet"));
+
+        let notice = attribute(
+            "notice",
+            TORRENT_UNAVAILABLE_NOTICE,
+            "Link temporarily hidden",
+            None,
+        );
+        let mut hidden = page.clone();
+        hidden.attributes[0] = notice;
+        let error = service(hidden.clone(), true)
+            .run_for_url(&config, &url)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            download_failure_kind(error.as_ref()),
+            QueueFailureKind::Attachment
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let queue = open_queue();
+        assert!(queue.retry_failure(&url).unwrap());
+        let (job, images_only) = queue.take_next_job().unwrap();
+        assert!(!images_only);
+        service(page, false)
+            .run_for_url(&config, &job)
+            .await
+            .unwrap();
+        queue.mark_finished(&job);
+        assert_eq!(queue.snapshot_light().failed_total, 0);
+        card = database.torrent_card(card.page_id).unwrap();
+        let saved = card
+            .attachments
+            .iter()
+            .find(|file| file.filename == "release.torrent")
+            .unwrap();
+        assert!(base.join(&saved.local_file_path).is_file());
+        service(hidden, true)
+            .run_for_url(&config, &url)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

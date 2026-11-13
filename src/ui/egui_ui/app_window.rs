@@ -61,6 +61,7 @@ enum SettingsPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OperationTab {
     Queue,
+    Failures,
     Activity,
     PeerLume,
 }
@@ -183,6 +184,7 @@ pub struct AppWindow {
     operation_tab: OperationTab,
     failure_kind: Option<QueueFailureKind>,
     failure_offset: usize,
+    retry_batch_size: usize,
     pub(super) queued_card_lookup: Option<String>,
     queue_card_feedback: Option<String>,
     raw_settings: Option<super::raw_settings::RawSettingsEditor>,
@@ -342,6 +344,7 @@ impl AppWindow {
             operation_tab: OperationTab::Queue,
             failure_kind: None,
             failure_offset: 0,
+            retry_batch_size: 10,
             queued_card_lookup: None,
             queue_card_feedback: None,
             raw_settings: None,
@@ -1424,7 +1427,7 @@ impl AppWindow {
     }
 
     pub(super) fn queue_failures(&self) -> Option<(Option<QueueFailureKind>, usize)> {
-        (self.operations_open && self.operation_tab == OperationTab::Queue)
+        (self.operations_open && self.operation_tab == OperationTab::Failures)
             .then_some((self.failure_kind, self.failure_offset))
     }
 
@@ -1558,9 +1561,6 @@ impl AppWindow {
                 UiCommand::PauseQueue
             });
         }
-        if self.queue_snapshot.failed_total > 0 && ui.button("Retry failed").clicked() {
-            self.pending_command = Some(UiCommand::RetryFailedQueue);
-        }
     }
 
     fn render_status_bar(&mut self, ctx: &egui::Context) {
@@ -1586,6 +1586,10 @@ impl AppWindow {
                 } else {
                     "Idle"
                 });
+                if snapshot.failed_total > 0 && ui.button("Failed downloads").clicked() {
+                    self.operations_open = true;
+                    self.operation_tab = OperationTab::Failures;
+                }
                 ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
                     self.queue_controls(ui)
                 });
@@ -1611,6 +1615,11 @@ impl AppWindow {
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.operation_tab, OperationTab::Queue, "Queue");
+                    ui.selectable_value(
+                        &mut self.operation_tab,
+                        OperationTab::Failures,
+                        "Failed downloads",
+                    );
                     ui.selectable_value(
                         &mut self.operation_tab,
                         OperationTab::Activity,
@@ -1640,11 +1649,21 @@ impl AppWindow {
                                 self.queue_controls(ui)
                             });
                         });
+                    }
+                    OperationTab::Failures => {
                         let snapshot = clone_queue_snapshot(&self.queue_snapshot);
+                        if snapshot.paused {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.weak("Queue paused");
+                                ui.add_enabled_ui(!self.storage_settings.applying, |ui| {
+                                    self.queue_controls(ui);
+                                });
+                            });
+                        }
                         if snapshot.failed_total == 0 {
                             ui.weak("No failed downloads.");
                         } else {
-                            ui.label(format!("Recent failures · {} total", snapshot.failed_total));
+                            ui.label(format!("{} failed downloads", snapshot.failed_total));
                             let mut kind = self.failure_kind;
                             ui.horizontal_wrapped(|ui| {
                                 egui::ComboBox::from_id_salt("queue_failure_reason")
@@ -1693,6 +1712,32 @@ impl AppWindow {
                                         self.failure_offset += page_size;
                                         ui.ctx().request_repaint();
                                     }
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Batch size");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.retry_batch_size)
+                                        .range(1..=1_000_000),
+                                );
+                                let count = self.retry_batch_size.min(snapshot.failed_matches);
+                                let enabled = count > 0
+                                    && !self.storage_settings.applying
+                                    && self.config.has_download_folder();
+                                if ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new(format!("Retry {count}")),
+                                    )
+                                    .on_hover_text(
+                                        "Return the oldest matching failures to the queue",
+                                    )
+                                    .clicked()
+                                {
+                                    self.pending_command = Some(UiCommand::RetryFailedBatch {
+                                        kind: self.failure_kind,
+                                        limit: self.retry_batch_size,
+                                    });
                                 }
                             });
                             if snapshot.failed_preview.is_empty() {
@@ -3793,16 +3838,7 @@ impl AppWindow {
                 .pending_rescrape_prompts
                 .pop_front()
                 .expect("the visible rescrape prompt must still be queued");
-            self.pending_command = Some(UiCommand::RescrapeUrl {
-                database_path: self.config.database_path.clone(),
-                download_dir: self
-                    .config
-                    .effective_download_dir()
-                    .to_string_lossy()
-                    .into_owned(),
-                url,
-                max_concurrent_downloads: self.config.max_concurrent_downloads,
-            });
+            self.pending_command = Some(UiCommand::RescrapeUrl { url });
         }
     }
 

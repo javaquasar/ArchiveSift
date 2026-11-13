@@ -364,14 +364,14 @@ pub enum UiCommand {
     },
     /// Re-process a URL that was previously scraped (bypasses already-processed check).
     RescrapeUrl {
-        database_path: String,
-        download_dir: String,
         url: String,
-        max_concurrent_downloads: usize,
     },
     PauseQueue,
     ResumeQueue,
-    RetryFailedQueue,
+    RetryFailedBatch {
+        kind: Option<crate::models::QueueFailureKind>,
+        limit: usize,
+    },
     RetryQueueItem {
         url: String,
     },

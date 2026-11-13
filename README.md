@@ -61,6 +61,13 @@ artwork, export instructions and the Linux desktop entry are in
 **Scrape** puts the URL field, destination and queue on the main screen.
 **More** opens file import and scrape options. The bottom bar shows queue
 counts and opens **Operations** for failures, activity and PeerLume handoffs.
+
+**Operations → Failed downloads** retains unsuccessful jobs across restarts.
+Filter by reason and use **Retry** on a row, or set **Batch size** to retry the
+oldest matching jobs. If the queue is paused, use **Resume** to start dispatch.
+When a torrent file is temporarily unavailable, the card and any available
+images and attachments are saved. The next attempt reuses saved files and
+fetches any missing ones.
 **Search** offers image and torrent results, with additional fields under
 **Filters**. **SQL** opens the database console. **Extensions** manages parser
 packages and their credentials. Choose a download folder in Scrape to enable

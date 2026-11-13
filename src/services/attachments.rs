@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use sha1::Digest;
 
 use crate::db::{Database, FileDownloadStore};
-use crate::models::{ScrapedItem, TorrentCard};
+use crate::error::IncompleteAttachments;
+use crate::models::{MetadataAttribute, ScrapedItem, TorrentCard, TORRENT_UNAVAILABLE_NOTICE};
 use crate::scraper::ContentScraper;
 use crate::AppResult;
 
@@ -324,52 +325,111 @@ pub(crate) async fn download(
     {
         return Err("too many content attachments".into());
     }
+    let mut failures = Vec::new();
     for attribute in &page.attributes {
-        if attribute.kind == "attachment" {
-            let url = attribute
-                .source_url
-                .as_deref()
-                .ok_or("attachment has no download URL")?;
-            let relative = stored_relative_path(database, page, page_id, url, &attribute.label)?;
-            let path = base_dir.join(&relative);
-            let data = if path.is_file() {
-                if std::fs::metadata(&path)?.len() > 8 * 1024 * 1024 {
-                    return Err("existing attachment exceeds limit".into());
-                }
-                tokio::fs::read(&path).await?
-            } else {
-                let data = scraper.fetch_attachment(url).await?;
-                if data.bytes.is_empty()
-                    || data
-                        .content_type
-                        .to_ascii_lowercase()
-                        .starts_with("text/html")
-                {
-                    return Err("attachment download returned an empty file or a login page; check the extension session".into());
-                }
-                data.bytes
-            };
-            let magnet = attribute
-                .label
-                .to_ascii_lowercase()
-                .ends_with(".torrent")
-                .then(|| torrent_magnet(&data))
-                .transpose()?;
-            if !path.is_file() {
-                store.write_bytes(&path.to_string_lossy(), &data).await?;
+        let result = match attribute.kind.as_str() {
+            "attachment" => {
+                save_attachment(
+                    page, page_id, attribute, scraper, database, base_dir, &store,
+                )
+                .await
             }
-            database.save_page_attachment(
-                page_id,
-                url,
-                &attribute.label,
-                &relative.to_string_lossy(),
-            )?;
-            if let Some(magnet) = magnet {
-                save_magnet(page, page_id, &magnet, database, base_dir, &store).await?;
+            "magnet" => {
+                save_magnet(page, page_id, &attribute.value, database, base_dir, &store).await
             }
-        } else if attribute.kind == "magnet" {
-            save_magnet(page, page_id, &attribute.value, database, base_dir, &store).await?;
+            _ => continue,
+        };
+        if let Err(error) = result {
+            let name = crate::fs::torrent::safe_component(&attribute.label, "Attachment", 100);
+            failures.push((name, error));
         }
+    }
+    if page.attributes.iter().any(|attribute| {
+        attribute.kind == "notice" && attribute.label == TORRENT_UNAVAILABLE_NOTICE
+    }) && !page
+        .attributes
+        .iter()
+        .any(|attribute| attribute.kind == "attachment" && is_torrent_file(&attribute.label))
+        && !database
+            .torrent_card(page_id)?
+            .attachments
+            .iter()
+            .any(|file| {
+                is_torrent_file(&file.filename)
+                    && base_dir
+                        .join(&file.local_file_path)
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+            })
+    {
+        failures.push((
+            "Torrent file".into(),
+            "The source did not provide a torrent link. Retry when torrent downloads are available."
+                .into(),
+        ));
+    }
+    if !failures.is_empty() {
+        return Err(IncompleteAttachments { failures }.into());
+    }
+    Ok(())
+}
+
+fn is_torrent_file(filename: &str) -> bool {
+    Path::new(filename)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
+}
+
+async fn save_attachment(
+    page: &ScrapedItem,
+    page_id: i64,
+    attribute: &MetadataAttribute,
+    scraper: &dyn ContentScraper,
+    database: &Database,
+    base_dir: &Path,
+    store: &FileDownloadStore,
+) -> AppResult<()> {
+    let url = attribute
+        .source_url
+        .as_deref()
+        .ok_or("attachment has no download URL")?;
+    let relative = stored_relative_path(database, page, page_id, url, &attribute.label)?;
+    let path = base_dir.join(&relative);
+    let size = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return Err("attachment destination is not a file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    let data = if size > 0 {
+        if size > 8 * 1024 * 1024 {
+            return Err("existing attachment exceeds limit".into());
+        }
+        tokio::fs::read(&path).await?
+    } else {
+        let data = scraper.fetch_attachment(url).await?;
+        if data.bytes.is_empty()
+            || data
+                .content_type
+                .to_ascii_lowercase()
+                .starts_with("text/html")
+        {
+            return Err(
+                "the source returned an empty file or a web page; check access or download limits"
+                    .into(),
+            );
+        }
+        data.bytes
+    };
+    let magnet = is_torrent_file(&attribute.label)
+        .then(|| torrent_magnet(&data))
+        .transpose()?;
+    if size == 0 {
+        store.write_bytes(&path.to_string_lossy(), &data).await?;
+    }
+    database.save_page_attachment(page_id, url, &attribute.label, &relative.to_string_lossy())?;
+    if let Some(magnet) = magnet {
+        save_magnet(page, page_id, &magnet, database, base_dir, store).await?;
     }
     Ok(())
 }
@@ -386,12 +446,17 @@ async fn save_magnet(
         return Err("invalid magnet reference".into());
     }
     let relative = stored_relative_path(database, page, page_id, magnet, "download.magnet.txt")?;
-    store
-        .write_bytes(
-            &base_dir.join(&relative).to_string_lossy(),
-            format!("{magnet}\n").as_bytes(),
-        )
-        .await?;
+    let path = base_dir.join(&relative);
+    let text = format!("{magnet}\n");
+    let already_saved = tokio::fs::metadata(&path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == text.len() as u64)
+        && tokio::fs::read(&path).await? == text.as_bytes();
+    if !already_saved {
+        store
+            .write_bytes(&path.to_string_lossy(), text.as_bytes())
+            .await?;
+    }
     database.save_page_attachment(page_id, magnet, "Magnet", &relative.to_string_lossy())
 }
 

@@ -38,8 +38,33 @@ impl std::error::Error for StorageUnavailable {}
 pub(crate) fn download_failure_kind(
     mut error: &(dyn std::error::Error + 'static),
 ) -> QueueFailureKind {
+    use crate::error::{IncompleteAttachments, IncompleteContent};
+    let mut fallback = QueueFailureKind::Download;
     loop {
         use crate::error::FileStoreError;
+        if let Some(incomplete) = error.downcast_ref::<IncompleteContent>() {
+            let images = download_failure_kind(incomplete.images.as_ref());
+            let attachments = download_failure_kind(incomplete.attachments.as_ref());
+            return [images, attachments]
+                .into_iter()
+                .find(|kind| {
+                    matches!(
+                        kind,
+                        QueueFailureKind::Storage
+                            | QueueFailureKind::RateLimit
+                            | QueueFailureKind::Authorization
+                    )
+                })
+                .unwrap_or(attachments);
+        }
+        if let Some(incomplete) = error.downcast_ref::<IncompleteAttachments>() {
+            return incomplete
+                .failures
+                .iter()
+                .map(|(_, cause)| download_failure_kind(cause.as_ref()))
+                .find(|kind| *kind != QueueFailureKind::Download)
+                .unwrap_or(QueueFailureKind::Attachment);
+        }
         if error.is::<StorageUnavailable>()
             || matches!(
                 error.downcast_ref::<FileStoreError>(),
@@ -52,19 +77,20 @@ pub(crate) fn download_failure_kind(
         {
             return QueueFailureKind::Storage;
         }
-        if error
+        match error
             .downcast_ref::<reqwest::Error>()
             .and_then(reqwest::Error::status)
-            .is_some_and(|status| {
-                matches!(
-                    status,
-                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-                )
-            })
         {
-            return QueueFailureKind::Authorization;
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => return QueueFailureKind::RateLimit,
+            Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+                fallback = QueueFailureKind::Authorization;
+            }
+            _ => {}
         }
         let message = error.to_string().to_ascii_lowercase();
+        if message.contains("http 429") || message.contains("429 too many requests") {
+            return QueueFailureKind::RateLimit;
+        }
         if [
             "credential is missing",
             "authentication required",
@@ -76,10 +102,10 @@ pub(crate) fn download_failure_kind(
         .iter()
         .any(|reason| message.contains(reason))
         {
-            return QueueFailureKind::Authorization;
+            fallback = QueueFailureKind::Authorization;
         }
         let Some(source) = error.source() else {
-            return QueueFailureKind::Download;
+            return fallback;
         };
         error = source;
     }
@@ -207,6 +233,17 @@ impl UrlQueueService {
                 )
                 .expect("failed to classify saved queue failures");
         }
+        upgrade
+            .execute_batch(
+                "UPDATE queue_items SET failure_kind = CASE
+                    WHEN lower(last_error) LIKE '%http 429%'
+                      OR lower(last_error) LIKE '%429 too many requests%' THEN 'rate_limit'
+                    WHEN lower(last_error) LIKE '%attachment download%'
+                      OR lower(last_error) LIKE '%not a valid torrent file%' THEN 'attachment'
+                    ELSE failure_kind
+                 END WHERE state = 'failed' AND coalesce(failure_kind, 'download') = 'download';",
+            )
+            .expect("failed to classify saved attachment failures");
         upgrade.commit().expect("failed to commit queue schema");
         Self {
             registry,
@@ -700,20 +737,51 @@ impl UrlQueueService {
             return Err("Enable the extension for this source before retrying images.".into());
         }
         let connection = self.store.connection.lock().unwrap();
+        // A previous full download may still be missing its attachments.
         Ok(connection.execute(
             "INSERT INTO queue_items(url, connector, state, repair_images) VALUES (?1, ?2, 'pending', 1)
-             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 1,
+             ON CONFLICT(url) DO UPDATE SET state = 'pending',
                  updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
             params![url, url_hostname(url)],
         )? == 1)
     }
 
-    pub fn retry_failed(&self) -> usize {
+    pub(crate) fn enqueue_rescrape(&self, url: &str) -> AppResult<()> {
+        if !self.registry().supports_url(url) {
+            return Err("Enable the extension for this source before scraping it again.".into());
+        }
         let connection = self.store.connection.lock().unwrap();
         connection.execute(
-            "UPDATE queue_items SET state = 'pending', updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
-            [],
-        ).unwrap_or(0)
+            "INSERT INTO queue_items(url, connector, state, attempt_count) VALUES (?1, ?2, 'pending', 1)
+             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 0,
+                 updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
+            params![url, url_hostname(url)],
+        )?;
+        Ok(())
+    }
+
+    pub fn retry_failed(&self) -> usize {
+        self.retry_failed_batch(None, usize::MAX).unwrap_or(0)
+    }
+
+    pub(crate) fn retry_failed_batch(
+        &self,
+        kind: Option<QueueFailureKind>,
+        limit: usize,
+    ) -> rusqlite::Result<usize> {
+        let connection = self.store.connection.lock().unwrap();
+        connection.execute(
+            "UPDATE queue_items SET state = 'pending', updated_at = CURRENT_TIMESTAMP
+             WHERE id IN (
+                 SELECT id FROM queue_items WHERE state = 'failed'
+                 AND (?1 IS NULL OR coalesce(failure_kind, 'download') = ?1)
+                 ORDER BY updated_at, id LIMIT ?2
+             )",
+            params![
+                kind.map(QueueFailureKind::key),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )
     }
 
     pub fn has_pending_work(&self) -> bool {
@@ -1471,6 +1539,47 @@ mod tests {
             download_failure_kind(&StorageUnavailable),
             QueueFailureKind::Storage
         );
+    }
+
+    #[test]
+    fn filtered_batch_retry_persists_and_selects_only_the_oldest_matching_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("queue.sqlite3");
+        let open = || {
+            UrlQueueService::with_registry_and_queue_path(
+                ScraperRegistry::with_public_scrapers(),
+                &path,
+            )
+        };
+        let other = "https://example.test/unrelated";
+        let oldest = CONTENT_URL;
+        let second = "https://demo.example.test/demo-site/galleries/second/";
+        let third = "https://demo.example.test/demo-site/galleries/third/";
+        let service = open();
+        service.mark_failed(other, "Network error");
+        for url in [oldest, second, third] {
+            service.mark_failed_with_kind(url, "HTTP 429", QueueFailureKind::RateLimit);
+        }
+        service.pause();
+        assert_eq!(
+            service
+                .retry_failed_batch(Some(QueueFailureKind::RateLimit), 2)
+                .unwrap(),
+            2
+        );
+        assert!(service.take_next_job().is_none());
+        assert_eq!(service.snapshot().pending, [oldest, second]);
+        assert_eq!(service.snapshot_light().failed_total, 2);
+        drop(service);
+
+        let restored = open();
+        assert_eq!(restored.take_next_job(), Some((oldest.into(), false)));
+        restored.mark_finished(oldest);
+        assert_eq!(restored.take_next_job(), Some((second.into(), false)));
+        restored.mark_failed_with_kind(second, "HTTP 429", QueueFailureKind::RateLimit);
+        assert!(restored.enqueue_image_repair(third).unwrap());
+        assert_eq!(restored.take_next_job(), Some((third.into(), false)));
+        assert_eq!(restored.snapshot_light().failed_total, 2);
     }
 
     #[test]
