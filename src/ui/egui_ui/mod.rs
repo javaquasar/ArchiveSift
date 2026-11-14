@@ -741,22 +741,9 @@ impl DesktopApp {
                     }
 
                     let database = Database::new(&config.database_path);
-                    match self.queue_service.enqueue_text(&database, &text) {
+                    match self.queue_service.enqueue_urls(&database, candidates) {
                         Ok(report) => {
                             let window = &mut self.window;
-                            // Log each found URL individually, not the raw clipboard text.
-                            if candidates.len() == 1 {
-                                window.log.push(format!("Clipboard: {}", candidates[0]));
-                            } else {
-                                window.log.push(format!(
-                                    "Clipboard: {} URL{} detected",
-                                    candidates.len(),
-                                    if candidates.len() == 1 { "" } else { "s" }
-                                ));
-                                for url in &candidates {
-                                    window.log.push(format!("  • {}", url));
-                                }
-                            }
                             window.apply_queue_report(&report, "Clipboard");
                             if report.queued_successfully > 0 {
                                 let cfg = window.config.clone();
@@ -3629,6 +3616,24 @@ mod startup_ui_tests {
         assert_eq!(app.live_presets.read().unwrap().tags, "portrait, outdoor");
         assert!(app.window.error.is_none());
         assert!(!app.worker_running);
+    }
+
+    #[test]
+    fn clipboard_array_queues_each_supported_url_once() {
+        let (mut app, _root, _context) = test_app(true);
+        app.window.config.clipboard_listener_enabled = true;
+        app.queue_service.pause();
+        let (sender, receiver) = mpsc::channel();
+        app.clipboard_rx = Some(receiver);
+        let first = "https://demo.example.test/demo-site/galleries/summer-escape-001/?x=1,2&y=3";
+        let second = "https://demo.example.test/demo-site/galleries/city-lights-002/";
+        let text = serde_json::to_string(&[first, second, first]).unwrap();
+        sender.send(ClipboardEvent::Text(text)).unwrap();
+
+        app.handle_clipboard_events();
+
+        assert_eq!(app.queue_service.snapshot().pending, [first, second]);
+        assert!(app.queue_service.is_paused());
     }
 
     #[test]

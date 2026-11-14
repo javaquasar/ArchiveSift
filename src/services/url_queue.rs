@@ -876,14 +876,27 @@ fn normalize_supported_url(registry: &ScraperRegistry, raw_input: &str) -> Optio
     }
 }
 
-/// Extracts all http(s) URL candidates from arbitrary text.
-/// Only tokens that start with `http://` or `https://` are returned so that
-/// plain text words do not pollute the queue as "invalid" entries.
+/// Extracts HTTP(S) candidates from a JSON array or whitespace-delimited text.
 pub fn extract_candidate_urls(contents: &str) -> Vec<String> {
+    let contents = contents.trim().trim_start_matches('\u{feff}').trim_start();
+    let is_http =
+        |candidate: &str| candidate.starts_with("http://") || candidate.starts_with("https://");
+    if contents.starts_with('[') {
+        if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(contents) {
+            return values
+                .into_iter()
+                .filter_map(|value| match value {
+                    serde_json::Value::String(url) if is_http(url.trim()) => {
+                        Some(url.trim().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
+    }
     contents
         .split_whitespace()
-        .map(str::trim)
-        .filter(|token| token.starts_with("http://") || token.starts_with("https://"))
+        .filter(|token| is_http(token))
         .map(ToString::to_string)
         .collect()
 }
@@ -926,6 +939,30 @@ mod tests {
                 "https://site.com/c",
             ]
         );
+    }
+
+    #[test]
+    fn extract_json_arrays_preserves_url_queries_order_and_duplicates() {
+        let compact = r#"["https:\/\/site.com/a?ids=1,2\u0026next=https://other.test/","http://site.com/b","https:\/\/site.com/a?ids=1,2\u0026next=https://other.test/"]"#;
+        let expected = [
+            "https://site.com/a?ids=1,2&next=https://other.test/",
+            "http://site.com/b",
+            "https://site.com/a?ids=1,2&next=https://other.test/",
+        ];
+        assert_eq!(extract_candidate_urls(compact), expected);
+        let multiline = format!(
+            "\u{feff}{}",
+            serde_json::to_string_pretty(&serde_json::json!([
+                null,
+                expected[0],
+                7,
+                expected[1],
+                "ordinary text",
+                expected[2]
+            ]))
+            .unwrap()
+        );
+        assert_eq!(extract_candidate_urls(&multiline), expected);
     }
 
     #[test]
