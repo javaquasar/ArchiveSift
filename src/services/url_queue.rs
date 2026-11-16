@@ -286,6 +286,13 @@ impl UrlQueueService {
             .map_or_else(|| self.registry.clone(), |provider| provider.snapshot())
     }
 
+    pub(crate) fn registry_for_job(&self, config: &mut crate::app::AppConfig) -> ScraperRegistry {
+        match &self.live_registry {
+            Some(provider) => provider.for_job(config),
+            None => self.registry.clone(),
+        }
+    }
+
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Relaxed);
     }

@@ -2179,7 +2179,7 @@ fn run_queue_processor(
                         }
                         let base_dir = base_dir.clone();
                         let log = log.clone();
-                        let scraper_registry = crate::scraper::global_registry().for_job(&mut config);
+                        let scraper_registry = queue_service.registry_for_job(&mut config);
                         active.push(Box::pin(async move {
                             let storage = if job != QueueJob::Full {
                                 tokio::fs::metadata(&base_dir).await.is_ok_and(|metadata| metadata.is_dir())
@@ -2916,6 +2916,8 @@ mod sql_query_tests {
 #[cfg(test)]
 mod startup_ui_tests {
     use super::*;
+
+    mod torrent_queue;
 
     fn test_app(configured: bool) -> (DesktopApp, tempfile::TempDir, egui::Context) {
         let root = tempfile::tempdir().unwrap();
