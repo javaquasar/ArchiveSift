@@ -1,8 +1,10 @@
 use super::*;
+use crate::fs::torrent::{valid_year, RELEASE_DATE_KINDS};
 use crate::models::{
-    TorrentAttachment, TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentPage,
-    TorrentQuery, TorrentSummary, TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE,
+    torrent_year_bounds, TorrentAttachment, TorrentCard, TorrentEdit, TorrentField, TorrentImage,
+    TorrentPage, TorrentQuery, TorrentSummary, TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE,
 };
+use rusqlite::functions::FunctionFlags;
 
 pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
     let tx = connection.transaction()?;
@@ -537,14 +539,14 @@ impl Database {
     }
 
     pub fn search_torrents(&self, query: &TorrentQuery) -> AppResult<TorrentPage> {
-        let (ids, total) = self.torrent_search_ids(query, None)?;
+        let (ids, total) = self.torrent_search_ids(query, None, None)?;
         let connection = self.connect()?;
         let cards = read_cards(&connection, &ids)?;
         Ok(TorrentPage { cards, total })
     }
 
     pub fn search_torrent_summaries(&self, query: &TorrentQuery) -> AppResult<TorrentSummaryPage> {
-        self.search_torrent_summaries_internal(query, None)
+        self.search_torrent_summaries_with_storage(query, None, None)
     }
 
     pub fn search_torrent_summaries_cancellable(
@@ -552,15 +554,16 @@ impl Database {
         query: &TorrentQuery,
         cancellation: &QueryCancellation,
     ) -> AppResult<TorrentSummaryPage> {
-        self.search_torrent_summaries_internal(query, Some(cancellation))
+        self.search_torrent_summaries_with_storage(query, None, Some(cancellation))
     }
 
-    fn search_torrent_summaries_internal(
+    pub(crate) fn search_torrent_summaries_with_storage(
         &self,
         query: &TorrentQuery,
+        root: Option<&Path>,
         cancellation: Option<&QueryCancellation>,
     ) -> AppResult<TorrentSummaryPage> {
-        let (ids, total) = self.torrent_search_ids(query, cancellation)?;
+        let (ids, total) = self.torrent_search_ids(query, root, cancellation)?;
         if ids.is_empty() {
             return Ok(TorrentSummaryPage {
                 cards: vec![],
@@ -600,12 +603,18 @@ impl Database {
     fn torrent_search_ids(
         &self,
         query: &TorrentQuery,
+        root: Option<&Path>,
         cancellation: Option<&QueryCancellation>,
     ) -> AppResult<(Vec<i64>, usize)> {
+        let year_bounds = torrent_year_bounds(&query.year)?;
         let connection = self.connect()?;
         let _guard = cancellation
             .map(|token| token.register(&connection))
             .transpose()?;
+        let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+        connection.create_scalar_function("torrent_fold", 1, flags, |ctx| {
+            Ok(ctx.get_raw(0).as_str()?.trim().to_lowercase())
+        })?;
         let mut sql = String::from(
             " FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE 1=1",
         );
@@ -614,6 +623,17 @@ impl Database {
             sql.push_str(" AND (instr(lower(sp.title),lower(?))>0 OR EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id WHERE pa.page_id=sp.id AND instr(a.normalized_value,lower(?))>0))
 ");
             values.extend([query.text.trim().into(), query.text.trim().into()]);
+        }
+        let title = query.title.trim();
+        if !title.is_empty() {
+            sql.push_str(
+                " AND (instr(torrent_fold(sp.title),?)>0 OR EXISTS(
+                    SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+                    WHERE pa.page_id=sp.id AND a.kind='content_title'
+                      AND instr(torrent_fold(a.value),?)>0))",
+            );
+            let title = title.to_lowercase();
+            values.extend([title.clone(), title]);
         }
         if !query.site_key.trim().is_empty() {
             sql.push_str(" AND sp.site_key=?");
@@ -631,18 +651,87 @@ impl Database {
             None,
             &query.creators,
         )?;
+        for actor in query
+            .actors
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            sql.push_str(
+                " AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+                    WHERE pa.page_id=sp.id AND a.kind='actor' AND instr(torrent_fold(a.value),?)>0)",
+            );
+            values.push(actor.to_lowercase());
+        }
         for (kind, entries) in [("tag", &query.tags), ("category", &query.categories)] {
             for entry in entries.iter().filter(|s| !s.trim().is_empty()) {
-                sql.push_str(" AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id WHERE pa.page_id=sp.id AND a.kind=? AND a.normalized_value=?)");
-                values.extend([kind.into(), entry.trim().to_ascii_lowercase()]);
+                sql.push_str(" AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id WHERE pa.page_id=sp.id AND a.kind=? AND torrent_fold(a.value)=?)");
+                values.extend([kind.into(), entry.trim().to_lowercase()]);
             }
         }
-        if !query.year.trim().is_empty() {
-            if query.year.len() != 4 || !query.year.bytes().all(|c| c.is_ascii_digit()) {
-                return Err("year must contain four digits".into());
+        for genre in query
+            .genres
+            .iter()
+            .map(|genre| genre.trim())
+            .filter(|genre| !genre.is_empty())
+        {
+            // Older parsers stored genres as tags. Prefer explicit genres whenever present.
+            sql.push_str(
+                " AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+                    WHERE pa.page_id=sp.id AND torrent_fold(a.value)=? AND (
+                        a.kind='genre' OR (a.kind='tag' AND NOT EXISTS(
+                            SELECT 1 FROM page_attributes pg JOIN attributes g ON g.id=pg.attribute_id
+                            WHERE pg.page_id=sp.id AND g.kind='genre' AND trim(g.value)<>''
+                        ))
+                    ))",
+            );
+            values.push(genre.to_lowercase());
+        }
+        if let Some((from, to)) = year_bounds {
+            connection.create_scalar_function("torrent_year", 1, flags, |ctx| {
+                Ok(valid_year(ctx.get_raw(0).as_str()?).map(str::to_owned))
+            })?;
+            let kinds = RELEASE_DATE_KINDS.map(|kind| format!("'{kind}'")).join(",");
+            let priority = RELEASE_DATE_KINDS
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| format!(" WHEN '{kind}' THEN {index}"))
+                .collect::<String>();
+            sql.push_str(&format!(
+                " AND (SELECT torrent_year(a.value) AS release_year
+                    FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+                    WHERE pa.page_id=sp.id AND a.kind IN ({kinds}) AND release_year IS NOT NULL
+                    ORDER BY CASE a.kind{priority} END, a.id LIMIT 1) BETWEEN ? AND ?"
+            ));
+            values.extend([from.into(), to.into()]);
+        }
+        if query.missing_torrent {
+            sql.push_str(
+                " AND NOT EXISTS(SELECT 1 FROM page_attachments f
+                WHERE f.page_id=sp.id AND length(f.filename)>8
+                  AND lower(substr(f.filename,-8))='.torrent' AND trim(f.local_file_path)<>''",
+            );
+            if let Some(root) = root {
+                if !root.is_dir() {
+                    return Err("Library storage unavailable.".into());
+                }
+                let root = root.to_path_buf();
+                let checked = std::cell::RefCell::new(HashMap::<String, bool>::new());
+                connection.create_scalar_function(
+                    "torrent_exists",
+                    1,
+                    FunctionFlags::SQLITE_UTF8,
+                    move |ctx| {
+                        let path = ctx.get_raw(0).as_str()?;
+                        let mut checked = checked.borrow_mut();
+                        Ok(*checked.entry(path.to_owned()).or_insert_with(|| {
+                            crate::fs::torrent::local_torrent_file_exists(&root, path)
+                        }))
+                    },
+                )?;
+                sql.push_str(" AND torrent_exists(f.local_file_path)");
             }
-            sql.push_str(" AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id WHERE pa.page_id=sp.id AND a.kind IN ('date','year','release_date','production_date') AND substr(a.value,1,4)=?)");
-            values.push(query.year.clone());
+            sql.push(')');
         }
         let total: usize = connection.query_row(
             &format!("SELECT COUNT(*){sql}"),

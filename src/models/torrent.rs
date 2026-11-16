@@ -6,13 +6,36 @@ pub(crate) const TORRENT_UNAVAILABLE_NOTICE: &str = "Torrent unavailable";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TorrentQuery {
     pub text: String,
+    pub title: String,
     pub site_key: String,
     pub studio: String,
+    pub actors: Vec<String>,
     pub creators: Vec<String>,
     pub tags: Vec<String>,
+    pub genres: Vec<String>,
     pub categories: Vec<String>,
     pub year: String,
+    pub missing_torrent: bool,
     pub offset: usize,
+}
+
+pub(crate) fn torrent_year_bounds(value: &str) -> Result<Option<(&str, &str)>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let (from, to) = value.split_once(['-', '–', '—']).unwrap_or((value, value));
+    let (from, to) = (from.trim(), to.trim());
+    let valid = |year: &str| {
+        year.len() == 4 && !year.starts_with('0') && year.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    if !valid(from) || !valid(to) {
+        return Err("Enter a four-digit year or range, for example 2020–2025.");
+    }
+    if from > to {
+        return Err("The first year must be earlier than or equal to the last year.");
+    }
+    Ok(Some((from, to)))
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +70,13 @@ pub struct TorrentCard {
 }
 
 impl TorrentCard {
+    pub(crate) fn has_downloaded_torrent(&self, root: &std::path::Path) -> bool {
+        self.attachments.iter().any(|attachment| {
+            crate::fs::torrent::is_torrent_file(&attachment.filename)
+                && crate::fs::torrent::local_torrent_file_exists(root, &attachment.local_file_path)
+        })
+    }
+
     pub fn directory_name(&self) -> Option<&str> {
         self.directory.as_deref()?.rsplit(['/', '\\']).next()
     }

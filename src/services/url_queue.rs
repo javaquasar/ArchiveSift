@@ -24,6 +24,13 @@ const QUEUE_PREVIEW_LIMIT: usize = 6;
 pub(crate) const QUEUE_FAILURE_PAGE_SIZE: usize = 10;
 const URL_ENQUEUE_BATCH_SIZE: usize = 512;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueJob {
+    Full,
+    Images,
+    Torrent,
+}
+
 #[derive(Debug)]
 pub(crate) struct StorageUnavailable;
 
@@ -178,6 +185,7 @@ impl UrlQueueService {
                     last_error TEXT,
                     failure_kind TEXT,
                     repair_images INTEGER NOT NULL DEFAULT 0,
+                    torrent_only INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -208,6 +216,10 @@ impl UrlQueueService {
             (
                 "repair_images",
                 "ALTER TABLE queue_items ADD COLUMN repair_images INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "torrent_only",
+                "ALTER TABLE queue_items ADD COLUMN torrent_only INTEGER NOT NULL DEFAULT 0",
             ),
         ] {
             if !columns.contains(column) {
@@ -458,7 +470,7 @@ impl UrlQueueService {
                 for url in processed {
                     removed += transaction.execute(
                         "DELETE FROM queue_items WHERE url = ?1 AND state = 'pending'
-                         AND repair_images = 0 AND attempt_count = 0",
+                         AND repair_images = 0 AND torrent_only = 0 AND attempt_count = 0",
                         params![url],
                     )?;
                 }
@@ -667,7 +679,7 @@ impl UrlQueueService {
         self.take_next_job().map(|(url, _)| url)
     }
 
-    pub(crate) fn take_next_job(&self) -> Option<(String, bool)> {
+    pub(crate) fn take_next_job(&self) -> Option<(String, QueueJob)> {
         // Check paused BEFORE taking the lock
         if self.is_paused() {
             return None;
@@ -675,17 +687,24 @@ impl UrlQueueService {
         self.claim_next_url().ok().flatten()
     }
 
-    fn claim_next_url(&self) -> rusqlite::Result<Option<(String, bool)>> {
+    fn claim_next_url(&self) -> rusqlite::Result<Option<(String, QueueJob)>> {
         let mut connection = self.store.connection.lock().unwrap();
         let transaction = connection.transaction()?;
         let next = transaction
             .query_row(
-                "SELECT id, url, repair_images FROM queue_items WHERE state = 'pending' ORDER BY id LIMIT 1",
+                "SELECT id, url, repair_images, torrent_only FROM queue_items WHERE state = 'pending' ORDER BY id LIMIT 1",
                 [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)),
+                |row| {
+                    let job = match (row.get::<_, bool>(2)?, row.get::<_, bool>(3)?) {
+                        (_, true) => QueueJob::Torrent,
+                        (true, false) => QueueJob::Images,
+                        (false, false) => QueueJob::Full,
+                    };
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, job))
+                },
             )
             .optional()?;
-        let Some((id, url, repair)) = next else {
+        let Some((id, url, job)) = next else {
             transaction.commit()?;
             return Ok(None);
         };
@@ -694,7 +713,7 @@ impl UrlQueueService {
             params![id],
         )?;
         transaction.commit()?;
-        Ok(Some((url, repair)))
+        Ok(Some((url, job)))
     }
 
     pub fn mark_finished(&self, url: &str) {
@@ -740,7 +759,23 @@ impl UrlQueueService {
         // A previous full download may still be missing its attachments.
         Ok(connection.execute(
             "INSERT INTO queue_items(url, connector, state, repair_images) VALUES (?1, ?2, 'pending', 1)
-             ON CONFLICT(url) DO UPDATE SET state = 'pending',
+             ON CONFLICT(url) DO UPDATE SET state = 'pending', torrent_only = 0,
+                 repair_images = CASE WHEN torrent_only = 1 THEN 1 ELSE repair_images END,
+                 updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
+            params![url, url_hostname(url)],
+        )? == 1)
+    }
+
+    pub(crate) fn enqueue_torrent_download(&self, url: &str) -> AppResult<bool> {
+        if !self.registry().supports_url(url) {
+            return Err(
+                "Enable the extension for this source before downloading the torrent file.".into(),
+            );
+        }
+        let connection = self.store.connection.lock().unwrap();
+        Ok(connection.execute(
+            "INSERT INTO queue_items(url, connector, state, torrent_only) VALUES (?1, ?2, 'pending', 1)
+             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 0, torrent_only = 1,
                  updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
             params![url, url_hostname(url)],
         )? == 1)
@@ -753,7 +788,7 @@ impl UrlQueueService {
         let connection = self.store.connection.lock().unwrap();
         connection.execute(
             "INSERT INTO queue_items(url, connector, state, attempt_count) VALUES (?1, ?2, 'pending', 1)
-             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 0,
+             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 0, torrent_only = 0,
                  updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
             params![url, url_hostname(url)],
         )?;
@@ -1496,6 +1531,46 @@ mod tests {
     }
 
     #[test]
+    fn a_torrent_only_retry_keeps_its_mode_after_reopening_the_queue() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("queue.sqlite3");
+        let (database, database_path) = temp_db();
+        mark_processed(&database_path, CONTENT_URL);
+        let open = || {
+            UrlQueueService::with_registry_and_queue_path(
+                ScraperRegistry::with_public_scrapers(),
+                &path,
+            )
+        };
+
+        let queue = open();
+        queue.mark_failed_with_kind(CONTENT_URL, "HTTP 429", QueueFailureKind::RateLimit);
+        assert!(queue.enqueue_torrent_download(CONTENT_URL).unwrap());
+        assert!(!queue.enqueue_torrent_download(CONTENT_URL).unwrap());
+        queue.prune_processed(&database).unwrap();
+        assert_eq!(
+            queue.take_next_job(),
+            Some((CONTENT_URL.into(), QueueJob::Torrent))
+        );
+        queue.mark_failed_with_kind(CONTENT_URL, "HTTP 429", QueueFailureKind::RateLimit);
+        drop(queue);
+
+        let restored = open();
+        assert!(restored.retry_failure(CONTENT_URL).unwrap());
+        assert_eq!(
+            restored.take_next_job(),
+            Some((CONTENT_URL.into(), QueueJob::Torrent))
+        );
+        restored.mark_failed_with_kind(CONTENT_URL, "HTTP 429", QueueFailureKind::RateLimit);
+        assert!(restored.enqueue_image_repair(CONTENT_URL).unwrap());
+        assert_eq!(
+            restored.take_next_job(),
+            Some((CONTENT_URL.into(), QueueJob::Images))
+        );
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[test]
     fn a_processed_page_can_queue_one_repair_and_restore_it_after_restart() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("queue.sqlite3");
@@ -1514,13 +1589,19 @@ mod tests {
             .enqueue_image_repair("https://unregistered.example.test/")
             .is_err());
         service.prune_processed(&database).unwrap();
-        assert_eq!(service.take_next_job(), Some((CONTENT_URL.into(), true)));
+        assert_eq!(
+            service.take_next_job(),
+            Some((CONTENT_URL.into(), QueueJob::Images))
+        );
         assert!(!service.enqueue_image_repair(CONTENT_URL).unwrap());
         drop(service);
 
         let restored = open();
         restored.prune_processed(&database).unwrap();
-        assert_eq!(restored.take_next_job(), Some((CONTENT_URL.into(), true)));
+        assert_eq!(
+            restored.take_next_job(),
+            Some((CONTENT_URL.into(), QueueJob::Images))
+        );
         restored.mark_failed_with_kind(
             CONTENT_URL,
             "Library storage unavailable",
@@ -1528,7 +1609,10 @@ mod tests {
         );
         assert!(restored.retry_failure(CONTENT_URL).unwrap());
         assert!(!restored.retry_failure(CONTENT_URL).unwrap());
-        assert_eq!(restored.take_next_job(), Some((CONTENT_URL.into(), true)));
+        assert_eq!(
+            restored.take_next_job(),
+            Some((CONTENT_URL.into(), QueueJob::Images))
+        );
         let _ = std::fs::remove_file(database_path);
     }
 
@@ -1610,12 +1694,21 @@ mod tests {
         drop(service);
 
         let restored = open();
-        assert_eq!(restored.take_next_job(), Some((oldest.into(), false)));
+        assert_eq!(
+            restored.take_next_job(),
+            Some((oldest.into(), QueueJob::Full))
+        );
         restored.mark_finished(oldest);
-        assert_eq!(restored.take_next_job(), Some((second.into(), false)));
+        assert_eq!(
+            restored.take_next_job(),
+            Some((second.into(), QueueJob::Full))
+        );
         restored.mark_failed_with_kind(second, "HTTP 429", QueueFailureKind::RateLimit);
         assert!(restored.enqueue_image_repair(third).unwrap());
-        assert_eq!(restored.take_next_job(), Some((third.into(), false)));
+        assert_eq!(
+            restored.take_next_job(),
+            Some((third.into(), QueueJob::Full))
+        );
         assert_eq!(restored.snapshot_light().failed_total, 2);
     }
 

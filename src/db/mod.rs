@@ -23,6 +23,21 @@ use crate::AppResult;
 
 pub struct FileDownloadStore;
 
+pub(crate) fn collection_url_alternate(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.query().is_some() || parsed.fragment().is_some() || parsed.path() == "/" {
+        return None;
+    }
+    let segment = parsed.path().trim_end_matches('/').rsplit('/').next()?;
+    if segment.contains('.') || segment.is_empty() {
+        return None;
+    }
+    Some(match url.strip_suffix('/') {
+        Some(without_slash) => without_slash.to_owned(),
+        None => format!("{url}/"),
+    })
+}
+
 impl FileDownloadStore {
     pub fn new() -> Self {
         Self
@@ -903,7 +918,44 @@ impl Database {
         filename: &str,
         local_file_path: &str,
     ) -> AppResult<()> {
-        self.writer_connection()?.execute(
+        let connection = self.writer_connection()?;
+        Self::write_page_attachment(&connection, page_id, source_url, filename, local_file_path)
+    }
+
+    pub(crate) fn save_targeted_torrent_file(
+        &self,
+        page_id: i64,
+        source_url: &str,
+        filename: &str,
+        local_file_path: &str,
+    ) -> AppResult<()> {
+        let mut connection = self.writer_connection()?;
+        let tx = connection.transaction()?;
+        Self::write_page_attachment(&tx, page_id, source_url, filename, local_file_path)?;
+        tx.execute(
+            "UPDATE torrent_cards SET revision=revision+1 WHERE page_id=?1",
+            [page_id],
+        )?;
+        if tx.execute(
+            "DELETE FROM page_attributes WHERE page_id=?1 AND attribute_id IN
+             (SELECT id FROM attributes WHERE kind='notice' AND label=?2)",
+            params![page_id, crate::models::TORRENT_UNAVAILABLE_NOTICE],
+        )? > 0
+        {
+            refresh_page_search_index(&tx, page_id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_page_attachment(
+        connection: &Connection,
+        page_id: i64,
+        source_url: &str,
+        filename: &str,
+        local_file_path: &str,
+    ) -> AppResult<()> {
+        connection.execute(
             "INSERT INTO page_attachments(page_id,source_url,filename,local_file_path) VALUES(?1,?2,?3,?4) ON CONFLICT(page_id,source_url) DO UPDATE SET filename=excluded.filename,local_file_path=excluded.local_file_path,downloaded_at=CURRENT_TIMESTAMP",
             params![page_id,source_url,filename,local_file_path],
         )?;
@@ -1307,22 +1359,20 @@ impl Database {
         Ok(sites)
     }
 
-    pub(crate) fn saved_page_location(&self, url: &str) -> AppResult<Option<(i64, bool)>> {
+    pub(crate) fn saved_page_location(&self, url: &str) -> AppResult<Option<(i64, bool, String)>> {
+        let mut parsed = url::Url::parse(url.trim())?;
+        parsed.set_fragment(None);
+        let url = parsed.as_str();
+        let alternative = collection_url_alternate(url);
         let connection = self.connect()?;
-        let alternative = if url.contains('?') {
-            url.to_owned()
-        } else if let Some(url) = url.strip_suffix('/') {
-            url.to_owned()
-        } else {
-            format!("{url}/")
-        };
         Ok(connection
             .query_row(
-                "SELECT sp.id, EXISTS(SELECT 1 FROM torrent_cards t WHERE t.page_id = sp.id)
+                "SELECT sp.id, EXISTS(SELECT 1 FROM torrent_cards t WHERE t.page_id = sp.id),
+                        sp.page_url
              FROM source_pages sp WHERE sp.page_url IN (?1, ?2)
              ORDER BY sp.page_url = ?1 DESC LIMIT 1",
                 params![url, alternative],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?)
     }

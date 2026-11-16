@@ -5,6 +5,7 @@ use sha1::Digest;
 
 use crate::db::{Database, FileDownloadStore};
 use crate::error::IncompleteAttachments;
+use crate::fs::torrent::is_torrent_file;
 use crate::models::{MetadataAttribute, ScrapedItem, TorrentCard, TORRENT_UNAVAILABLE_NOTICE};
 use crate::scraper::ContentScraper;
 use crate::AppResult;
@@ -330,7 +331,7 @@ pub(crate) async fn download(
         let result = match attribute.kind.as_str() {
             "attachment" => {
                 save_attachment(
-                    page, page_id, attribute, scraper, database, base_dir, &store,
+                    page, page_id, attribute, scraper, database, base_dir, &store, false,
                 )
                 .await
             }
@@ -352,15 +353,7 @@ pub(crate) async fn download(
         .any(|attribute| attribute.kind == "attachment" && is_torrent_file(&attribute.label))
         && !database
             .torrent_card(page_id)?
-            .attachments
-            .iter()
-            .any(|file| {
-                is_torrent_file(&file.filename)
-                    && base_dir
-                        .join(&file.local_file_path)
-                        .metadata()
-                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-            })
+            .has_downloaded_torrent(base_dir)
     {
         failures.push((
             "Torrent file".into(),
@@ -374,10 +367,27 @@ pub(crate) async fn download(
     Ok(())
 }
 
-fn is_torrent_file(filename: &str) -> bool {
-    Path::new(filename)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
+pub(super) async fn download_torrent_file(
+    page: &ScrapedItem,
+    page_id: i64,
+    scraper: &dyn ContentScraper,
+    database: &Database,
+    base_dir: &Path,
+) -> AppResult<()> {
+    let result = match page.attributes.iter().find(|attribute| {
+        attribute.kind == "attachment" && is_torrent_file(&attribute.label)
+    }) {
+        Some(attribute) => save_attachment(
+            page, page_id, attribute, scraper, database, base_dir, &FileDownloadStore::new(), true,
+        ).await,
+        None => Err("The source did not provide a .torrent link. Check your access or retry when the file is available.".into()),
+    };
+    result.map_err(|error| {
+        IncompleteAttachments {
+            failures: vec![("Torrent file".into(), error)],
+        }
+        .into()
+    })
 }
 
 async fn save_attachment(
@@ -388,13 +398,21 @@ async fn save_attachment(
     database: &Database,
     base_dir: &Path,
     store: &FileDownloadStore,
+    torrent_only: bool,
 ) -> AppResult<()> {
     let url = attribute
         .source_url
         .as_deref()
         .ok_or("attachment has no download URL")?;
     let relative = stored_relative_path(database, page, page_id, url, &attribute.label)?;
-    let path = base_dir.join(&relative);
+    let path = if torrent_only {
+        super::torrent_library::checked_path(
+            &base_dir.canonicalize()?,
+            &relative.to_string_lossy(),
+        )?
+    } else {
+        base_dir.join(&relative)
+    };
     let size = match tokio::fs::metadata(&path).await {
         Ok(metadata) if metadata.is_file() => metadata.len(),
         Ok(_) => return Err("attachment destination is not a file".into()),
@@ -426,6 +444,14 @@ async fn save_attachment(
         .transpose()?;
     if size == 0 {
         store.write_bytes(&path.to_string_lossy(), &data).await?;
+    }
+    if torrent_only {
+        return database.save_targeted_torrent_file(
+            page_id,
+            url,
+            &attribute.label,
+            &relative.to_string_lossy(),
+        );
     }
     database.save_page_attachment(page_id, url, &attribute.label, &relative.to_string_lossy())?;
     if let Some(magnet) = magnet {

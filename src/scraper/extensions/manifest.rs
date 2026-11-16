@@ -8,6 +8,7 @@ use crate::models::{PageKind, ScraperCapabilities};
 use crate::AppResult;
 
 pub const MAX_MODULE_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const MAX_NETWORK_ORIGINS: usize = 128;
 
 /// Keeps the cache key paired with the exact immutable bytes that were hashed.
 pub(super) struct ModuleBytes {
@@ -160,7 +161,10 @@ impl PluginManifest {
         {
             return Err("plugin entry must stay inside its package directory".into());
         }
-        if self.routes.is_empty() || self.routes.len() > 64 || self.network_origins.len() > 64 {
+        if self.routes.is_empty()
+            || self.routes.len() > 64
+            || self.network_origins.len() > MAX_NETWORK_ORIGINS
+        {
             return Err("invalid number of routes or network origins".into());
         }
         for route in &self.routes {

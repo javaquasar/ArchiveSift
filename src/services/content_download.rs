@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::path::PathBuf;
 
 use futures::{stream, StreamExt};
@@ -88,6 +89,75 @@ impl
         self.run_page(config, source_url, true).await
     }
 
+    pub(crate) async fn download_torrent_file(
+        &self,
+        config: &AppConfig,
+        source_url: &str,
+    ) -> AppResult<Vec<String>> {
+        self.database.initialize()?;
+        let Some((page_id, true, saved_url)) = self.database.saved_page_location(source_url)?
+        else {
+            return Err("Save the torrent card before requesting its file.".into());
+        };
+        let _lease = self.lock_page(&saved_url).await?;
+        if self
+            .database
+            .torrent_card(page_id)?
+            .has_downloaded_torrent(&self.base_dir)
+        {
+            return Ok(Vec::new());
+        }
+        let scraper = self
+            .scraper_registry
+            .scraper_for_url(&saved_url)
+            .ok_or_else(|| ScraperError::NoScraperRegistered {
+                url: saved_url.clone(),
+            })?;
+        if scraper.classify_url(&saved_url) == PageKind::Listing {
+            return Err("A torrent file download requires a saved content page.".into());
+        }
+        let settings = scraper
+            .extension_id()
+            .and_then(|id| config.extension_settings.get(id));
+        let page = scraper
+            .scrape_content_configured(&saved_url, settings)
+            .await?;
+        if page.page_url != saved_url
+            && crate::db::collection_url_alternate(&saved_url).as_deref() != Some(&page.page_url)
+        {
+            return Err("The extension returned a different page for this torrent file.".into());
+        }
+        super::attachments::download_torrent_file(
+            &page,
+            page_id,
+            scraper,
+            &self.database,
+            &self.base_dir,
+        )
+        .await?;
+        Ok(Vec::new())
+    }
+
+    async fn lock_page(
+        &self,
+        url: &str,
+    ) -> AppResult<(tokio::sync::OwnedMutexGuard<()>, std::fs::File)> {
+        let guard = self.database.content_lock(url).lock_owned().await;
+        let database = self.database.clone();
+        let root = self.base_dir.clone();
+        let url = url.to_owned();
+        let lease = tokio::task::spawn_blocking(move || -> AppResult<std::fs::File> {
+            let lease = database
+                .try_content_lease(&url)?
+                .ok_or("this page is being updated by another application instance")?;
+            super::torrent_library::TorrentLibrary::new(database, root)
+                .recover_page_locked(&url)?;
+            Ok(lease)
+        })
+        .await??;
+        Ok((guard, lease))
+    }
+
     async fn run_page(
         &self,
         config: &AppConfig,
@@ -163,22 +233,14 @@ impl
             .scrape_content_configured(source_url, settings)
             .await?;
         if images_only && page.page_url != source_url {
-            return Err("The extension returned a different page for this image repair.".into());
+            if crate::db::collection_url_alternate(source_url).as_deref() != Some(&page.page_url) {
+                return Err(
+                    "The extension returned a different page for this image repair.".into(),
+                );
+            }
+            page.page_url = source_url.to_owned();
         }
-        let content_lock = self.database.content_lock(&page.page_url);
-        let _guard = content_lock.lock_owned().await;
-        let recovery_database = self.database.clone();
-        let recovery_root = self.base_dir.clone();
-        let recovery_url = page.page_url.clone();
-        let _lease = tokio::task::spawn_blocking(move || -> AppResult<std::fs::File> {
-            let lease = recovery_database
-                .try_content_lease(&recovery_url)?
-                .ok_or("this page is being updated by another application instance")?;
-            super::torrent_library::TorrentLibrary::new(recovery_database, recovery_root)
-                .recover_page_locked(&recovery_url)?;
-            Ok(lease)
-        })
-        .await??;
+        let _lease = self.lock_page(&page.page_url).await?;
         let image_sections = take_image_sections(&mut page);
         self.log_content_discovery(&page);
 
@@ -240,6 +302,7 @@ impl
             persisted.page_id,
             &persisted.image_ids_by_url,
             &sections_by_id,
+            images_only,
         )?;
         let image_result = self
             .execute_downloads(
@@ -306,38 +369,66 @@ impl
         page_id: i64,
         image_ids_by_url: &std::collections::HashMap<String, i64>,
         sections_by_id: &HashMap<i64, String>,
+        repair: bool,
     ) -> AppResult<Vec<DownloadRequest>> {
         let directory = self.database.torrent_directory(page_id)?;
-        let existing = self
+        let existing: HashMap<_, _> = self
             .database
             .get_page_images_with_paths(page_id)?
             .into_iter()
-            .collect::<std::collections::HashMap<_, _>>();
+            .filter(|(_, path)| !path.is_empty())
+            .filter_map(|(id, path)| {
+                if repair {
+                    super::torrent_library::portable_path(&path)
+                        .ok()
+                        .map(|path| (id, path))
+                } else {
+                    Some((
+                        id,
+                        PathBuf::from(path.replace('\\', "/"))
+                            .components()
+                            .collect(),
+                    ))
+                }
+            })
+            .collect();
+        let gallery_directory = if repair && directory.is_none() {
+            let mut directories = HashMap::<&Path, usize>::new();
+            for parent in existing.values().filter_map(|path| path.parent()) {
+                *directories.entry(parent).or_default() += 1;
+            }
+            directories
+                .into_iter()
+                .max_by(|(a, n), (b, m)| n.cmp(m).then_with(|| b.cmp(a)))
+                .map(|(path, _)| path)
+        } else {
+            None
+        };
+        let mut used_paths = HashSet::new();
+        let mut seen_ids = HashSet::new();
+        if repair {
+            used_paths.extend(existing.values().cloned());
+        }
         Ok(page
             .images
             .iter()
             .filter_map(|image| {
                 let image_id = image_ids_by_url.get(&image.source_url)?;
+                if repair && !seen_ids.insert(*image_id) {
+                    return None;
+                }
                 let mut request =
                     build_download_request(image, page, page_id, *image_id, &self.strategy);
-                let existing_path = existing
-                    .get(image_id)
-                    .filter(|p| !p.is_empty())
-                    .map(|path| {
-                        PathBuf::from(path.replace('\\', "/"))
-                            .components()
-                            .collect::<PathBuf>()
+                let existing_path = existing.get(image_id).filter(|path| {
+                    directory.as_ref().is_none_or(|directory| {
+                        (path.starts_with(directory)
+                            && sections_by_id.get(image_id).is_none_or(|section| {
+                                path.starts_with(directory.join("images").join(section))
+                            }))
+                            || self.base_dir.join(path).is_file()
                     })
-                    .filter(|path| {
-                        directory.as_ref().is_none_or(|directory| {
-                            (path.starts_with(directory)
-                                && sections_by_id.get(image_id).is_none_or(|section| {
-                                    path.starts_with(directory.join("images").join(section))
-                                }))
-                                || self.base_dir.join(path).is_file()
-                        })
-                    });
-                if let Some(path) = &existing_path {
+                });
+                if let Some(path) = existing_path {
                     request.relative_path = path.clone();
                 } else if let Some(directory) = &directory {
                     let filename = request.relative_path.file_name()?.to_owned();
@@ -346,23 +437,39 @@ impl
                         images.push(section);
                     }
                     request.relative_path = images.join(filename);
+                } else if let Some(directory) = gallery_directory {
+                    request.relative_path = directory.join(request.relative_path.file_name()?);
                 }
-                if existing_path.is_none()
-                    && image
+                if existing_path.is_none() {
+                    let has_preview = image
                         .preview_url
                         .as_deref()
-                        .is_some_and(|preview| preview != image.source_url)
-                    && self.base_dir.join(&request.relative_path).exists()
-                {
-                    // A newly resolved original may share the preview's basename.
-                    // Give it a stable separate path instead of accepting old pixels.
-                    let mut name = request.relative_path.file_stem()?.to_os_string();
-                    name.push(format!("_{image_id}"));
-                    if let Some(extension) = request.relative_path.extension() {
-                        name.push(".");
-                        name.push(extension);
+                        .is_some_and(|preview| preview != image.source_url);
+                    if (repair && used_paths.contains(&request.relative_path))
+                        || (has_preview && self.base_dir.join(&request.relative_path).exists())
+                    {
+                        // A new image can share an older image's filename after reordering.
+                        let stem = request.relative_path.file_stem()?;
+                        for index in 0.. {
+                            let mut name = stem.to_os_string();
+                            name.push(format!("_{image_id}"));
+                            if index > 0 {
+                                name.push(format!("_{index}"));
+                            }
+                            if let Some(extension) = request.relative_path.extension() {
+                                name.push(".");
+                                name.push(extension);
+                            }
+                            let candidate = request.relative_path.with_file_name(name);
+                            if !used_paths.contains(&candidate) {
+                                request.relative_path = candidate;
+                                break;
+                            }
+                        }
                     }
-                    request.relative_path.set_file_name(name);
+                }
+                if repair {
+                    used_paths.insert(request.relative_path.clone());
                 }
                 Some(request)
             })
@@ -374,11 +481,11 @@ impl
         requests: Vec<DownloadRequest>,
         max_concurrent_downloads: usize,
         asset_origins: Option<&[String]>,
-        repair_empty: bool,
+        repair: bool,
     ) -> AppResult<()> {
         let restricted_client = asset_origins.map(OriginRestrictedClient::new).transpose()?;
         let results = stream::iter(requests)
-            .map(|request| self.download_one(request, restricted_client.as_ref(), repair_empty))
+            .map(|request| self.download_one(request, restricted_client.as_ref(), repair))
             .buffer_unordered(max_concurrent_downloads.max(1))
             .collect::<Vec<_>>()
             .await;
@@ -415,7 +522,7 @@ impl
         &self,
         mut request: DownloadRequest,
         restricted_client: Option<&OriginRestrictedClient>,
-        repair_empty: bool,
+        repair: bool,
     ) -> AppResult<ImageArtifactUpdate> {
         self.ui.print_download_target(&request.image_url);
 
@@ -441,13 +548,13 @@ impl
             let mut file = tokio::fs::File::open(&absolute).await?;
             let mut header = [0; 32];
             let size = file.read(&mut header).await?;
-            if size > 0 || !repair_empty {
-                if image::guess_format(&header[..size]).is_err() {
-                    return Err("existing image file has an invalid image header".into());
-                }
+            if image::guess_format(&header[..size]).is_ok() {
                 self.ui.print_output_file(&absolute_str);
                 self.ui.print_skipped_existing(&absolute_str);
                 return Ok(self.prepare_local_artifact(&request, &absolute).await);
+            }
+            if !repair {
+                return Err("existing image file has an invalid image header".into());
             }
         }
 
@@ -757,7 +864,7 @@ mod tests {
         )]);
 
         let requests = service
-            .build_download_requests(&page, 11, &image_ids_by_url, &HashMap::new())
+            .build_download_requests(&page, 11, &image_ids_by_url, &HashMap::new(), false)
             .unwrap();
 
         assert_eq!(requests.len(), 1);
@@ -825,6 +932,7 @@ mod tests {
                     persisted.page_id,
                     &persisted.image_ids_by_url,
                     &HashMap::new(),
+                    false,
                 )
                 .unwrap()
         };
@@ -869,6 +977,7 @@ mod tests {
                 persisted.page_id,
                 &persisted.image_ids_by_url,
                 &HashMap::from([(persisted.image_ids_by_url[second], sections[second].clone())]),
+                false,
             )
             .unwrap();
         assert_eq!(requests[0].relative_path, existing);
@@ -1016,6 +1125,7 @@ mod tests {
         }
         fn supports_url(&self, url: &str) -> bool {
             url == self.page.page_url
+                || crate::db::collection_url_alternate(&self.page.page_url).as_deref() == Some(url)
         }
         fn scrape_content<'a>(
             &'a self,
@@ -1058,9 +1168,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repairs_a_legacy_gallery_in_its_saved_folder() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::new(root.path().join("archive.db"));
+        database.initialize().unwrap();
+        let base = root.path().join("downloads");
+        let folder = Path::new("my library/edited collection");
+        std::fs::create_dir_all(base.join(folder)).unwrap();
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let downloads = Arc::new(Mutex::new(Vec::new()));
+        let server = tokio::spawn({
+            let downloads = downloads.clone();
+            let png = png.clone();
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut request = [0; 4096];
+                    let len = stream.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..len]);
+                    if let Some(path) = request.split_whitespace().nth(1) {
+                        downloads.lock().unwrap().push(path.to_owned());
+                    }
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    stream.write_all(&png).await.unwrap();
+                }
+            }
+        });
+
+        let mut saved = sample_page();
+        saved.page_url.pop();
+        let image_at = |path: &str, order, name: Option<&str>| {
+            let mut image = sample_image(&format!("{origin}/{path}"));
+            image.sort_order = order;
+            image.local_file_path =
+                name.map(|name| folder.join(name).to_string_lossy().into_owned());
+            image
+        };
+        saved.images = vec![
+            image_at("old/picture.png", 0, Some("001_picture.png")),
+            image_at("broken.png", 1, Some("002_broken.png")),
+            image_at("omitted.png", 2, None),
+        ];
+        let old_file = base.join(folder).join("001_picture.png");
+        std::fs::write(&old_file, &png).unwrap();
+        std::fs::write(base.join(folder).join("002_broken.png"), b"broken").unwrap();
+        let persisted = database.upsert_scraped_item(&saved).unwrap();
+        assert!(database
+            .torrent_directory(persisted.page_id)
+            .unwrap()
+            .is_none());
+
+        let mut fresh = saved.clone();
+        fresh.page_url.push('/');
+        fresh.title = "Renamed on the website".into();
+        fresh.images.pop();
+        let added_image = image_at("new/picture.png", 0, None);
+        fresh.images.insert(0, added_image.clone());
+        fresh.images.push(added_image);
+        let mut registry = ScraperRegistry::new();
+        registry.register(Box::new(RetryFixtureScraper {
+            page: fresh,
+            attachment_calls: Default::default(),
+            attachment_fails: false,
+        }));
+        let service = ContentDownloadService::new(
+            registry,
+            database.clone(),
+            FileDownloadStore::new(),
+            ConsoleUi::new(),
+            StructuredDirectoryStrategy,
+            base.clone(),
+            root.path().join("thumbs"),
+        );
+        service
+            .repair_page_images(&AppConfig::default(), &saved.page_url)
+            .await
+            .unwrap();
+        service
+            .repair_page_images(&AppConfig::default(), &saved.page_url)
+            .await
+            .unwrap();
+        let mut fetched = downloads.lock().unwrap().clone();
+        fetched.sort();
+        assert_eq!(fetched, ["/broken.png", "/new/picture.png", "/omitted.png"]);
+        assert_eq!(std::fs::read(old_file).unwrap(), png);
+        let images = database.page_repair_images(persisted.page_id).unwrap();
+        assert_eq!(images.len(), 4);
+        let paths = images
+            .iter()
+            .map(|(_, image)| {
+                let path = PathBuf::from(image.local_file_path.as_ref().unwrap());
+                assert_eq!(path.parent(), Some(folder));
+                assert_eq!(std::fs::read(base.join(&path)).unwrap(), png);
+                path
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(paths.len(), 4);
+        let connection = rusqlite::Connection::open(root.path().join("archive.db")).unwrap();
+        let title: String = connection
+            .query_row(
+                "SELECT title FROM source_pages WHERE id=?1",
+                [persisted.page_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, saved.title);
+        assert_eq!(
+            database.page_image_paths(persisted.page_id).unwrap().len(),
+            4
+        );
+        assert_eq!(
+            database
+                .saved_page_location(&format!("{}/", saved.page_url))
+                .unwrap(),
+            Some((persisted.page_id, false, saved.page_url.clone()))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn torrent_file_only_repairs_the_attachment_and_leaves_other_assets_alone() {
+        use crate::models::{MetadataAttribute, TorrentQuery, TORRENT_UNAVAILABLE_NOTICE};
+        use crate::services::url_queue::download_failure_kind;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("downloads");
+        std::fs::create_dir_all(&base).unwrap();
+        let database = Database::new(root.path().join("library.db"));
+        database.initialize().unwrap();
+        let attribute =
+            |kind: &str, label: &str, value: &str, source: Option<&str>| MetadataAttribute {
+                kind: kind.into(),
+                label: label.into(),
+                value: value.into(),
+                source_url: source.map(str::to_owned),
+                is_female: None,
+            };
+        let mut saved = sample_page();
+        saved.title = "Keep the saved title".into();
+        saved.attributes = vec![attribute(
+            "notice",
+            TORRENT_UNAVAILABLE_NOTICE,
+            "Sign in",
+            None,
+        )];
+        let page_id = database.upsert_scraped_item(&saved).unwrap().page_id;
+        let card = database.torrent_card(page_id).unwrap();
+        let directory = Path::new(card.directory.as_ref().unwrap());
+        let relative = directory.join("release.TORRENT");
+        let magnet = directory.join("release.magnet.txt");
+        std::fs::create_dir_all(base.join(directory)).unwrap();
+        std::fs::write(base.join(&magnet), b"existing magnet").unwrap();
+        database
+            .save_page_attachment(
+                page_id,
+                "magnet:fixture",
+                "Magnet",
+                &magnet.to_string_lossy(),
+            )
+            .unwrap();
+
+        let query = TorrentQuery {
+            missing_torrent: true,
+            ..Default::default()
+        };
+        let count = || {
+            database
+                .search_torrent_summaries_with_storage(&query, Some(&base), None)
+                .unwrap()
+                .total
+        };
+        assert_eq!(count(), 1);
+        let torrent = "https://example.test/release.torrent";
+        database
+            .save_page_attachment(
+                page_id,
+                torrent,
+                "release.TORRENT",
+                &relative.to_string_lossy(),
+            )
+            .unwrap();
+        assert_eq!(count(), 1);
+        std::fs::write(base.join(&relative), []).unwrap();
+        assert_eq!(count(), 1);
+
+        let mut remote = saved.clone();
+        remote.title = "Changed remote title".into();
+        remote
+            .images
+            .push(sample_image("https://example.invalid/image.png"));
+        remote.attributes = vec![
+            attribute(
+                "attachment",
+                "sidecar.txt",
+                "Sidecar",
+                Some("https://example.test/sidecar.txt"),
+            ),
+            attribute("attachment", "release.TORRENT", "Download", Some(torrent)),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let make_service = |attachment_fails| {
+            let mut registry = ScraperRegistry::new();
+            registry.register(Box::new(RetryFixtureScraper {
+                page: remote.clone(),
+                attachment_calls: calls.clone(),
+                attachment_fails,
+            }));
+            ContentDownloadService::new(
+                registry,
+                database.clone(),
+                FileDownloadStore::new(),
+                ConsoleUi::new(),
+                StructuredDirectoryStrategy,
+                base.clone(),
+                root.path().join("thumbs"),
+            )
+        };
+        let config = AppConfig::default();
+        let error = make_service(true)
+            .download_torrent_file(&config, &saved.page_url)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            download_failure_kind(error.as_ref()),
+            crate::models::QueueFailureKind::RateLimit
+        );
+        assert_eq!(count(), 1);
+        let service = make_service(false);
+        service
+            .download_torrent_file(&config, &saved.page_url)
+            .await
+            .unwrap();
+        service
+            .download_torrent_file(&config, &saved.page_url)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(count(), 0);
+        assert_eq!(
+            std::fs::read(base.join(&relative)).unwrap(),
+            b"d4:infod6:lengthi1e4:name4:demoee"
+        );
+        assert_eq!(
+            std::fs::read(base.join(&magnet)).unwrap(),
+            b"existing magnet"
+        );
+        let after = database.torrent_card(page_id).unwrap();
+        assert_eq!(after.title, saved.title);
+        assert!(after.images.is_empty());
+        assert_eq!(after.attachments.len(), 2);
+        assert!(!after
+            .attributes
+            .iter()
+            .any(|a| a.label == TORRENT_UNAVAILABLE_NOTICE));
+        assert!(after.revision > card.revision);
+        assert_eq!(std::fs::read_dir(base.join(directory)).unwrap().count(), 2);
+    }
+
+    #[tokio::test]
     async fn quota_failure_saves_other_files_and_can_retry_after_a_restart() {
         use crate::models::{MetadataAttribute, QueueFailureKind, TORRENT_UNAVAILABLE_NOTICE};
-        use crate::services::url_queue::{download_failure_kind, UrlQueueService};
+        use crate::services::url_queue::{download_failure_kind, QueueJob, UrlQueueService};
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1159,8 +1542,8 @@ mod tests {
 
         let queue = open_queue();
         assert!(queue.retry_failure(&url).unwrap());
-        let (job, images_only) = queue.take_next_job().unwrap();
-        assert!(!images_only);
+        let (job, mode) = queue.take_next_job().unwrap();
+        assert_eq!(mode, QueueJob::Full);
         service(page, false)
             .run_for_url(&config, &job)
             .await

@@ -37,6 +37,8 @@ pub struct TorrentMovePlan {
     page_url: String,
     image_paths: Vec<(i64, String)>,
     attachment_paths: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_images: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description_export: Option<String>,
 }
@@ -171,6 +173,7 @@ impl TorrentLibrary {
             page_url: card.page_url.clone(),
             image_paths: vec![],
             attachment_paths: vec![],
+            missing_images: vec![],
             description_export: None,
         };
         if !move_files {
@@ -179,6 +182,8 @@ impl TorrentLibrary {
         }
         let target = plan.to_directory.as_ref().unwrap();
         let mut mapping = HashMap::<String, String>::new();
+        let mut optional_sources = HashSet::new();
+        let current_directory = card.directory.as_deref().map(portable_path).transpose()?;
         // Existing managed directories may also contain user-added sidecar files.
         if let Some(directory) = &card.directory {
             let absolute = checked_path(&plan.base_dir, directory)?;
@@ -200,15 +205,20 @@ impl TorrentLibrary {
             if let Some(from) = image.local_file_path.as_deref().filter(|s| !s.is_empty()) {
                 let from = portable_path(from)?.to_string_lossy().into_owned();
                 let to = mapping.get(&from).cloned().unwrap_or_else(|| {
-                    Path::new(target)
-                        .join("images")
-                        .join(format!(
+                    optional_sources.insert(from.clone());
+                    let target = Path::new(target);
+                    let tail = current_directory
+                        .as_ref()
+                        .and_then(|directory| Path::new(&from).strip_prefix(directory).ok());
+                    let path = match tail {
+                        Some(tail) => target.join(tail),
+                        None => target.join("images").join(format!(
                             "{}_{}",
                             image.image_id,
                             safe_component(file_name(&from), "image", 100)
-                        ))
-                        .to_string_lossy()
-                        .into_owned()
+                        )),
+                    };
+                    path.to_string_lossy().into_owned()
                 });
                 mapping.insert(from, to.clone());
                 plan.image_paths.push((image.image_id, to));
@@ -218,6 +228,7 @@ impl TorrentLibrary {
             let from = portable_path(&attachment.local_file_path)?
                 .to_string_lossy()
                 .into_owned();
+            optional_sources.remove(&from);
             let to = mapping.get(&from).cloned().unwrap_or_else(|| {
                 Path::new(target)
                     .join(safe_component(file_name(&from), "attachment", 120))
@@ -242,6 +253,10 @@ impl TorrentLibrary {
             if destination.try_exists()? {
                 return Err("destination already contains a file; nothing was moved".into());
             }
+            if optional_sources.contains(&from) && !source.try_exists()? {
+                plan.missing_images.push((from, to));
+                continue;
+            }
             let (size, sha256) = fingerprint(&source)?;
             let retain_source = self.database.archive_path_is_shared(page_id, &from)?;
             plan.files.push(PlannedFile {
@@ -253,6 +268,7 @@ impl TorrentLibrary {
             });
         }
         plan.files.sort_by(|a, b| a.from.cmp(&b.from));
+        plan.missing_images.sort_unstable();
         if card.directory != plan.to_directory {
             let destination = checked_path(&plan.base_dir, target)?;
             if destination.try_exists()? {
@@ -347,6 +363,7 @@ impl TorrentLibrary {
             page_url: card.page_url.clone(),
             image_paths: Vec::new(),
             attachment_paths: Vec::new(),
+            missing_images: Vec::new(),
             description_export: None,
         };
         let images = directory.join("images");
@@ -437,6 +454,13 @@ impl TorrentLibrary {
                 return Err(
                     "a temporary destination file already exists; nothing was moved".into(),
                 );
+            }
+        }
+        for (from, to) in &plan.missing_images {
+            if checked_path(&plan.base_dir, from)?.try_exists()?
+                || checked_path(&plan.base_dir, to)?.try_exists()?
+            {
+                return Err("image files changed; prepare a new move".into());
             }
         }
         if plan.from_directory != plan.to_directory {
@@ -835,7 +859,7 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or("file")
 }
 
-fn portable_path(value: &str) -> AppResult<PathBuf> {
+pub(super) fn portable_path(value: &str) -> AppResult<PathBuf> {
     let value = value.replace('\\', "/");
     if value.is_empty() || value.contains(':') || value.split('/').any(|s| matches!(s, "." | ".."))
     {

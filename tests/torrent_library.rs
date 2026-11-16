@@ -2,7 +2,8 @@ use archive_sift::{
     db::Database,
     fs::torrent::{safe_component, torrent_directory},
     models::{
-        MetadataAttribute, ScrapedImage, ScrapedItem, SearchQuery, TorrentEdit, TorrentQuery,
+        MetadataAttribute, ScrapedImage, ScrapedItem, SearchQuery, TorrentEdit, TorrentField,
+        TorrentQuery,
     },
     services::torrent_library::TorrentLibrary,
 };
@@ -607,6 +608,102 @@ fn renamed_folder_moves_all_assets_after_confirmation_and_keeps_its_name() {
 }
 
 #[test]
+fn title_year_and_cast_edits_move_saved_images_even_if_one_is_missing() {
+    let library = Library::new(false);
+    let old = library.db.torrent_card(library.id).unwrap();
+    let old_dir = Path::new(old.directory.as_ref().unwrap());
+    let mut page = library.page.clone();
+    for (index, filename) in [(1, "present.png"), (2, "missing.png")] {
+        let path = old_dir.join("images/Scene 2").join(filename);
+        if index == 1 {
+            let absolute = library.base.join(&path);
+            std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            std::fs::write(absolute, b"second image bytes").unwrap();
+        }
+        page.images.push(ScrapedImage {
+            source_url: format!("https://example.test/{filename}"),
+            local_file_path: Some(path.to_string_lossy().into_owned()),
+            sort_order: index,
+            ..page.images[0].clone()
+        });
+    }
+    library.db.upsert_scraped_item(&page).unwrap();
+    let old = library.db.torrent_card(library.id).unwrap();
+    let mut edit = TorrentEdit::from(&old);
+    edit.details.extend([
+        (TorrentField::Title, "Corrected Collection".into()),
+        (TorrentField::Release, "2019".into()),
+    ]);
+    edit.actors = Some(vec!["Actor Two".into(), "Added Actor".into()]);
+    edit.regenerate_folder = true;
+
+    let plan = library
+        .service()
+        .prepare(library.id, old.revision, edit, false)
+        .unwrap();
+    let destination = PathBuf::from(plan.to_directory.as_ref().unwrap());
+    assert!(destination
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("Corrected Collection (2019)"));
+    assert!(!library.base.join(&destination).exists());
+    assert_eq!(
+        library.db.torrent_card(library.id).unwrap().directory,
+        old.directory
+    );
+    assert_eq!(plan.files.len(), 4);
+
+    let saved = library.service().apply(plan, |_| {}).unwrap();
+    assert_eq!(saved.content_title(), "Corrected Collection");
+    assert_eq!(saved.value("year"), "2019");
+    assert_eq!(saved.values("actor"), ["Actor Two", "Added Actor"]);
+    assert!(!library.base.join(old_dir).exists());
+    let files = [
+        ("images/001.png", b"image bytes".as_slice()),
+        ("images/Scene 2/present.png", b"second image bytes"),
+        ("release.torrent", b"torrent bytes"),
+        ("release.magnet.txt", b"magnet bytes"),
+    ];
+    for (name, bytes) in files {
+        assert_eq!(
+            std::fs::read(library.base.join(&destination).join(name)).unwrap(),
+            bytes
+        );
+    }
+    let missing = destination.join("images/Scene 2/missing.png");
+    assert_eq!(
+        Path::new(saved.images[2].local_file_path.as_ref().unwrap()),
+        missing
+    );
+    assert!(!library.base.join(missing).exists());
+    assert_eq!(saved.images[0].thumbnail_path, old.images[0].thumbnail_path);
+
+    let query = TorrentQuery {
+        title: "ed Collec".into(),
+        year: "2019".into(),
+        actors: vec!["Added Actor".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        library.db.search_torrent_summaries(&query).unwrap().total,
+        1
+    );
+    assert_eq!(
+        library
+            .db
+            .search_torrent_summaries(&TorrentQuery {
+                actors: vec!["Actor One".into()],
+                ..query
+            })
+            .unwrap()
+            .total,
+        0
+    );
+}
+
+#[test]
 fn folder_rename_rejects_invalid_names_without_changing_files_or_metadata() {
     let library = Library::new(false);
     let old = library.db.torrent_card(library.id).unwrap();
@@ -1060,6 +1157,121 @@ fn portable_paths_preserve_unicode_and_reject_windows_device_names_and_collision
             false
         )
         .is_err());
+}
+
+#[test]
+fn torrent_search_combines_title_cast_year_tags_and_genres() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::new(root.path().join("archive.sqlite3"));
+    db.initialize().unwrap();
+    let insert = |id: u32, heading: &str, fields: &[(&str, &str)]| {
+        let mut item = page();
+        item.page_url = format!("https://example.test/topic?t={id}");
+        item.title = heading.into();
+        item.images.clear();
+        item.attributes.retain(|a| a.kind == "magnet");
+        item.attributes
+            .extend(fields.iter().map(|(kind, value)| attribute(kind, value)));
+        db.upsert_scraped_item(&item).unwrap().page_id
+    };
+
+    let modern = insert(
+        1,
+        "Original page heading",
+        &[
+            ("content_title", "Северный ветер 100%_cut"),
+            ("actor", "Анна Ветрова"),
+            ("actor", "Alex Rivera"),
+            ("production_date", " 2018-09-07 "),
+            ("release_date", "2025"),
+            ("tag", "Restored"),
+            ("genre", "Драма"),
+        ],
+    );
+    let legacy = insert(
+        2,
+        "Old legacy title",
+        &[("year", "2024"), ("actor", "Alex Rivera"), ("tag", "Драма")],
+    );
+    insert(
+        3,
+        "Unrelated",
+        &[
+            ("description", "Северный ветер 100%_cut"),
+            ("director", "Анна Ветрова"),
+            ("date", "2024broken"),
+            ("tag", "Драма"),
+            ("genre", "Comedy"),
+        ],
+    );
+
+    let query = TorrentQuery {
+        title: "ВЕТЕР 100%_".into(),
+        actors: vec!["ВЕТРОВА".into(), "Rivera".into()],
+        year: "2018 – 2024".into(),
+        tags: vec!["restored".into()],
+        genres: vec!["ДРАМА".into()],
+        ..Default::default()
+    };
+    let matches = |query: &TorrentQuery| {
+        let page = db.search_torrent_summaries(query).unwrap();
+        assert_eq!(page.total, page.cards.len());
+        page.cards
+            .iter()
+            .map(|card| card.page_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(matches(&query), [modern]);
+    assert_eq!(db.search_torrents(&query).unwrap().cards[0].page_id, modern);
+    assert!(matches(&TorrentQuery {
+        year: "2025".into(),
+        ..query
+    })
+    .is_empty());
+    assert_eq!(
+        matches(&TorrentQuery {
+            title: "page HEAD".into(),
+            ..Default::default()
+        }),
+        [modern]
+    );
+    assert_eq!(
+        matches(&TorrentQuery {
+            title: "legacy".into(),
+            genres: vec!["драма".into()],
+            year: "2018—2024".into(),
+            ..Default::default()
+        }),
+        [legacy]
+    );
+    assert_eq!(
+        matches(&TorrentQuery {
+            year: "2024".into(),
+            ..Default::default()
+        }),
+        [legacy]
+    );
+    assert_eq!(
+        matches(&TorrentQuery {
+            actors: vec!["Анна".into()],
+            ..Default::default()
+        }),
+        [modern]
+    );
+    let mut genre_matches = matches(&TorrentQuery {
+        genres: vec!["драма".into()],
+        ..Default::default()
+    });
+    genre_matches.sort_unstable();
+    assert_eq!(genre_matches, [modern, legacy]);
+    for year in ["2024-2018", "20-2024", "2018-", "2024broken"] {
+        assert!(db
+            .search_torrent_summaries(&TorrentQuery {
+                year: year.into(),
+                ..Default::default()
+            })
+            .is_err());
+    }
 }
 
 #[test]

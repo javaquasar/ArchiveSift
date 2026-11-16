@@ -1161,7 +1161,7 @@ impl AppWindow {
             let input = ui.add(
                 egui::TextEdit::singleline(&mut self.config.source_url)
                     .hint_text("Content or listing URL")
-                    .desired_width((ui.available_width() - 170.0).clamp(100.0, 680.0)),
+                    .desired_width((ui.available_width() - 320.0).clamp(100.0, 680.0)),
             );
             let can_add = configured && !self.config.source_url.trim().is_empty();
             if ui
@@ -1171,6 +1171,16 @@ impl AppWindow {
             {
                 self.error = None;
                 self.pending_command = Some(UiCommand::QueueUrl(self.config.clone()));
+            }
+            if ui
+                .add_enabled(can_add, egui::Button::new("Download missing images"))
+                .on_hover_text("Check the images of an existing collection at this URL.")
+                .clicked()
+            {
+                self.error = None;
+                self.pending_command = Some(UiCommand::RepairSavedCollection {
+                    url: self.config.source_url.trim().to_owned(),
+                });
             }
             ui.menu_button("More", |ui| {
                 if ui
@@ -1480,14 +1490,14 @@ impl AppWindow {
     pub(super) fn queued_card_resolved(
         &mut self,
         ctx: &egui::Context,
-        result: Result<Option<(i64, bool)>, String>,
+        result: Result<Option<(i64, bool, String)>, String>,
     ) {
         self.queued_card_lookup = None;
         if !self.operations_open {
             return;
         }
         match result {
-            Ok(Some((id, torrent))) => {
+            Ok(Some((id, torrent, _))) => {
                 self.operations_open = false;
                 self.active_tab = Tab::Search;
                 self.torrent_mode = torrent;

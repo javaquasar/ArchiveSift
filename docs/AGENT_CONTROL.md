@@ -63,7 +63,7 @@ both executables and this guide in its application artifact. `--help` and
 | `archivesift_status` | Read | Application version, grants and queue counts. |
 | `archivesift_extensions` | Read | Installed parser IDs, versions, runtime and loaded state. |
 | `archivesift_search_images` | Read | Image/page IDs, titles, source links, favorite flags and stable pagination cursor. |
-| `archivesift_search_torrents` | Read | Compact torrent cards with counts and offset pagination. |
+| `archivesift_search_torrents` | Read | Compact torrent cards with counts and offset pagination. Supports title substrings, actor names, tags, genres and a single year or inclusive year range. |
 | `archivesift_torrent_details` | Read | Bounded titles, descriptions, credits, image IDs and attachment names. |
 | `archivesift_queue_status` | Read | Counts, current work and a bounded pending preview. |
 | `archivesift_queue_add` | Downloads | Add supported URLs to the same persistent queue used by the UI. |

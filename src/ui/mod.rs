@@ -378,6 +378,12 @@ pub enum UiCommand {
     RepairPageImages {
         url: String,
     },
+    DownloadTorrentFile {
+        url: String,
+    },
+    RepairSavedCollection {
+        url: String,
+    },
     OpenQueuedCard {
         url: String,
     },

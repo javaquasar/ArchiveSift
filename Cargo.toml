@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 select = "0.6.0"
 futures = "0.3.31"
 rayon = "1.10.0"
-rusqlite = { version = "0.33.0", features = ["bundled"] }
+rusqlite = { version = "0.33.0", features = ["bundled", "functions"] }
 eframe = "0.31.1"
 rfd = "0.15.2"
 serde = { version = "1.0.219", features = ["derive"] }

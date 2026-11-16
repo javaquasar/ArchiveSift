@@ -35,7 +35,7 @@ use crate::models::{
     DateBrowseDirection, DateGroupCursor, DateGroupPage, DeleteMode, SearchCursor,
     SearchImageResult, SearchQuery, SearchResultPage, UrlQueueReport,
 };
-use crate::services::url_queue;
+use crate::services::url_queue::{self, QueueJob};
 use crate::services::{
     ContentDownloadService, SearchService, SettingsService, StorageSettings, UrlQueueService,
 };
@@ -507,6 +507,40 @@ impl DesktopApp {
                     .log
                     .push(format!("Failed to queue manual URL: {}", error));
             }
+        }
+    }
+
+    fn enqueue_collection_images(&mut self, url: String) -> Result<(), String> {
+        let added = self
+            .queue_service
+            .enqueue_image_repair(&url)
+            .map_err(|error| error.to_string())?;
+        self.window.download_status.queued(url);
+        if added {
+            self.window.log.push("Collection image download queued.");
+        }
+        self.start_processor_if_needed(self.window.config.clone());
+        Ok(())
+    }
+
+    fn find_saved_collection(&mut self, url: String) {
+        let database_path = self.window.config.database_path.clone();
+        let state_tx = self.state_tx.clone();
+        if let Err(error) = spawn_background(move || {
+            let result = Database::new(&database_path)
+                .saved_page_location(&url)
+                .map_err(|error| error.to_string())
+                .and_then(|page| {
+                    page.map(|(_, _, saved_url)| saved_url).ok_or_else(|| {
+                        "Save this collection before downloading missing images.".into()
+                    })
+                });
+            let _ = state_tx.send(WorkerState::SavedCollectionFound {
+                database_path,
+                result,
+            });
+        }) {
+            self.window.error = Some(error);
         }
     }
 
@@ -1271,6 +1305,21 @@ impl DesktopApp {
                         self.window.queued_card_resolved(ctx, result);
                     }
                 }
+                WorkerState::SavedCollectionFound {
+                    database_path,
+                    result,
+                } => {
+                    if self.window.config.database_path == database_path
+                        && self.window.config.has_download_folder()
+                        && !self.window.storage_settings_applying()
+                    {
+                        if let Err(error) =
+                            result.and_then(|url| self.enqueue_collection_images(url))
+                        {
+                            self.window.error = Some(error);
+                        }
+                    }
+                }
                 WorkerState::DownloadSearchRefreshed { seq, result } => {
                     if seq == self.window.search_seq {
                         self.window.running = false;
@@ -1794,21 +1843,44 @@ impl DesktopApp {
                     if self.window.config.has_download_folder()
                         && !self.window.storage_settings_applying()
                     {
-                        match self.queue_service.enqueue_image_repair(&url) {
-                            Ok(_) => {
+                        if let Err(error) = self.enqueue_collection_images(url.clone()) {
+                            self.window.download_status.complete(&url, &error, true);
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                UiCommand::DownloadTorrentFile { url } => {
+                    if self.window.config.has_download_folder()
+                        && !self.window.storage_settings_applying()
+                    {
+                        match self.queue_service.enqueue_torrent_download(&url) {
+                            Ok(true) => {
                                 self.window.download_status.queued(url);
-                                self.window.log.push("Download check queued.");
+                                self.window.log.push("Torrent file download queued.");
                                 self.start_processor_if_needed(self.window.config.clone());
                             }
-                            Err(error) => {
+                            Ok(false) if !self.window.download_status.is_pending(&url) => {
                                 self.window.download_status.complete(
                                     &url,
-                                    &error.to_string(),
+                                    "A download is already queued for this card.",
                                     true,
                                 );
                             }
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.window
+                                    .download_status
+                                    .complete(&url, &error.to_string(), true)
+                            }
                         }
                         ctx.request_repaint();
+                    }
+                }
+                UiCommand::RepairSavedCollection { url } => {
+                    if self.window.config.has_download_folder()
+                        && !self.window.storage_settings_applying()
+                    {
+                        self.find_saved_collection(url);
                     }
                 }
                 UiCommand::OpenQueuedCard { url } => {
@@ -2004,7 +2076,11 @@ enum WorkerState {
     QueuedCardLoaded {
         database_path: String,
         url: String,
-        result: Result<Option<(i64, bool)>, String>,
+        result: Result<Option<(i64, bool, String)>, String>,
+    },
+    SavedCollectionFound {
+        database_path: String,
+        result: Result<String, String>,
     },
     DownloadSearchRefreshed {
         seq: u64,
@@ -2084,7 +2160,7 @@ fn run_queue_processor(
         // Each future returns the processed URL plus any newly-discovered URLs
         // (non-empty only for listing pages).
         type BoxedFut = std::pin::Pin<
-            Box<dyn std::future::Future<Output = (String, bool, AppResult<Vec<String>>)> + Send>,
+            Box<dyn std::future::Future<Output = (String, QueueJob, AppResult<Vec<String>>)> + Send>,
         >;
         let mut active: FuturesUnordered<BoxedFut> = FuturesUnordered::new();
 
@@ -2092,7 +2168,7 @@ fn run_queue_processor(
             // Fill up to concurrency limit when not paused.
             while !queue_service.is_paused() && active.len() < concurrency {
                 match queue_service.take_next_job() {
-                    Some((url, repair)) => {
+                    Some((url, job)) => {
                         let mut config = config.clone();
                         // Read the latest preset tags/categories from the shared
                         // RwLock so changes made in the UI take effect immediately
@@ -2105,13 +2181,13 @@ fn run_queue_processor(
                         let log = log.clone();
                         let scraper_registry = crate::scraper::global_registry().for_job(&mut config);
                         active.push(Box::pin(async move {
-                            let storage = if repair {
+                            let storage = if job != QueueJob::Full {
                                 tokio::fs::metadata(&base_dir).await.is_ok_and(|metadata| metadata.is_dir())
                             } else {
                                 tokio::fs::create_dir_all(&base_dir).await.is_ok()
                             };
                             if !storage {
-                                return (url, repair, Err(crate::services::url_queue::StorageUnavailable.into()));
+                                return (url, job, Err(crate::services::url_queue::StorageUnavailable.into()));
                             }
                             // ── Random throttle delay ─────────────────────────
                             let delay_ms = sample_delay(
@@ -2135,12 +2211,12 @@ fn run_queue_processor(
                                 base_dir,
                                 thumb_dir,
                             );
-                            let result = if repair {
-                                service.repair_page_images(&config, &url).await
-                            } else {
-                                service.run_for_url(&config, &url).await
+                            let result = match job {
+                                QueueJob::Full => service.run_for_url(&config, &url).await,
+                                QueueJob::Images => service.repair_page_images(&config, &url).await,
+                                QueueJob::Torrent => service.download_torrent_file(&config, &url).await,
                             };
-                            (url, repair, result)
+                            (url, job, result)
                         }));
                     }
                     None => break,
@@ -2157,7 +2233,8 @@ fn run_queue_processor(
             }
 
             // Wait for any task to complete.
-            if let Some((url, repair, result)) = active.next().await {
+            if let Some((url, job, result)) = active.next().await {
+                let repair = job != QueueJob::Full;
                 if result.is_ok() {
                     queue_service.mark_finished(&url);
                 }
@@ -2191,8 +2268,13 @@ fn run_queue_processor(
                         }
                     }
                     Ok(_) => {
+                        let message = if job == QueueJob::Torrent {
+                            "Torrent file saved."
+                        } else {
+                            "Image download completed."
+                        };
                         let _ = state_tx.send(WorkerState::ContentFinished {
-                            url, repair, message: "Image download completed.".into()
+                            url, repair, message: message.into()
                         });
                     }
                     Err(error) => {
@@ -3183,6 +3265,42 @@ mod startup_ui_tests {
     }
 
     #[test]
+    fn scrape_can_queue_missing_images_for_a_collection_without_images() {
+        use crate::models::ScrapedItem;
+        let (mut app, _root, context) = test_app(true);
+        let url = "https://demo.example.test/demo-site/galleries/summer-escape-001";
+        let db = Database::new(&app.window.config.database_path);
+        db.initialize().unwrap();
+        db.upsert_scraped_item(&ScrapedItem {
+            site_key: "demo-site".into(),
+            page_url: url.into(),
+            title: "Saved collection".into(),
+            raw_html: String::new(),
+            images: vec![],
+            attributes: vec![],
+        })
+        .unwrap();
+        app.window.config.source_url = format!("{url}/#photos");
+        app.queue_service.pause();
+
+        let size = egui::vec2(1400.0, 900.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let _ = click_label_at_size(&mut app, &context, &output, "Download missing images", size);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.queue_service.has_pending_work() && std::time::Instant::now() < deadline {
+            let _ = render(&mut app, &context, size, Vec::new());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.window.download_status.is_pending(url));
+        app.queue_service.resume();
+        assert_eq!(
+            app.queue_service.take_next_job(),
+            Some((url.into(), QueueJob::Images))
+        );
+        assert!(app.queue_service.take_next_job().is_none());
+    }
+
+    #[test]
     fn narrow_image_search_shows_results_before_details_and_returns_to_the_grid() {
         use crate::models::{SearchImageResult, SearchPageSummary};
         let (mut app, _root, context) = test_app(true);
@@ -3371,7 +3489,10 @@ mod startup_ui_tests {
 
         // Complete the queued repair as the download worker would.
         app.queue_service.resume();
-        assert_eq!(app.queue_service.take_next_job(), Some((url.into(), true)));
+        assert_eq!(
+            app.queue_service.take_next_job(),
+            Some((url.into(), QueueJob::Images))
+        );
         save(1, "second.png");
         app.queue_service.mark_finished(url);
         app.state_tx

@@ -7,11 +7,11 @@ use super::creator_filter::CreatorFilter;
 use super::download_status::DownloadStatus;
 use super::preview_loader::{ImageLoadMode, PreviewLoader, PreviewSource};
 use super::texture_cache::SizedLruCache;
-use crate::app::AppConfig;
+use crate::app::{parse_comma_list, AppConfig};
 use crate::db::Database;
 use crate::models::{
-    TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentQuery, TorrentSummaryPage,
-    TORRENT_UNAVAILABLE_NOTICE,
+    torrent_year_bounds, TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentQuery,
+    TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE,
 };
 use crate::services::torrent_library::{
     generated_directory, MoveProgress, TorrentLibrary, TorrentMovePlan,
@@ -20,32 +20,33 @@ use eframe::egui;
 
 #[derive(Default)]
 struct Filters {
+    title: String,
     text: String,
     site: String,
     studio: String,
+    actors: String,
     creators: CreatorFilter,
     tags: String,
+    genres: String,
     categories: String,
     year: String,
+    missing_torrent: bool,
     offset: usize,
 }
 impl Filters {
     fn query(&self) -> TorrentQuery {
-        let values = |s: &str| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        };
         TorrentQuery {
-            text: self.text.clone(),
+            title: self.title.trim().into(),
+            text: self.text.trim().into(),
             site_key: self.site.clone(),
-            studio: self.studio.clone(),
+            studio: self.studio.trim().into(),
+            actors: parse_comma_list(&self.actors),
             creators: self.creators.values(),
-            tags: values(&self.tags),
-            categories: values(&self.categories),
+            tags: parse_comma_list(&self.tags),
+            genres: parse_comma_list(&self.genres),
+            categories: parse_comma_list(&self.categories),
             year: self.year.trim().into(),
+            missing_torrent: self.missing_torrent,
             offset: self.offset,
         }
     }
@@ -53,9 +54,13 @@ impl Filters {
 
 fn torrent_filter_count(query: &TorrentQuery) -> usize {
     usize::from(!query.site_key.is_empty())
+        + usize::from(!query.text.is_empty())
         + usize::from(!query.studio.is_empty())
         + usize::from(!query.year.is_empty())
+        + usize::from(query.missing_torrent)
+        + query.actors.len()
         + query.tags.len()
+        + query.genres.len()
         + query.categories.len()
         + query.creators.len()
 }
@@ -188,10 +193,11 @@ impl TorrentLibraryUi {
     }
 
     pub(super) fn page_download_finished(&mut self, url: &str) {
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|card| card.page_url == url)
+        if self.applied.missing_torrent
+            || self
+                .selected
+                .as_ref()
+                .is_some_and(|card| card.page_url == url)
         {
             self.reload = true;
             self.textures.clear();
@@ -383,8 +389,9 @@ impl TorrentLibraryUi {
         self.job(ctx, move |_, _| {
             let run = || -> crate::AppResult<Outcome> {
                 database.initialize()?;
-                TorrentLibrary::new(database.clone(), root).recover()?;
-                let page = database.search_torrent_summaries(&query)?;
+                TorrentLibrary::new(database.clone(), &root).recover()?;
+                let page =
+                    database.search_torrent_summaries_with_storage(&query, Some(&root), None)?;
                 let card = selected.map(|id| database.torrent_card(id)).transpose()?;
                 let suggestions = if let Some(cached) = cached_suggestions {
                     cached
@@ -623,14 +630,14 @@ impl TorrentLibraryUi {
             offset: query.offset,
             ..draft
         } != query;
-        let applied_count = torrent_filter_count(&query) + usize::from(!query.text.is_empty());
+        let applied_count = torrent_filter_count(&query) + usize::from(!query.title.is_empty());
         let width = ui.available_width();
         let can_search = !self.busy && !self.editing && self.plan.is_none();
         ui.add_enabled_ui(can_search, |ui| {
             ui.horizontal_wrapped(|ui| {
-                let text = ui.add(
-                    egui::TextEdit::singleline(&mut self.filters.text)
-                        .hint_text("Search torrents")
+                let title = ui.add(
+                    egui::TextEdit::singleline(&mut self.filters.title)
+                        .hint_text("Movie title")
                         .desired_width((width * 0.32).clamp(105.0, 320.0)),
                 );
                 site_selector(ui, "torrent_site_filter", &mut self.filters.site, sites);
@@ -639,7 +646,8 @@ impl TorrentLibraryUi {
                         .hint_text("Tags")
                         .desired_width(105.0),
                 );
-                let enter = (text.lost_focus() || tags.lost_focus())
+                ui.checkbox(&mut self.filters.missing_torrent, "Missing .torrent");
+                let enter = (title.lost_focus() || tags.lost_focus())
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui
                     .button(if dirty { "Apply filters" } else { "Run Search" })
@@ -658,7 +666,14 @@ impl TorrentLibraryUi {
                     ui.horizontal_wrapped(|ui| {
                         ui.weak("Applied");
                         let mut remaining = 6;
+                        if query.missing_torrent
+                            && filter_chip(ui, "File", "Missing .torrent", &mut remaining)
+                        {
+                            self.filters.missing_torrent = false;
+                            removed = true;
+                        }
                         for (label, field, value) in [
+                            ("Title", &mut self.filters.title, &query.title),
                             ("Text", &mut self.filters.text, &query.text),
                             ("Site", &mut self.filters.site, &query.site_key),
                             ("Studio", &mut self.filters.studio, &query.studio),
@@ -671,9 +686,23 @@ impl TorrentLibraryUi {
                         }
                         removed |= filter_value_chips(
                             ui,
+                            "Actor",
+                            &mut self.filters.actors,
+                            &query.actors,
+                            &mut remaining,
+                        );
+                        removed |= filter_value_chips(
+                            ui,
                             "Tag",
                             &mut self.filters.tags,
                             &query.tags,
+                            &mut remaining,
+                        );
+                        removed |= filter_value_chips(
+                            ui,
+                            "Genre",
+                            &mut self.filters.genres,
+                            &query.genres,
                             &mut remaining,
                         );
                         removed |= filter_value_chips(
@@ -711,12 +740,23 @@ impl TorrentLibraryUi {
                 .show(&ctx, |ui| {
                     ui.add_enabled_ui(can_search, |ui| {
                         for (label, value) in [
+                            ("Actors (comma separated)", &mut self.filters.actors),
+                            ("Genres (comma separated)", &mut self.filters.genres),
                             ("Studio", &mut self.filters.studio),
-                            ("Year", &mut self.filters.year),
                             ("Categories (comma separated)", &mut self.filters.categories),
+                            ("Any text", &mut self.filters.text),
                         ] {
                             ui.label(label);
                             ui.text_edit_singleline(value);
+                        }
+                        ui.label("Year or range");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filters.year)
+                                .hint_text("2024 or 2018–2024")
+                                .char_limit(24),
+                        );
+                        if let Err(error) = torrent_year_bounds(&self.filters.year) {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
                         }
                         ui.label("Director / Author");
                         let size = [ui.available_width(), ui.spacing().interact_size.y];
@@ -729,8 +769,9 @@ impl TorrentLibraryUi {
                             self.filters.creators.render_suggestions(ui);
                         }
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Apply filters").clicked() {
-                                self.search_from_first_page(ui.ctx(), config);
+                            if ui.button("Apply filters").clicked()
+                                && self.search_from_first_page(ui.ctx(), config)
+                            {
                                 self.filters_open = false;
                             }
                             if ui.button("Reset filters").clicked() {
@@ -743,9 +784,14 @@ impl TorrentLibraryUi {
         }
     }
 
-    fn search_from_first_page(&mut self, ctx: &egui::Context, config: &AppConfig) {
+    fn search_from_first_page(&mut self, ctx: &egui::Context, config: &AppConfig) -> bool {
+        let mut query = self.filters.query();
+        if let Err(error) = torrent_year_bounds(&query.year) {
+            self.error = Some(error.into());
+            return false;
+        }
         self.filters.offset = 0;
-        let query = self.filters.query();
+        query.offset = 0;
         if self.applied != query {
             self.selected = None;
             self.details_open = false;
@@ -757,6 +803,7 @@ impl TorrentLibraryUi {
         self.applied = query;
         self.refresh_suggestions = true;
         self.load(ctx, config);
+        true
     }
 
     fn details(&mut self, ui: &mut egui::Ui, config: &AppConfig, downloads: &mut DownloadStatus) {
@@ -816,6 +863,17 @@ impl TorrentLibraryUi {
                 url: card.page_url.clone(),
             });
         }
+        if ui
+            .add_enabled(
+                !self.busy && config.has_download_folder() && !downloads.is_pending(&card.page_url),
+                egui::Button::new("Download .torrent only"),
+            )
+            .clicked()
+        {
+            self.pending_command = Some(crate::ui::UiCommand::DownloadTorrentFile {
+                url: card.page_url.clone(),
+            });
+        }
         if let Some(notice) = card
             .attributes
             .iter()
@@ -850,6 +908,7 @@ impl TorrentLibraryUi {
             "photographer",
             "creator",
             "tag",
+            "genre",
             "category",
         ] {
             let values = card.values(kind);
@@ -1497,14 +1556,73 @@ mod tests {
 
     #[test]
     fn torrent_filters_reuse_creator_names_across_pagination() {
-        let mut filters = Filters::default();
+        let mut filters = Filters {
+            title: "  Example film ".into(),
+            actors: "Alice, , Bob".into(),
+            tags: "Restored".into(),
+            genres: "Drama, Mystery".into(),
+            year: " 2018–2024 ".into(),
+            offset: 40,
+            site: "example-source".into(),
+            ..Default::default()
+        };
         filters.creators.text = "Alice Creator, Bob Author".into();
-        filters.offset = 40;
-        filters.site = "example-source".into();
         let query = filters.query();
+        assert_eq!(query.title, "Example film");
+        assert_eq!(query.actors, ["Alice", "Bob"]);
+        assert_eq!(query.tags, ["Restored"]);
+        assert_eq!(query.genres, ["Drama", "Mystery"]);
+        assert_eq!(query.year, "2018–2024");
         assert_eq!(query.creators, ["Alice Creator", "Bob Author"]);
         assert_eq!(query.offset, 40);
         assert_eq!(query.site_key, "example-source");
+        assert_eq!(torrent_filter_count(&query), 9);
+    }
+
+    #[test]
+    fn missing_torrent_filter_and_file_only_action_use_the_saved_card() {
+        let (_root, config, db, mut editor, ctx) = fixture();
+        let url = editor.selected.as_ref().unwrap().page_url.clone();
+        click(&mut editor, &config, &ctx, "Missing .torrent");
+        click(&mut editor, &config, &ctx, "Apply filters");
+        finish(&mut editor);
+        assert!(editor.applied.missing_torrent);
+        assert_eq!(editor.page.total, 1);
+        click(&mut editor, &config, &ctx, "Full torrent heading [2025]");
+        finish(&mut editor);
+        click(&mut editor, &config, &ctx, "Download .torrent only");
+        assert!(matches!(
+            editor.take_command(),
+            Some(crate::ui::UiCommand::DownloadTorrentFile { url: queued }) if queued == url
+        ));
+        let card = editor.selected.as_ref().unwrap();
+        let path = std::path::Path::new(card.directory.as_ref().unwrap()).join("release.torrent");
+        std::fs::write(config.effective_download_dir().join(&path), b"test torrent").unwrap();
+        db.save_page_attachment(
+            card.page_id,
+            "https://example.test/release.torrent",
+            "release.torrent",
+            &path.to_string_lossy(),
+        )
+        .unwrap();
+        editor.page_download_finished(&url);
+        render(&mut editor, &config, &ctx, vec![]);
+        finish(&mut editor);
+        assert_eq!(editor.page.total, 0);
+    }
+
+    #[test]
+    fn invalid_torrent_year_keeps_the_applied_search() {
+        let (_root, config, _, mut library, ctx) = fixture();
+        library.applied.year = "2024".into();
+        library.applied.offset = 40;
+        library.filters.year = "2024–2018".into();
+
+        assert!(!library.search_from_first_page(&ctx, &config));
+        assert!(!library.busy);
+        assert_eq!(library.applied.year, "2024");
+        assert_eq!(library.applied.offset, 40);
+        assert!(library.error.is_some());
     }
 
     fn fixture() -> (

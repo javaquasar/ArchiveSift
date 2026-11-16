@@ -4,7 +4,7 @@ mod diagnostics;
 mod tests;
 pub mod updates;
 use super::{
-    manifest::{PluginManifest, RuntimeKind},
+    manifest::{PluginManifest, RuntimeKind, MAX_NETWORK_ORIGINS},
     settings::PluginSettings,
 };
 use crate::{
@@ -121,7 +121,7 @@ fn validate_state(state: &LocalState) -> AppResult<()> {
                 || version.digest.len() != 64
                 || !version.digest.bytes().all(|c| c.is_ascii_hexdigit())
                 || semver::Version::parse(&version.version).is_err()
-                || version.origins.len() > 64
+                || version.origins.len() > MAX_NETWORK_ORIGINS
                 || serde_json::to_vec(&version.settings)?.len() > 16 * 1024
             {
                 return Err("invalid extension version state".into());

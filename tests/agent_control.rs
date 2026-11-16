@@ -76,7 +76,11 @@ impl Fixture {
                 .collect(),
             attributes: vec![
                 attribute("content_title", "Example movie"),
+                attribute("actor", "Example Actor"),
                 attribute("director", "Example Creator"),
+                attribute("date", "2020"),
+                attribute("tag", "Restored"),
+                attribute("genre", "Drama"),
                 attribute("description", "Full description"),
                 attribute("api_key", "test-fixture-private-value"),
                 attribute(
@@ -157,7 +161,8 @@ fn live_session_defaults_off_requires_a_token_and_never_exposes_secrets_or_paths
         .call(
             &token,
             "archivesift_search_torrents",
-            json!({"creators":["Example Creator"]}),
+            json!({"title":"ple mov","actors":["Actor"],"creators":["Example Creator"],
+                "year":"2020-2022","tags":["Restored"],"genres":["Drama"],"missing_torrent":true}),
         )
         .result
         .unwrap();

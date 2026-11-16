@@ -1,9 +1,21 @@
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::models::MetadataAttribute;
 
-fn valid_year(value: &str) -> Option<&str> {
+pub(crate) fn is_torrent_file(filename: &str) -> bool {
+    Path::new(filename)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
+}
+
+pub(crate) fn local_torrent_file_exists(root: &Path, stored_path: &str) -> bool {
+    root.join(stored_path.replace('\\', "/"))
+        .metadata()
+        .is_ok_and(|file| file.is_file() && file.len() > 0)
+}
+
+pub(crate) fn valid_year(value: &str) -> Option<&str> {
     let value = value.trim();
     let year = value.get(..4)?;
     if !year.bytes().all(|byte| byte.is_ascii_digit()) || year.starts_with('0') {

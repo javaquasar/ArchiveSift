@@ -158,6 +158,24 @@ fn manifest_rejects_incompatible_versions_and_unsafe_permissions() {
 }
 
 #[test]
+fn manifest_bounds_explicit_origins_independently_of_routes() {
+    let mut plugin = manifest();
+    plugin.network_origins = (0..128)
+        .map(|index| format!("https://cdn{index}.example.test"))
+        .collect();
+    plugin.validate().unwrap();
+
+    plugin
+        .network_origins
+        .push("https://other.example.test".into());
+    assert!(plugin.validate().is_err());
+    plugin.network_origins.pop();
+
+    plugin.routes.resize(65, plugin.routes[0].clone());
+    assert!(plugin.validate().is_err());
+}
+
+#[test]
 fn routing_matches_exact_hosts_and_path_boundaries_without_guest_calls() {
     let mut manifest = manifest();
     manifest.routes[0].path_prefix = "/content".into();

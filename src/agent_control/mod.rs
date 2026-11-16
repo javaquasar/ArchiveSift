@@ -257,17 +257,25 @@ impl AgentService {
                     .map_err(|_| ErrorCode::InvalidArguments)?;
                 let query = TorrentQuery {
                     text: args.text,
+                    title: args.title,
                     site_key: args.site,
                     studio: args.studio,
+                    actors: args.actors,
                     creators: args.creators,
                     tags: args.tags,
+                    genres: args.genres,
                     categories: args.categories,
                     year: args.year,
+                    missing_torrent: args.missing_torrent,
                     offset: args.offset,
                 };
                 let page = self
                     .database()?
-                    .search_torrent_summaries_cancellable(&query, token)
+                    .search_torrent_summaries_with_storage(
+                        &query,
+                        Some(&self.config.effective_download_dir()),
+                        Some(token),
+                    )
                     .map_err(failed)?;
                 json!({"total":page.total,"offset":query.offset,"next_offset":(query.offset+page.cards.len()<page.total).then_some(query.offset+page.cards.len()),
                     "items":page.cards.iter().map(|card|json!({"page_id":card.page_id,"site":clip(&card.site_key,128),"title":clip(&card.content_title,512),"primary_studio":clip(&card.primary_studio,256),"image_count":card.image_count,"attachment_count":card.attachment_count})).collect::<Vec<_>>()})
@@ -283,6 +291,7 @@ impl AgentService {
                 let allowed = [
                     "actor",
                     "tag",
+                    "genre",
                     "category",
                     "studio",
                     "date",
@@ -385,12 +394,16 @@ impl SearchArgs {
 #[serde(default, deny_unknown_fields)]
 struct TorrentArgs {
     text: String,
+    title: String,
     site: String,
     studio: String,
+    actors: Vec<String>,
     creators: Vec<String>,
     tags: Vec<String>,
+    genres: Vec<String>,
     categories: Vec<String>,
     year: String,
+    missing_torrent: bool,
     offset: usize,
 }
 
