@@ -464,24 +464,40 @@ fn check_defaults(schema: &Value) -> Result<(), String> {
 
 /// Opt-in envelope over the existing opaque state field; WIT 1.0 stays unchanged.
 pub fn settings_state(settings: &Value, state: Option<String>) -> Result<String, String> {
-    let text = serde_json::to_string(
-        &serde_json::json!({"$archivesift":1,"settings":settings,"state":state}),
-    )
-    .map_err(|_| "cannot encode settings")?;
+    settings_state_with_image_origins(settings, state, &[])
+}
+
+/// Optional host-owned image permissions in the WIT 1.0 settings envelope.
+pub fn settings_state_with_image_origins(
+    settings: &Value,
+    state: Option<String>,
+    origins: &[String],
+) -> Result<String, String> {
+    let mut envelope = serde_json::json!({"$archivesift":1,"settings":settings,"state":state});
+    if !origins.is_empty() {
+        envelope["image_origins"] = serde_json::json!(origins);
+    }
+    let text = serde_json::to_string(&envelope).map_err(|_| "cannot encode settings")?;
     if text.len() > MAX_SETTINGS_BYTES {
         return Err("configured continuation exceeds 64 KiB".into());
     }
     Ok(text)
 }
 pub fn unpack_settings(input: &mut crate::Request) -> Result<Value, String> {
+    unpack_settings_with_image_origins(input).map(|(settings, _)| settings)
+}
+
+pub fn unpack_settings_with_image_origins(
+    input: &mut crate::Request,
+) -> Result<(Value, Vec<String>), String> {
     let Some(state) = input.state.as_deref() else {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), Vec::new()));
     };
     let Ok(value) = serde_json::from_str::<Value>(state) else {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), Vec::new()));
     };
     if value.get("$archivesift").is_none() {
-        return Ok(serde_json::json!({}));
+        return Ok((serde_json::json!({}), Vec::new()));
     }
     if value["$archivesift"] != 1
         || !value["settings"].is_object()
@@ -489,8 +505,15 @@ pub fn unpack_settings(input: &mut crate::Request) -> Result<Value, String> {
     {
         return Err("invalid settings envelope".into());
     }
+    let origins = value
+        .get("image_origins")
+        .map(|origins| {
+            serde_json::from_value(origins.clone()).map_err(|_| "invalid image origin permissions")
+        })
+        .transpose()?
+        .unwrap_or_default();
     input.state = value["state"].as_str().map(String::from);
-    Ok(value["settings"].clone())
+    Ok((value["settings"].clone(), origins))
 }
 
 #[cfg(test)]
@@ -598,6 +621,12 @@ mod tests {
         assert_eq!(request.state, Some(state.clone()));
         assert_eq!(unpack_settings(&mut request).unwrap(), json!({}));
         assert_eq!(request.state, Some(state));
+        let origins = vec!["https://cdn.example.test".to_owned()];
+        request.state = Some(settings_state_with_image_origins(&settings, None, &origins).unwrap());
+        assert_eq!(
+            unpack_settings_with_image_origins(&mut request).unwrap(),
+            (settings, origins)
+        );
         request.state = Some("{\"$archivesift\":2}".into());
         assert!(unpack_settings(&mut request).is_err());
         assert!(settings_state(&json!({"big":"x".repeat(MAX_SETTINGS_BYTES)}), None).is_err());

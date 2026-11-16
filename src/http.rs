@@ -74,47 +74,85 @@ pub(crate) async fn fetch_response(url: &str) -> AppResult<LimitedHttpResponse> 
 pub(crate) struct OriginRestrictedClient {
     client: Client,
     origins: Vec<String>,
+    public: Option<Client>,
+    grants: Vec<String>,
 }
 
 impl OriginRestrictedClient {
     pub(crate) fn new(origins: &[String]) -> AppResult<Self> {
-        let permissions = origins.to_vec();
-        let origins = origins.to_vec();
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 5 {
-                    return attempt.error("too many image redirects");
-                }
-                let target = attempt.url();
-                if !target.username().is_empty()
-                    || target.password().is_some()
-                    || !origins.contains(&target.origin().ascii_serialization())
-                {
-                    return attempt
-                        .error("image redirect is outside the extension network permissions");
-                }
-                attempt.follow()
-            }))
-            .build()?;
+        Self::with_grants(origins, &[])
+    }
+
+    pub(crate) fn with_grants(origins: &[String], grants: &[String]) -> AppResult<Self> {
+        let builder = || {
+            Client::builder()
+                .user_agent(USER_AGENT)
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        };
         Ok(Self {
-            client,
-            origins: permissions,
+            client: builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            origins: origins.to_vec(),
+            public: (!grants.is_empty())
+                .then(|| crate::image_access::public_client(builder()))
+                .transpose()?,
+            grants: grants.to_vec(),
         })
     }
 
     pub(crate) async fn fetch(&self, url: &str) -> AppResult<LimitedHttpResponse> {
-        let parsed = reqwest::Url::parse(url)?;
-        if !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || !self
-                .origins
-                .contains(&parsed.origin().ascii_serialization())
-        {
-            return Err("image URL is outside the extension network permissions".into());
+        use crate::image_access::{is_granted, ImageAccessIssue, ImagePermissionRequired};
+        let mut target = reqwest::Url::parse(url)?;
+        let permit = shared_request_limiter().acquire().await;
+        let mut public_only = false;
+        for hop in 0..=5 {
+            let declared = target.username().is_empty()
+                && target.password().is_none()
+                && self
+                    .origins
+                    .contains(&target.origin().ascii_serialization());
+            let client = if declared && !public_only {
+                &self.client
+            } else if is_granted(&target, &self.grants)
+                || (declared
+                    && public_only
+                    && crate::image_access::public_image_origin(&target).is_some())
+            {
+                public_only = true;
+                self.public.as_ref().expect("a grant has a public client")
+            } else {
+                let reason = if hop == 0 { "download" } else { "redirect" };
+                return match ImageAccessIssue::for_url(target, reason) {
+                    Some(issue) => Err(ImagePermissionRequired(issue).into()),
+                    None => Err("image URL is outside the extension network permissions".into()),
+                };
+            };
+            let response = client.get(target.clone()).send().await.map_err(|source| {
+                HttpClientError::RequestFailed {
+                    url: url.to_owned(),
+                    source,
+                }
+            })?;
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .ok_or("image redirect has no Location header")?
+                    .to_str()?;
+                target = target.join(location)?;
+                continue;
+            }
+            let response =
+                response
+                    .error_for_status()
+                    .map_err(|source| HttpClientError::RequestFailed {
+                        url: url.to_owned(),
+                        source,
+                    })?;
+            return Ok(LimitedHttpResponse { response, permit });
         }
-        fetch_response_using(url, &self.client).await
+        Err("too many image redirects".into())
     }
 }
 
@@ -300,6 +338,32 @@ mod tests {
         let limited = client.fetch(&format!("{origin}/image.png")).await.unwrap();
         let (response, _permit) = limited.into_parts();
         assert_eq!(response.bytes().await.unwrap().as_ref(), b"png");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_redirect_reports_the_blocked_origin_without_its_query() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://cdn.example.test/new.png?signature=fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let client = OriginRestrictedClient::new(&[origin.clone()]).unwrap();
+        let error = match client.fetch(&format!("{origin}/image.png")).await {
+            Ok(_) => panic!("unexpected permitted redirect"),
+            Err(error) => error,
+        };
+        let issue = &error
+            .downcast_ref::<crate::image_access::ImagePermissionRequired>()
+            .unwrap()
+            .0;
+        assert_eq!(issue.origin, "https://cdn.example.test");
+        assert_eq!(issue.resource, "https://cdn.example.test/new.png");
+        assert_eq!(issue.reason, "redirect");
         server.await.unwrap();
     }
 

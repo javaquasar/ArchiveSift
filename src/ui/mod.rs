@@ -128,6 +128,31 @@ fn truncate_log_line(mut line: String) -> String {
 #[derive(Clone, Default)]
 pub struct ConsoleUi {
     log: UiLog,
+    progress: Option<QueueProgress>,
+}
+
+/// Live counters for a single run of the download worker.
+#[derive(Clone, Default)]
+pub(crate) struct QueueProgress(Arc<Mutex<QueueProgressSnapshot>>);
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QueueProgressSnapshot {
+    pub pages_processed: usize,
+    pub pages_failed: usize,
+    pub images_processed: usize,
+    pub images_total: usize,
+}
+
+impl QueueProgress {
+    pub(crate) fn snapshot(&self) -> QueueProgressSnapshot {
+        *self.0.lock().unwrap()
+    }
+
+    pub(crate) fn finish_page(&self, failed: bool) {
+        let mut progress = self.0.lock().unwrap();
+        progress.pages_processed += 1;
+        progress.pages_failed += usize::from(failed);
+    }
 }
 
 impl ConsoleUi {
@@ -136,7 +161,29 @@ impl ConsoleUi {
     }
 
     pub fn from_log(log: UiLog) -> Self {
-        Self { log }
+        Self {
+            log,
+            progress: None,
+        }
+    }
+
+    pub(crate) fn with_queue_progress(log: UiLog, progress: QueueProgress) -> Self {
+        Self {
+            log,
+            progress: Some(progress),
+        }
+    }
+
+    pub(crate) fn begin_image_batch(&self, count: usize) {
+        if let Some(progress) = &self.progress {
+            progress.0.lock().unwrap().images_total += count;
+        }
+    }
+
+    pub(crate) fn finish_image(&self) {
+        if let Some(progress) = &self.progress {
+            progress.0.lock().unwrap().images_processed += 1;
+        }
     }
 
     pub fn print_html(&self, html: &str) {
@@ -381,8 +428,17 @@ pub enum UiCommand {
     RetryQueueItem {
         url: String,
     },
+    RemoveFailedDownloads {
+        urls: Vec<String>,
+    },
     RepairPageImages {
         url: String,
+    },
+    LoadImageAccess,
+    ChangeImageAccess {
+        extension_id: String,
+        origin: String,
+        action: ImageAccessAction,
     },
     DownloadTorrentFile {
         url: String,
@@ -415,6 +471,13 @@ pub enum UiCommand {
         ascending: bool,
         max_favorites_exclusive: Option<usize>,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ImageAccessAction {
+    ApproveAndRetry,
+    Retry,
+    Revoke,
 }
 
 // ── Shared utilities ──────────────────────────────────────────────────────────

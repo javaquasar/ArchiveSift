@@ -20,11 +20,12 @@ use crate::app::{AppConfig, PreviewOpenMode};
 use crate::fs::structured::actor_folder_name;
 use crate::models::{
     DateBrowseDirection, DateGroup, DateGroupCursor, DateGroupPage, DeleteMode, PageKind,
-    QueueFailureKind, SearchCursor, SearchImageResult, SearchQuery, SearchResultPage, TorrentFacet,
-    UrlQueueDecision, UrlQueueOutcome, UrlQueueReport,
+    QueueFailureKind, SearchCursor, SearchImageResult, SearchPageSummary, SearchQuery,
+    SearchResultPage, TorrentFacet, TorrentImage, UrlQueueDecision, UrlQueueOutcome,
+    UrlQueueReport,
 };
 use crate::scraper::ScraperRegistry;
-use crate::ui::{truncate, SearchRefresh, UiCommand, UiLog};
+use crate::ui::{truncate, QueueProgress, SearchRefresh, UiCommand, UiLog};
 
 const PREVIEW_CACHE_MAX_ENTRIES: usize = 256;
 const PREVIEW_CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
@@ -181,12 +182,13 @@ pub struct AppWindow {
     appearance_applied: Option<crate::app::AppearanceConfig>,
     scrape_options_open: bool,
     operations_open: bool,
+    pub(super) image_access: super::image_access::ImageAccessPanel,
     operation_tab: OperationTab,
     failure_kind: Option<QueueFailureKind>,
     failure_offset: usize,
     retry_batch_size: usize,
     pub(super) queued_card_lookup: Option<String>,
-    queue_card_feedback: Option<String>,
+    failure_feedback: Option<String>,
     raw_settings: Option<super::raw_settings::RawSettingsEditor>,
     account_settings: Option<AccountSettingsEditor>,
     extensions_manager: super::extensions_manager::ExtensionsManagerUi,
@@ -246,6 +248,7 @@ pub struct AppWindow {
 
     // Viewer / lightbox
     viewer_open: Option<usize>,
+    torrent_viewer: Option<(i64, i64)>,
     /// Current zoom level (1.0 = fit-to-window). Reset on navigation.
     viewer_zoom: f32,
     /// Pan offset in pixels from the image centre. Reset on navigation.
@@ -284,6 +287,7 @@ pub struct AppWindow {
     pub queue_window_open: bool,
     /// Latest snapshot of the download queue (updated every frame).
     pub queue_snapshot: Arc<crate::models::QueueSnapshot>,
+    pub(super) queue_progress: QueueProgress,
     /// Pending range requested by the virtualized queue window for the next
     /// frame. The queue service clones only this bounded slice.
     pub(super) queue_visible_range: std::ops::Range<usize>,
@@ -341,12 +345,13 @@ impl AppWindow {
             appearance_applied: None,
             scrape_options_open: false,
             operations_open: false,
+            image_access: Default::default(),
             operation_tab: OperationTab::Queue,
             failure_kind: None,
             failure_offset: 0,
             retry_batch_size: 10,
             queued_card_lookup: None,
-            queue_card_feedback: None,
+            failure_feedback: None,
             raw_settings: None,
             account_settings: None,
             extensions_manager: Default::default(),
@@ -391,6 +396,7 @@ impl AppWindow {
             recent_pages_limit: 10,
             recent_pages_active: false,
             viewer_open: None,
+            torrent_viewer: None,
             viewer_zoom: 1.0,
             viewer_pan: egui::Vec2::ZERO,
             viewer_image_mode: ImageLoadMode::Preview,
@@ -413,6 +419,7 @@ impl AppWindow {
             thumb_dir,
             queue_window_open: false,
             queue_snapshot: Arc::new(crate::models::QueueSnapshot::default()),
+            queue_progress: QueueProgress::default(),
             queue_visible_range: 0..64,
             live_presets,
             sql_query: String::new(),
@@ -785,6 +792,7 @@ impl AppWindow {
                         ui.selectable_value(&mut self.active_tab, Tab::SqlQuery, "SQL");
                         ui.selectable_value(&mut self.active_tab, Tab::Extensions, "Extensions");
                         ui.selectable_value(&mut self.active_tab, Tab::Settings, "Settings");
+                        self.render_queue_progress(ui);
                     });
                 },
             );
@@ -934,6 +942,7 @@ impl AppWindow {
         replacement.extensions_manager = std::mem::take(&mut self.extensions_manager);
         replacement.extensions_manager.invalidate();
         replacement.active_tab = self.active_tab;
+        replacement.queue_progress = self.queue_progress.clone();
         replacement.storage_settings_saved();
         *self = replacement;
     }
@@ -1528,10 +1537,21 @@ impl AppWindow {
                 ctx.request_repaint();
             }
             Ok(None) => {
-                self.queue_card_feedback = Some("No card has been saved for this URL yet.".into())
+                self.failure_feedback = Some("No card has been saved for this URL yet.".into())
             }
-            Err(error) => self.queue_card_feedback = Some(error),
+            Err(error) => self.failure_feedback = Some(error),
         }
+    }
+
+    pub(super) fn failed_downloads_removed(&mut self, result: rusqlite::Result<usize>) {
+        let message = match result {
+            Ok(0) => "The selected downloads have already left the failure list.".into(),
+            Ok(1) => "Removed 1 failed download.".into(),
+            Ok(count) => format!("Removed {count} failed downloads."),
+            Err(error) => format!("Could not remove failed downloads: {error}"),
+        };
+        self.log.push(message.clone());
+        self.failure_feedback = Some(message);
     }
 
     fn render_queue_rows(&mut self, ui: &mut egui::Ui) {
@@ -1583,6 +1603,42 @@ impl AppWindow {
             } else {
                 UiCommand::PauseQueue
             });
+        }
+    }
+
+    fn render_queue_progress(&self, ui: &mut egui::Ui) {
+        let progress = self.queue_progress.snapshot();
+        let active = self.queue_snapshot.in_progress.len();
+        let pending = self.queue_snapshot.pending_total;
+        let total = progress.pages_processed + active + pending;
+        if total == 0 {
+            return;
+        }
+
+        ui.separator();
+        ui.add(
+            egui::ProgressBar::new(progress.pages_processed as f32 / total as f32)
+                .desired_width(144.0)
+                .text(format!("{}/{} pages", progress.pages_processed, total)),
+        )
+        .on_hover_text(format!(
+            "Pages processed this run · {active} active · {pending} pending"
+        ));
+        if self.queue_snapshot.paused && active + pending > 0 {
+            ui.weak("Queue paused");
+        }
+        if progress.images_total > 0 {
+            ui.weak(format!(
+                "{}/{} images",
+                progress.images_processed, progress.images_total
+            ))
+            .on_hover_text("Images checked this run, including existing files and failed attempts");
+        }
+        if progress.pages_failed > 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{} failed this run", progress.pages_failed),
+            );
         }
     }
 
@@ -1683,6 +1739,9 @@ impl AppWindow {
                                 });
                             });
                         }
+                        if let Some(feedback) = &self.failure_feedback {
+                            ui.label(feedback);
+                        }
                         if snapshot.failed_total == 0 {
                             ui.weak("No failed downloads.");
                         } else {
@@ -1706,6 +1765,7 @@ impl AppWindow {
                                 if kind != self.failure_kind {
                                     self.failure_kind = kind;
                                     self.failure_offset = 0;
+                                    self.failure_feedback = None;
                                     ui.ctx().request_repaint();
                                 } else {
                                     let page_size =
@@ -1762,12 +1822,28 @@ impl AppWindow {
                                         limit: self.retry_batch_size,
                                     });
                                 }
+                                if snapshot.failed_preview.len() > 1
+                                    && ui
+                                        .button(format!(
+                                            "Remove this page ({})",
+                                            snapshot.failed_preview.len()
+                                        ))
+                                        .on_hover_text(
+                                            "Remove this page of errors from the retry queue",
+                                        )
+                                        .clicked()
+                                {
+                                    self.pending_command = Some(UiCommand::RemoveFailedDownloads {
+                                        urls: snapshot
+                                            .failed_preview
+                                            .iter()
+                                            .map(|row| row.url.clone())
+                                            .collect(),
+                                    });
+                                }
                             });
                             if snapshot.failed_preview.is_empty() {
                                 ui.weak("No failures match this reason.");
-                            }
-                            if let Some(feedback) = &self.queue_card_feedback {
-                                ui.label(feedback);
                             }
                             egui::ScrollArea::vertical()
                                 .max_height(260.0)
@@ -1794,6 +1870,18 @@ impl AppWindow {
                                                         });
                                                 }
                                                 if ui
+                                                    .button("Remove from list")
+                                                    .on_hover_text(
+                                                        "Remove this error from the retry queue",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.pending_command =
+                                                        Some(UiCommand::RemoveFailedDownloads {
+                                                            urls: vec![failure.url.clone()],
+                                                        });
+                                                }
+                                                if ui
                                                     .add_enabled(
                                                         storage_ready
                                                             && !self.running
@@ -1806,7 +1894,7 @@ impl AppWindow {
                                                 {
                                                     self.queued_card_lookup =
                                                         Some(failure.url.clone());
-                                                    self.queue_card_feedback = None;
+                                                    self.failure_feedback = None;
                                                     self.pending_command =
                                                         Some(UiCommand::OpenQueuedCard {
                                                             url: failure.url.clone(),
@@ -1821,6 +1909,14 @@ impl AppWindow {
                         }
                     }
                     OperationTab::Activity => {
+                        if let Some(command) = self.image_access.show(
+                            ui,
+                            &self.config.database_path,
+                            self.config.has_download_folder() && !self.storage_settings.applying,
+                        ) {
+                            self.pending_command = Some(command);
+                        }
+                        ui.separator();
                         if ui.button("Clear log").clicked() {
                             self.log.clear();
                         }
@@ -2124,6 +2220,7 @@ impl AppWindow {
                                                     }
                                                 }
                                                 if should_open_preview(self.config.preview_open_mode, &resp) {
+                                                    self.torrent_viewer = None;
                                                     self.viewer_open = Some(index);
                                                 }
                                             } else {
@@ -2339,6 +2436,7 @@ impl AppWindow {
                                             .fit_to_exact_size(size * scale),
                                     );
                                 if should_open_preview(self.config.preview_open_mode, &response) {
+                                    self.torrent_viewer = None;
                                     self.viewer_open = Some(index);
                                 }
                                 ui.small(match self.config.preview_open_mode {
@@ -3092,28 +3190,74 @@ impl AppWindow {
     // window and onto secondary monitors.
 
     fn render_viewer(&mut self, ctx: &egui::Context) {
-        let index = match self.viewer_open {
-            Some(i) => i,
-            None => return,
-        };
-
-        let total = self.search_results.len();
-        if total == 0 {
-            self.viewer_open = None;
-            return;
+        let torrent_request = self.torrent_library.take_viewer_request();
+        if let Some((page_id, image_id)) = torrent_request {
+            self.open_torrent_viewer(page_id, image_id);
         }
-        let index = index.min(total - 1);
-
-        // Clone the data the viewport closure needs so it does not borrow self.
-        let result = self.search_results[index].clone();
-
-        // Pre-clone adjacent results for thumbnail preloading inside the closure.
-        let prev_result = if index > 0 {
-            self.search_results.get(index - 1).cloned()
+        let torrent = self.torrent_viewer.and_then(|(page_id, image_id)| {
+            let card = self.torrent_library.viewer_card(page_id)?;
+            let index = card
+                .images
+                .iter()
+                .position(|image| image.image_id == image_id)?;
+            Some((card, index))
+        });
+        if self.torrent_viewer.is_some() && torrent.is_none() {
+            self.torrent_viewer = None;
+            self.original_loader.advance_generation();
+            self.viewer_original_cache.clear();
+        }
+        let (index, total, result, prev_result, next_result) = if let Some((card, index)) = &torrent
+        {
+            let page = Arc::new(SearchPageSummary {
+                page_id: card.page_id,
+                title: card.content_title().into(),
+                url: card.page_url.clone(),
+                attributes: Arc::default(),
+            });
+            let at = |index| {
+                card.images
+                    .get(index)
+                    .map(|image| torrent_viewer_image(image, &page))
+            };
+            (
+                *index,
+                card.images.len(),
+                torrent_viewer_image(&card.images[*index], &page),
+                index.checked_sub(1).and_then(at),
+                at(index + 1),
+            )
         } else {
-            None
+            let Some(index) = self.viewer_open else {
+                return;
+            };
+            let total = self.search_results.len();
+            if total == 0 {
+                self.viewer_open = None;
+                return;
+            }
+            let index = index.min(total - 1);
+            (
+                index,
+                total,
+                self.search_results[index].clone(),
+                index
+                    .checked_sub(1)
+                    .and_then(|i| self.search_results.get(i))
+                    .cloned(),
+                self.search_results.get(index + 1).cloned(),
+            )
         };
-        let next_result = self.search_results.get(index + 1).cloned();
+        let is_torrent = torrent.is_some();
+        let mut main_image_change = None;
+        let mut is_main_image = torrent.as_ref().is_some_and(|(card, _)| {
+            self.torrent_library.viewer_primary_image(card) == Some(result.image_id)
+        });
+        let can_set_main_image = self.torrent_library.can_change_primary_image()
+            && !self.download_status.is_pending(result.page_url());
+        let torrent_error = is_torrent
+            .then(|| self.torrent_library.viewer_error())
+            .flatten();
 
         // All mutation intent collected into locals; applied after the closure.
         let mut nav_to: Option<usize> = None;
@@ -3124,8 +3268,12 @@ impl AppWindow {
         let mut viewer_delete_confirmed = false;
         let mut viewer_delete_cancelled = false;
         let is_favorite = result.is_favorite;
-        let has_description = result
-            .attributes
+        let attributes = torrent
+            .as_ref()
+            .map_or(result.attributes.as_slice(), |(card, _)| {
+                card.attributes.as_slice()
+            });
+        let has_description = attributes
             .iter()
             .any(|attribute| matches!(attribute.kind.as_str(), "description" | "full_description"));
         let db_path = self.config.database_path.clone();
@@ -3170,8 +3318,9 @@ impl AppWindow {
             total
         );
 
+        let viewport_id = egui::ViewportId::from_hash_of("image_viewer");
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("image_viewer"),
+            viewport_id,
             application_viewport()
                 .with_title(&title)
                 .with_inner_size([900.0, 700.0]),
@@ -3184,14 +3333,14 @@ impl AppWindow {
                         close_viewer = true;
                     }
 
-                    if viewer_delete_shortcut_requested(&i.events, wants_keyboard_input) {
+                    if !is_torrent && viewer_delete_shortcut_requested(&i.events, wants_keyboard_input) {
                         trigger_delete = true;
                     }
 
                     // Text fields own all keyboard input while focused. This avoids
                     // navigation, mode changes, favorites, and viewer deletion while
                     // the user edits tags (and protects future text fields as well).
-                    if !wants_keyboard_input {
+                    if is_torrent || !wants_keyboard_input {
                         // Navigation
                         if i.key_pressed(egui::Key::ArrowLeft)
                             || i.key_pressed(egui::Key::ArrowUp)
@@ -3200,14 +3349,14 @@ impl AppWindow {
                         }
                         if i.key_pressed(egui::Key::ArrowRight)
                             || i.key_pressed(egui::Key::ArrowDown)
-                            || i.key_pressed(egui::Key::Space)
+                            || (!wants_keyboard_input && i.key_pressed(egui::Key::Space))
                         {
                             if index + 1 < total { nav_to = Some(index + 1); }
                         }
                         if i.key_pressed(egui::Key::Escape) {
                             close_viewer = true;
                         }
-                        if i.key_pressed(egui::Key::F) {
+                        if !is_torrent && i.key_pressed(egui::Key::F) {
                             toggle_fav = true;
                         }
                         if i.key_pressed(egui::Key::O) && original_available {
@@ -3296,7 +3445,7 @@ impl AppWindow {
 
                 // ── Tag strip (bottom panel — declared before CentralPanel so it
                 //    gets space first and the image fills what remains) ──────────
-                egui::TopBottomPanel::bottom("viewer_tag_panel").show(vp_ctx, |ui| {
+                let render_tags = |ui: &mut egui::Ui| {
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.label("Tags:");
@@ -3364,16 +3513,25 @@ impl AppWindow {
                     }
 
                     ui.add_space(2.0);
-                });
+                };
+                if !is_torrent {
+                    egui::TopBottomPanel::bottom("viewer_tag_panel").show(vp_ctx, render_tags);
+                }
 
                 egui::CentralPanel::default().show(vp_ctx, |ui| {
                     // ── Navigation bar ────────────────────────────────────────
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(index > 0, egui::Button::new("◀ Prev")).clicked() {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(index > 0, egui::Button::new("◀ Prev"))
+                            .on_hover_text("Previous image (←)")
+                            .clicked()
+                        {
                             nav_to = Some(index - 1);
                         }
                         ui.label(format!("{} / {}", index + 1, total));
-                        if ui.add_enabled(index + 1 < total, egui::Button::new("Next ▶")).clicked() {
+                        if ui.add_enabled(index + 1 < total, egui::Button::new("Next ▶"))
+                            .on_hover_text("Next image (→)")
+                            .clicked()
+                        {
                             nav_to = Some(index + 1);
                         }
 
@@ -3410,13 +3568,25 @@ impl AppWindow {
                             viewer_pan  = egui::Vec2::ZERO;
                         }
 
-                        ui.separator();
-                        ui.small("← →  Space: next  •  O: preview/original  •  scroll: zoom  •  drag: pan  •  F: ★  •  Esc: close");
-
-                        let fav_label = if is_favorite { "★" } else { "☆" };
-                        let fav_hover = if is_favorite { "Remove from favorites (F)" } else { "Add to favorites (F)" };
-                        if ui.button(fav_label).on_hover_text(fav_hover).clicked() {
-                            toggle_fav = true;
+                        if is_torrent {
+                            if ui
+                                .add_enabled(
+                                    can_set_main_image,
+                                    egui::Checkbox::new(&mut is_main_image, "Main image"),
+                                )
+                                .on_hover_text("Choose this image as the card preview. Clearing the choice uses the first image automatically.")
+                                .changed()
+                            {
+                                main_image_change = Some(is_main_image);
+                            }
+                        } else {
+                            ui.separator();
+                            ui.small("← →  Space: next  •  O: preview/original  •  scroll: zoom  •  drag: pan  •  F: ★  •  Esc: close");
+                            let fav_label = if is_favorite { "★" } else { "☆" };
+                            let fav_hover = if is_favorite { "Remove from favorites (F)" } else { "Add to favorites (F)" };
+                            if ui.button(fav_label).on_hover_text(fav_hover).clicked() {
+                                toggle_fav = true;
+                            }
                         }
                         if ui.add_enabled(has_description, egui::Button::new("📄"))
                             .on_hover_text("Open full description")
@@ -3440,6 +3610,9 @@ impl AppWindow {
                         }
                     });
 
+                    if let Some(error) = torrent_error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
                     ui.separator();
 
                     // ── Image with zoom / pan / click-to-navigate ─────────────
@@ -3631,15 +3804,16 @@ impl AppWindow {
                 });
             },
         );
+        if torrent_request.is_some() && !close_viewer {
+            ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Focus);
+        }
 
         if open_description {
-            if let Some(description) = result
-                .attributes
+            if let Some(description) = attributes
                 .iter()
                 .find(|attribute| attribute.kind == "full_description")
                 .or_else(|| {
-                    result
-                        .attributes
+                    attributes
                         .iter()
                         .find(|attribute| attribute.kind == "description")
                 })
@@ -3658,6 +3832,7 @@ impl AppWindow {
         self.viewer_image_transition = viewer_image_transition;
         if close_viewer {
             self.viewer_open = None;
+            self.torrent_viewer = None;
             self.viewer_zoom = 1.0;
             self.viewer_pan = egui::Vec2::ZERO;
             self.viewer_original_blend = 0.0;
@@ -3665,8 +3840,12 @@ impl AppWindow {
             self.original_loader.advance_generation();
             self.viewer_original_cache.clear();
         } else if let Some(new_idx) = nav_to {
-            self.viewer_open = Some(new_idx);
-            self.selected_result = Some(new_idx);
+            if let Some((card, _)) = &torrent {
+                self.torrent_viewer = Some((card.page_id, card.images[new_idx].image_id));
+            } else {
+                self.viewer_open = Some(new_idx);
+                self.selected_result = Some(new_idx);
+            }
             // Reset zoom and pan when moving to a different image.
             self.viewer_zoom = 1.0;
             self.viewer_pan = egui::Vec2::ZERO;
@@ -3675,6 +3854,7 @@ impl AppWindow {
             if self.viewer_image_mode == ImageLoadMode::Original {
                 self.original_loader.advance_generation();
             }
+            ctx.request_repaint_of(viewport_id);
         } else if viewer_image_mode_changed {
             self.viewer_zoom = 1.0;
             self.viewer_pan = egui::Vec2::ZERO;
@@ -3682,6 +3862,14 @@ impl AppWindow {
             // Persist zoom/pan changes made this frame.
             self.viewer_zoom = viewer_zoom;
             self.viewer_pan = viewer_pan;
+        }
+        if let (Some((card, _)), Some(selected)) = (torrent, main_image_change) {
+            self.torrent_library.set_viewer_primary_image(
+                ctx,
+                &self.config,
+                card,
+                selected.then_some(result.image_id),
+            );
         }
         if toggle_fav {
             self.pending_command = Some(UiCommand::SetFavorite {
@@ -3742,6 +3930,17 @@ impl AppWindow {
                 refresh: viewer_refresh,
             });
         }
+    }
+
+    fn open_torrent_viewer(&mut self, page_id: i64, image_id: i64) {
+        self.viewer_open = None;
+        self.viewer_delete_confirm = None;
+        self.torrent_viewer = Some((page_id, image_id));
+        self.viewer_zoom = 1.0;
+        self.viewer_pan = egui::Vec2::ZERO;
+        self.viewer_original_blend = 0.0;
+        self.viewer_image_transition = None;
+        self.original_loader.advance_generation();
     }
 
     // ── Delete confirmation modal ─────────────────────────────────────────────
@@ -4567,6 +4766,19 @@ pub(crate) fn should_show_rescrape_prompt(
     matches!(outcome, UrlQueueOutcome::AlreadyProcessed) && !skip_downloaded
 }
 
+fn torrent_viewer_image(image: &TorrentImage, page: &Arc<SearchPageSummary>) -> SearchImageResult {
+    SearchImageResult {
+        image_id: image.image_id,
+        page: page.clone(),
+        source_url: image.source_url.clone(),
+        preview_url: None,
+        local_file_path: image.local_file_path.clone(),
+        thumbnail_path: image.thumbnail_path.clone(),
+        is_favorite: false,
+        attributes: page.attributes.clone(),
+    }
+}
+
 fn viewer_delete_shortcut_requested(events: &[egui::Event], wants_keyboard_input: bool) -> bool {
     !wants_keyboard_input
         && events.iter().any(|event| {
@@ -4841,6 +5053,175 @@ mod tests {
             );
             assert_eq!(builder.app_id.as_deref(), Some("archive-sift"));
         }
+    }
+
+    #[test]
+    fn torrent_photos_use_the_native_viewer_and_save_the_main_image_for_that_card() {
+        use crate::models::{ScrapedImage, ScrapedItem};
+        let root = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            database_path: root.path().join("library.sqlite3").display().to_string(),
+            download_folder: root.path().join("files").display().to_string(),
+            ..AppConfig::default()
+        };
+        let db = crate::db::Database::new(&config.database_path);
+        db.initialize().unwrap();
+        let images = (0..2)
+            .map(|index| ScrapedImage {
+                source_url: format!("https://example.test/cover-{index}.png"),
+                preview_url: None,
+                alt_text: None,
+                width: None,
+                height: None,
+                sort_order: index,
+                local_file_path: None,
+            })
+            .collect();
+        let page_id = db
+            .upsert_scraped_item(&ScrapedItem {
+                site_key: "fixture".into(),
+                page_url: "https://example.test/card".into(),
+                title: "Torrent viewer fixture".into(),
+                raw_html: String::new(),
+                images,
+                attributes: vec![MetadataAttribute {
+                    kind: "magnet".into(),
+                    label: "Magnet".into(),
+                    value: "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".into(),
+                    source_url: None,
+                    is_female: None,
+                }],
+            })
+            .unwrap()
+            .page_id;
+        let original = db.torrent_card(page_id).unwrap();
+        let first = original.images[0].image_id;
+        let second = original.images[1].image_id;
+
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let mut window = AppWindow::new(
+            config.clone(),
+            UiLog::default(),
+            Arc::new(RwLock::new(LivePresets::default())),
+        );
+        window.set_search_results(vec![search_result(99, vec![])]);
+        window.torrent_library.open_card(&ctx, &config, page_id);
+        let wait_for_card = |window: &mut AppWindow| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while window.torrent_library.busy {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "torrent card operation timed out"
+                );
+                window.torrent_library.poll();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        wait_for_card(&mut window);
+        window.open_torrent_viewer(page_id, first);
+
+        let input = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = Arc::new(std::sync::Mutex::new(None));
+        let events = input.clone();
+        let captured = output.clone();
+        let child = egui::Context::default();
+        egui::Context::set_immediate_viewport_renderer(move |_, mut viewport| {
+            assert_eq!(
+                viewport.ids.this,
+                egui::ViewportId::from_hash_of("image_viewer")
+            );
+            let mut raw = egui::RawInput {
+                viewport_id: viewport.ids.this,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900., 700.),
+                )),
+                events: std::mem::take(&mut *events.lock().unwrap()),
+                ..Default::default()
+            };
+            raw.viewports
+                .insert(viewport.ids.this, egui::ViewportInfo::default());
+            let frame = child.run(raw, |ctx| (viewport.viewport_ui_cb)(ctx));
+            *captured.lock().unwrap() = Some((viewport.builder.clone(), frame));
+        });
+        let render = |window: &mut AppWindow, events| {
+            *input.lock().unwrap() = events;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| window.render_viewer(ctx));
+        };
+        let key = |key| {
+            [true, false]
+                .map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .into()
+        };
+        render(&mut window, key(egui::Key::ArrowLeft));
+        assert_eq!(window.torrent_viewer, Some((page_id, first)));
+        render(&mut window, key(egui::Key::ArrowRight));
+        render(&mut window, key(egui::Key::ArrowRight));
+        assert_eq!(window.torrent_viewer, Some((page_id, second)));
+        assert!(window.viewer_open.is_none());
+        assert_eq!(window.search_results[0].image_id, 99);
+
+        fn checkbox_pos(shape: &egui::Shape) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Main image" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(checkbox_pos),
+                _ => None,
+            }
+        }
+        let toggle = |window: &mut AppWindow, expected: Option<i64>| {
+            render(window, vec![]);
+            let (builder, frame) = output.lock().unwrap().take().unwrap();
+            assert_eq!(
+                builder.title.as_deref(),
+                Some("Torrent viewer fixture — 2 / 2")
+            );
+            let pos = frame
+                .shapes
+                .iter()
+                .find_map(|shape| checkbox_pos(&shape.shape))
+                .unwrap();
+            for pressed in [true, false] {
+                render(
+                    window,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            wait_for_card(window);
+            let saved = db.torrent_card(page_id).unwrap();
+            assert_eq!(saved.primary_image_id, expected);
+            assert_eq!(saved.directory, original.directory);
+        };
+        toggle(&mut window, Some(second));
+        render(&mut window, key(egui::Key::ArrowLeft));
+        assert_eq!(window.torrent_viewer, Some((page_id, first)));
+        render(&mut window, key(egui::Key::ArrowRight));
+        toggle(&mut window, None);
+        assert!(db
+            .update_torrent_primary_image(page_id, original.revision, Some(first))
+            .is_err());
+        let saved = db.torrent_card(page_id).unwrap();
+        assert!(db
+            .update_torrent_primary_image(page_id, saved.revision, Some(i64::MAX))
+            .is_err());
+        render(&mut window, key(egui::Key::Escape));
+        assert!(window.torrent_viewer.is_none());
     }
 
     #[test]

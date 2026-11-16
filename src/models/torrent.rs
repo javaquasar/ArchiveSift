@@ -256,6 +256,7 @@ pub struct TorrentPage {
 #[derive(Clone, Debug)]
 pub struct TorrentSummary {
     pub page_id: i64,
+    pub page_url: String,
     pub site_key: String,
     pub primary_studio: String,
     pub content_title: String,

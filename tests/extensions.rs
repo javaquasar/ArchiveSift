@@ -390,9 +390,29 @@ async fn both_runtimes_enforce_permissions_result_kinds_errors_and_size_limits()
         };
         let (package, _) = make_package(runtime, &server.origin, limits);
         let scraper = ExtensionScraper::load(package.path()).unwrap();
+        let image_page = format!("{}/galleries/__fixture__/image-denied", server.origin);
+        let deferred = scraper.scrape_content(&image_page).await.unwrap();
+        assert!(deferred.images.is_empty());
+        assert_eq!(deferred.attributes[0].kind, "image_origin_required");
+        assert_eq!(
+            deferred.attributes[0].source_url.as_deref(),
+            Some("https://ungranted.invalid/image.png")
+        );
+        let permitted = scraper
+            .scrape_content_with_image_origins(
+                &image_page,
+                None,
+                &["https://ungranted.invalid".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            permitted.images[0].source_url,
+            "https://ungranted.invalid/image.png"
+        );
+        assert!(permitted.attributes.is_empty());
         for (mode, expected) in [
             ("fetch-denied", "permission"),
-            ("image-denied", "permission"),
             ("wrong-kind", "wrong result kind"),
             ("error", "intentional extension error"),
             ("large-output", "output"),

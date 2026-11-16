@@ -1,4 +1,5 @@
 mod creators;
+pub(crate) mod image_access;
 mod torrents;
 
 use std::collections::{HashMap, HashSet};
@@ -906,6 +907,7 @@ impl Database {
         }
 
         torrents::initialize(&mut connection)?;
+        image_access::initialize(&connection)?;
         let _ = connection.execute_batch("PRAGMA optimize;");
 
         initialized.insert(identity);

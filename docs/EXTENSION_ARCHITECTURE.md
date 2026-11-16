@@ -4,6 +4,8 @@ Status: implemented API 1.0. This document describes the public extension host,
 the typed WASM interface, the process protocol, and their test coverage.
 For current package installation, versioning, signatures, updates and persistence,
 see [Extension manager](EXTENSION_MANAGER.md).
+See [Image host permissions](IMAGE_HOST_PERMISSIONS.md) for the image retry
+flow, library schema, and optional settings envelope field.
 
 ## Goals and runtime selection
 

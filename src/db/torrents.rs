@@ -900,7 +900,8 @@ impl Database {
                (SELECT a.value FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
                WHERE pa.page_id=sp.id AND a.kind='content_title' AND trim(a.value)<>'' ORDER BY a.id LIMIT 1),sp.title),
              (SELECT COUNT(*) FROM page_images pi WHERE pi.page_id=sp.id),
-             (SELECT COUNT(*) FROM page_attachments f WHERE f.page_id=sp.id)
+             (SELECT COUNT(*) FROM page_attachments f WHERE f.page_id=sp.id),
+             sp.page_url
              FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE sp.id IN ({placeholders})
              ORDER BY sp.scraped_at DESC,sp.id DESC"))?;
         let cards = statement
@@ -912,6 +913,7 @@ impl Database {
                     content_title: r.get(3)?,
                     image_count: r.get(4)?,
                     attachment_count: r.get(5)?,
+                    page_url: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1101,6 +1103,31 @@ impl Database {
             .query_map(params_from_iter(&values), |r| r.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((ids, total))
+    }
+
+    pub(crate) fn update_torrent_primary_image(
+        &self,
+        page_id: i64,
+        revision: i64,
+        image_id: Option<i64>,
+    ) -> AppResult<()> {
+        let connection = self.writer_connection()?;
+        let updated = connection.execute(
+            "UPDATE torrent_cards SET primary_image_id = ?3, revision = revision + 1
+             WHERE page_id = ?1 AND revision = ?2
+             AND NOT EXISTS (SELECT 1 FROM torrent_moves WHERE page_id = ?1)
+             AND (?3 IS NULL OR EXISTS (
+                 SELECT 1 FROM page_images WHERE page_id = ?1 AND image_id = ?3
+             ))",
+            params![page_id, revision, image_id],
+        )?;
+        if updated != 1 {
+            return Err(
+                "The card or its images changed. Reopen the card before choosing its main image."
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn torrent_directory(&self, page_id: i64) -> AppResult<Option<PathBuf>> {

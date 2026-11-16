@@ -114,6 +114,23 @@ impl TorrentLibrary {
         Ok(display_root.join(folder.strip_prefix(&root)?))
     }
 
+    pub(crate) fn set_primary_image(
+        &self,
+        card: &TorrentCard,
+        image_id: Option<i64>,
+    ) -> AppResult<TorrentCard> {
+        let lock = self.database.content_lock(&card.page_url);
+        let busy = "This card is being updated. Try again when the operation finishes.";
+        let _guard = lock.try_lock().map_err(|_| busy)?;
+        let _lease = self
+            .database
+            .try_content_lease(&card.page_url)?
+            .ok_or(busy)?;
+        self.database
+            .update_torrent_primary_image(card.page_id, card.revision, image_id)?;
+        self.database.torrent_card(card.page_id)
+    }
+
     pub fn prepare(
         &self,
         page_id: i64,

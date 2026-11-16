@@ -757,6 +757,21 @@ impl UrlQueueService {
         )? == 1)
     }
 
+    pub(crate) fn remove_failed_downloads(&self, urls: &[String]) -> rusqlite::Result<usize> {
+        let mut connection = self.store.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        let mut removed = 0;
+        {
+            let mut delete = transaction
+                .prepare("DELETE FROM queue_items WHERE url = ?1 AND state = 'failed'")?;
+            for url in urls {
+                removed += delete.execute([url])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+
     pub(crate) fn enqueue_image_repair(&self, url: &str) -> AppResult<bool> {
         // A saved page has a canonical URL. Preserve it when queuing a repair.
         if !self.registry().supports_url(url) {
@@ -1667,6 +1682,43 @@ mod tests {
             download_failure_kind(&StorageUnavailable),
             QueueFailureKind::Storage
         );
+    }
+
+    #[test]
+    fn failed_download_removal_persists_and_leaves_pending_and_active_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("queue.sqlite3");
+        let open = || UrlQueueService::with_registry_and_queue_path(ScraperRegistry::new(), &path);
+        let active = "https://example.test/active";
+        let pending = "https://example.test/pending";
+        let removed = "https://example.test/discard";
+        let kept = "https://example.test/keep";
+        let service = open();
+        service.mark_failed(active, "HTTP 404");
+        assert!(service.retry_failure(active).unwrap());
+        assert_eq!(
+            service.take_next_job(),
+            Some((active.into(), QueueJob::Full))
+        );
+        service.mark_failed(pending, "HTTP 429");
+        assert!(service.retry_failure(pending).unwrap());
+        service.mark_failed(removed, "HTTP 404");
+        service.mark_failed(kept, "HTTP 429");
+        let selection = [active, removed, removed, pending].map(str::to_owned);
+        assert_eq!(service.remove_failed_downloads(&selection).unwrap(), 1);
+        assert_eq!(service.remove_failed_downloads(&selection).unwrap(), 0);
+        let snapshot = service.snapshot_for_ui(0..1, Some((None, 0)));
+        assert_eq!(snapshot.pending, [pending]);
+        assert_eq!(snapshot.in_progress[0].0, active);
+        assert_eq!(snapshot.failed_preview[0].url, kept);
+        drop(service);
+
+        let restored = open();
+        let snapshot = restored.snapshot_for_ui(0..2, Some((None, 0)));
+        assert_eq!(snapshot.failed_total, 1);
+        assert_eq!(snapshot.failed_preview[0].url, kept);
+        assert_eq!(snapshot.pending, [active, pending]);
+        assert!(!restored.retry_failure(removed).unwrap());
     }
 
     #[test]

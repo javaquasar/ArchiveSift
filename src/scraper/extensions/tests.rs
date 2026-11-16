@@ -333,6 +333,8 @@ fn normalized_results_keep_storage_identity_in_the_host_and_reject_unsafe_urls()
             content.clone(),
             "https://example.test/content/one",
             "html".into(),
+            &[],
+            vec![],
         )
         .unwrap();
     assert_eq!(normalized.site_key, "example");
@@ -351,12 +353,53 @@ fn normalized_results_keep_storage_identity_in_the_host_and_reject_unsafe_urls()
     let mut invalid = content.clone();
     invalid.images[0].url = "file:///secret".into();
     assert!(extension
-        .convert_content(invalid, "https://example.test/content/one", String::new())
+        .convert_content(
+            invalid,
+            "https://example.test/content/one",
+            String::new(),
+            &[],
+            vec![]
+        )
         .is_err());
+    let mut external = content.clone();
+    external.images[0].url = "https://cdn.example.test/cover.png?signature=private".into();
+    let blocked = extension
+        .convert_content(
+            external.clone(),
+            "https://example.test/content/one",
+            String::new(),
+            &[],
+            vec![],
+        )
+        .unwrap();
+    assert!(blocked.images.is_empty());
+    assert_eq!(
+        blocked.attributes[1].source_url.as_deref(),
+        Some("https://cdn.example.test/cover.png")
+    );
+    let allowed = extension
+        .convert_content(
+            external,
+            "https://example.test/content/one",
+            String::new(),
+            &["https://cdn.example.test".into()],
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(
+        allowed.images[0].source_url,
+        "https://cdn.example.test/cover.png?signature=private"
+    );
     let mut invalid = content;
     invalid.title.clear();
     assert!(extension
-        .convert_content(invalid, "https://example.test/content/one", String::new())
+        .convert_content(
+            invalid,
+            "https://example.test/content/one",
+            String::new(),
+            &[],
+            vec![]
+        )
         .is_err());
     let invalid = Listing {
         urls: vec![DiscoveredUrl {

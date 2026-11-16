@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod fs;
 pub mod http;
+mod image_access;
 pub mod logging;
 pub mod models;
 pub mod persistence;

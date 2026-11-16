@@ -190,13 +190,18 @@ fn saved_card(
     (db, page_id)
 }
 
-fn click_torrent_download(app: &mut DesktopApp, context: &egui::Context) {
+fn click_torrent_download(app: &mut DesktopApp, context: &egui::Context, from_filter: bool) {
     let size = egui::vec2(1900.0, 1400.0);
     let output = render(app, context, size, vec![]);
     let output = click_label(app, context, &output, "Search");
     click_label(app, context, &output, "Torrents");
     let output = wait_for_label(app, context, size, CARD_TITLE);
-    click_label(app, context, &output, CARD_TITLE);
+    if from_filter {
+        let output = click_label(app, context, &output, "Missing .torrent");
+        click_label(app, context, &output, "Apply filters");
+    } else {
+        click_label(app, context, &output, CARD_TITLE);
+    }
     let output = wait_for_label(app, context, size, "Download .torrent only");
     click_label(app, context, &output, "Download .torrent only");
     assert!(app
@@ -235,14 +240,15 @@ fn assert_retry(app: &DesktopApp, url: &str, kind: QueueFailureKind, message: &s
 }
 
 #[test]
-fn torrent_queue_button_downloads_one_file_through_the_worker() {
+fn missing_torrent_filter_button_downloads_one_file_through_the_worker() {
     let (mut app, root, context) = test_app(true);
     let server = TorrentFixtureServer::start(true);
     let (db, page_id) = saved_card(&mut app, &root, &server);
     let downloads = app.window.config.effective_download_dir();
     std::fs::create_dir(&downloads).unwrap();
 
-    click_torrent_download(&mut app, &context);
+    click_torrent_download(&mut app, &context, true);
+    wait_for_label(&mut app, &context, egui::vec2(1900.0, 1400.0), "1/1 pages");
 
     assert_eq!(app.queue_service.snapshot().failed_total, 0);
     let card = db.torrent_card(page_id).unwrap();
@@ -276,7 +282,7 @@ fn torrent_queue_keeps_a_retry_when_download_storage_is_missing() {
     let server = TorrentFixtureServer::start(true);
     let (db, page_id) = saved_card(&mut app, &root, &server);
 
-    click_torrent_download(&mut app, &context);
+    click_torrent_download(&mut app, &context, false);
 
     assert_retry(
         &app,
@@ -297,7 +303,7 @@ fn torrent_queue_keeps_a_retry_when_source_has_only_a_magnet() {
     let downloads = app.window.config.effective_download_dir();
     std::fs::create_dir(&downloads).unwrap();
 
-    click_torrent_download(&mut app, &context);
+    click_torrent_download(&mut app, &context, false);
 
     assert_retry(
         &app,

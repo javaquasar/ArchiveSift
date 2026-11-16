@@ -8,6 +8,7 @@ mod creator_filter;
 mod download_status;
 mod extensions_manager;
 mod icon;
+mod image_access;
 mod peerlume;
 mod preview_loader;
 mod raw_settings;
@@ -39,7 +40,9 @@ use crate::services::url_queue::{self, QueueJob};
 use crate::services::{
     ContentDownloadService, SearchService, SettingsService, StorageSettings, UrlQueueService,
 };
-use crate::ui::{ConsoleUi, SearchRefresh, UiBackend, UiCommand, UiLog};
+use crate::ui::{
+    ConsoleUi, ImageAccessAction, QueueProgress, SearchRefresh, UiBackend, UiCommand, UiLog,
+};
 use crate::AppResult;
 use background_executor::{shared_async_runtime, spawn_background};
 use coalescing_worker::CoalescingWorker;
@@ -525,6 +528,76 @@ impl DesktopApp {
         }
         self.start_processor_if_needed(self.window.config.clone());
         Ok(())
+    }
+
+    fn load_image_access(&mut self, change: Option<(String, String, ImageAccessAction)>) {
+        let database_path = self.window.config.database_path.clone();
+        let rejected_database = database_path.clone();
+        let queue = self.queue_service.clone();
+        let tx = self.state_tx.clone();
+        let can_retry =
+            self.window.config.has_download_folder() && !self.window.storage_settings_applying();
+        if let Err(error) = spawn_background(move || {
+            let db = Database::new(&database_path);
+            let mut queued = Vec::new();
+            let result = (|| -> AppResult<Option<String>> {
+                db.initialize()?;
+                let registry = queue.registry();
+                let Some((extension_id, origin, action)) = change else {
+                    db.seed_legacy_image_access(&registry)?;
+                    return Ok(None);
+                };
+                match action {
+                    ImageAccessAction::Revoke => {
+                        db.set_image_origin_grant(&extension_id, &origin, false)?;
+                        return Ok(Some("Image host permission revoked.".into()));
+                    }
+                    ImageAccessAction::ApproveAndRetry | ImageAccessAction::Retry if !can_retry => {
+                        return Err("Select a download directory before retrying images.".into());
+                    }
+                    ImageAccessAction::ApproveAndRetry => {
+                        db.set_image_origin_grant(&extension_id, &origin, true)?;
+                    }
+                    ImageAccessAction::Retry => {}
+                }
+                let pages = db.image_origin_cards(&extension_id, &origin)?;
+                let mut unavailable = 0;
+                let mut already_queued = 0;
+                for url in pages {
+                    if registry
+                        .scraper_for_url(&url)
+                        .and_then(|scraper| scraper.extension_id())
+                        != Some(extension_id.as_str())
+                    {
+                        unavailable += 1;
+                        continue;
+                    }
+                    if queue.enqueue_image_repair(&url)? {
+                        queued.push(url);
+                    } else {
+                        already_queued += 1;
+                    }
+                }
+                Ok(Some(format!("Queued {} cards. {already_queued} already queued. {unavailable} require the matching extension.", queued.len())))
+            })();
+            let (result, message) = match result {
+                Ok(message) => (
+                    db.image_access_groups().map_err(|error| error.to_string()),
+                    message,
+                ),
+                Err(error) => (Err(error.to_string()), None),
+            };
+            let _ = tx.send(WorkerState::ImageAccessLoaded {
+                database_path,
+                result,
+                queued,
+                message,
+            });
+        }) {
+            self.window
+                .image_access
+                .finish(&rejected_database, Err(error), None);
+        }
     }
 
     fn find_saved_collection(&mut self, url: String) {
@@ -1175,6 +1248,8 @@ impl DesktopApp {
         let state_tx = self.state_tx.clone();
         let queue_service = Arc::clone(&self.queue_service);
         let log = window.log.clone();
+        window.queue_progress = QueueProgress::default();
+        let progress = window.queue_progress.clone();
         let max_parallel = config.effective_parallel_downloads();
         let live_presets = Arc::clone(&self.live_presets);
 
@@ -1185,6 +1260,7 @@ impl DesktopApp {
                 log,
                 max_parallel,
                 live_presets,
+                progress,
                 &state_tx,
             );
             let worker_state = match result {
@@ -1283,6 +1359,26 @@ impl DesktopApp {
                     repair,
                 } => {
                     self.window.page_download_finished(&url, &message, repair);
+                    self.window.image_access.invalidate();
+                }
+                WorkerState::ImageAccessLoaded {
+                    database_path,
+                    result,
+                    queued,
+                    message,
+                } => {
+                    if self.window.config.database_path == database_path {
+                        let start = !queued.is_empty();
+                        for url in queued {
+                            self.window.download_status.queued(url);
+                        }
+                        self.window
+                            .image_access
+                            .finish(&database_path, result, message);
+                        if start {
+                            self.start_processor_if_needed(self.window.config.clone());
+                        }
+                    }
                 }
                 WorkerState::LibrarySitesLoaded {
                     database_path,
@@ -1871,6 +1967,11 @@ impl DesktopApp {
                         ctx.request_repaint();
                     }
                 }
+                UiCommand::RemoveFailedDownloads { urls } => {
+                    let result = self.queue_service.remove_failed_downloads(&urls);
+                    self.window.failed_downloads_removed(result);
+                    ctx.request_repaint();
+                }
                 UiCommand::RepairPageImages { url } => {
                     if self.window.config.has_download_folder()
                         && !self.window.storage_settings_applying()
@@ -1880,6 +1981,14 @@ impl DesktopApp {
                         }
                         ctx.request_repaint();
                     }
+                }
+                UiCommand::LoadImageAccess => self.load_image_access(None),
+                UiCommand::ChangeImageAccess {
+                    extension_id,
+                    origin,
+                    action,
+                } => {
+                    self.load_image_access(Some((extension_id, origin, action)));
                 }
                 UiCommand::DownloadTorrentFile { url } => {
                     if self.window.config.has_download_folder()
@@ -1996,8 +2105,9 @@ impl DesktopApp {
             self.refresh_downloaded_images();
         }
 
-        if let Some(delay) =
-            background_poll_delay(self.worker_running, self.queue_service.is_paused())
+        let paused_without_active_work =
+            self.queue_service.is_paused() && self.window.queue_snapshot.in_progress.is_empty();
+        if let Some(delay) = background_poll_delay(self.worker_running, paused_without_active_work)
         {
             ctx.request_repaint_after(delay);
         }
@@ -2078,6 +2188,12 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    ImageAccessLoaded {
+        database_path: String,
+        result: Result<Vec<crate::db::image_access::ImageAccessGroup>, String>,
+        queued: Vec<String>,
+        message: Option<String>,
+    },
     ExtensionVersionSwitched(Result<AppConfig, String>),
     SettingSecretStored {
         target: String,
@@ -2185,6 +2301,7 @@ fn run_queue_processor(
     log: UiLog,
     max_parallel: usize,
     live_presets: Arc<RwLock<LivePresets>>,
+    progress: QueueProgress,
     state_tx: &RepaintingSender<WorkerState>,
 ) -> AppResult<()> {
     let runtime = shared_async_runtime()
@@ -2217,6 +2334,7 @@ fn run_queue_processor(
                         }
                         let base_dir = base_dir.clone();
                         let log = log.clone();
+                        let image_progress = progress.clone();
                         let scraper_registry = queue_service.registry_for_job(&mut config);
                         active.push(Box::pin(async move {
                             let storage = if job != QueueJob::Full {
@@ -2244,7 +2362,7 @@ fn run_queue_processor(
                                 scraper_registry,
                                 Database::new(&config.database_path),
                                 FileDownloadStore::new(),
-                                ConsoleUi::from_log(log),
+                                ConsoleUi::with_queue_progress(log, image_progress),
                                 StructuredDirectoryStrategy,
                                 base_dir,
                                 thumb_dir,
@@ -2273,9 +2391,14 @@ fn run_queue_processor(
             // Wait for any task to complete.
             if let Some((url, job, result)) = active.next().await {
                 let repair = job != QueueJob::Full;
-                if result.is_ok() {
-                    queue_service.mark_finished(&url);
+                match &result {
+                    Ok(_) => queue_service.mark_finished(&url),
+                    Err(error) => {
+                        let kind = crate::services::url_queue::download_failure_kind(error.as_ref());
+                        queue_service.mark_failed_with_kind(&url, &error.to_string(), kind);
+                    }
                 }
+                progress.finish_page(result.is_err());
                 match result {
                     Ok(discovered) if !discovered.is_empty() => {
                         // Listing page — re-enqueue discovered content URLs (and next page).
@@ -2316,8 +2439,6 @@ fn run_queue_processor(
                         });
                     }
                     Err(error) => {
-                        let kind = crate::services::url_queue::download_failure_kind(error.as_ref());
-                        queue_service.mark_failed_with_kind(&url, &error.to_string(), kind);
                         log.push(format!("Download failed [{}]: {}", url, error));
                         let _ = state_tx.send(WorkerState::ContentFinished {
                             url, repair, message: format!("Download incomplete. {error}"),
@@ -3266,6 +3387,49 @@ mod startup_ui_tests {
     }
 
     #[test]
+    fn download_progress_stays_in_the_tab_bar_across_screens() {
+        let (mut app, _root, context) = test_app(false);
+        let progress = app.window.queue_progress.clone();
+        progress.finish_page(false);
+        progress.finish_page(true);
+        let reporter = ConsoleUi::with_queue_progress(UiLog::default(), progress);
+        reporter.begin_image_batch(12);
+        for _ in 0..6 {
+            reporter.finish_image();
+        }
+        for url in [
+            "https://example.test/active",
+            "https://example.test/pending",
+        ] {
+            app.queue_service.mark_failed(url, "Fixture");
+            assert!(app.queue_service.retry_failure(url).unwrap());
+        }
+        assert!(app.queue_service.take_next_job().is_some());
+        app.queue_service.pause();
+
+        let size = egui::vec2(800.0 / 1.5, 600.0 / 1.5);
+        app.window.config.appearance.zoom_percent = 150;
+        let _ = render(&mut app, &context, size, Vec::new());
+        let mut output = render(&mut app, &context, size, Vec::new());
+        for tab in ["Search", "SQL", "Extensions", "Settings", "Scrape"] {
+            output = click_label_at_size(&mut app, &context, &output, tab, size);
+            let text = rendered_text(&output);
+            for label in [
+                "2/4 pages",
+                "6/12 images",
+                "Queue paused",
+                "1 failed this run",
+            ] {
+                let bounds = text.iter().find(|(text, _)| text == label).unwrap().1;
+                assert!(
+                    bounds.right() <= size.x && bounds.bottom() < 75.0,
+                    "{label}: {bounds:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fresh_start_exposes_workspace_settings_queue_and_activity_log() {
         let (mut app, _root, context) = test_app(false);
         app.window.log.push("Download progress is visible here");
@@ -3303,8 +3467,198 @@ mod startup_ui_tests {
             assert!(!app.worker_running);
             assert!(!app.queue_service.has_pending_work());
             let output = click_label_at_size(&mut app, &context, &output, "Activity", size);
-            assert_labels(&output, &["Download progress is visible here"]);
+            assert_labels(
+                &output,
+                &[
+                    "Download progress is visible here",
+                    "Image host permissions",
+                ],
+            );
             let _ = click_label_at_size(&mut app, &context, &output, "Operations", size);
+        }
+    }
+
+    #[test]
+    fn activity_approves_a_host_and_repairs_only_its_affected_cards() {
+        use crate::image_access::ImageAccessIssue;
+        use crate::models::{ScrapedImage, ScrapedItem};
+        use crate::scraper::{ContentScraper, ScraperRegistry};
+        use std::io::{Read, Write};
+
+        const HOST: &str = "https://cdn.example.test";
+        const EXTENSION: &str = "demo.activity-fixture";
+        struct Fixture {
+            local_origin: Vec<String>,
+        }
+        impl ContentScraper for Fixture {
+            fn extension_id(&self) -> Option<&str> {
+                Some(EXTENSION)
+            }
+            fn site_key(&self) -> &str {
+                "demo-site"
+            }
+            fn asset_origins(&self) -> Option<&[String]> {
+                Some(&self.local_origin)
+            }
+            fn supports_url(&self, url: &str) -> bool {
+                url.starts_with("https://demo.example.test/gallery/")
+            }
+            fn scrape_content<'a>(
+                &'a self,
+                url: &'a str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = AppResult<ScrapedItem>> + Send + 'a>,
+            > {
+                self.scrape_content_with_image_origins(url, None, &[])
+            }
+            fn scrape_content_with_image_origins<'a>(
+                &'a self,
+                url: &'a str,
+                _: Option<&'a serde_json::Value>,
+                grants: &'a [String],
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = AppResult<ScrapedItem>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    if !grants.iter().any(|grant| grant == HOST) {
+                        return Err("image permission was not delivered to extension".into());
+                    }
+                    let id = url.rsplit('/').next().unwrap();
+                    Ok(ScrapedItem {
+                        site_key: self.site_key().into(),
+                        page_url: url.into(),
+                        title: "Changed source title".into(),
+                        raw_html: String::new(),
+                        attributes: vec![],
+                        images: vec![ScrapedImage {
+                            source_url: format!("{}/{id}.png", self.local_origin[0]),
+                            preview_url: None,
+                            alt_text: None,
+                            width: None,
+                            height: None,
+                            sort_order: 0,
+                            local_file_path: None,
+                        }],
+                    })
+                })
+            }
+        }
+        let (mut app, temp, context) = test_app(true);
+        app.window.config.request_delay_min_ms = 0;
+        app.window.config.request_delay_max_ms = 0;
+        let download_dir = app.window.config.effective_download_dir();
+        std::fs::create_dir_all(&download_dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let server = std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).unwrap();
+                paths.push(
+                    String::from_utf8_lossy(&request[..read])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_owned(),
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len()).unwrap();
+                stream.write_all(&png).unwrap();
+            }
+            paths
+        });
+        let mut registry = ScraperRegistry::new();
+        registry.register(Box::new(Fixture {
+            local_origin: vec![origin],
+        }));
+        app.queue_service = Arc::new(UrlQueueService::with_registry_and_queue_path(
+            registry,
+            temp.path().join("permission-queue.db"),
+        ));
+        app.queue_service.pause();
+        let db = Database::new(&app.window.config.database_path);
+        db.initialize().unwrap();
+        let mut pages = Vec::new();
+        for (name, host) in [
+            ("one", HOST),
+            ("two", HOST),
+            ("other", "https://other.example.test"),
+        ] {
+            let page = db
+                .upsert_scraped_item(&ScrapedItem {
+                    site_key: "demo-site".into(),
+                    page_url: format!("https://demo.example.test/gallery/{name}"),
+                    title: format!("Saved card {name}"),
+                    raw_html: String::new(),
+                    attributes: vec![],
+                    images: vec![],
+                })
+                .unwrap();
+            let issue = ImageAccessIssue::for_reference(
+                &format!("{host}/{name}.png?signature=fixture"),
+                "discovered",
+            )
+            .unwrap();
+            db.update_image_access_issues(page.page_id, EXTENSION, &[issue], false)
+                .unwrap();
+            pages.push(page.page_id);
+        }
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let _ = click_label(&mut app, &context, &output, "Activity");
+        let group = format!("{HOST} · Needs permission · 2 cards");
+        let output = wait_for_label(&mut app, &context, size, &group);
+        let _ = click_label(&mut app, &context, &output, &group);
+        let output = wait_for_label(&mut app, &context, size, "Saved card one");
+        assert_labels(
+            &output,
+            &["Saved card two", "Open card", "Allow host and retry all"],
+        );
+        let _ = click_label(&mut app, &context, &output, "Allow host and retry all");
+        wait_for_label(
+            &mut app,
+            &context,
+            size,
+            &format!("{HOST} · Allowed · 2 cards"),
+        );
+        assert!(app.queue_service.is_paused());
+        assert_eq!(db.image_origin_cards(EXTENSION, HOST).unwrap().len(), 2);
+
+        app.queue_service.resume();
+        app.start_processor_if_needed(app.window.config.clone());
+        wait_for_label(
+            &mut app,
+            &context,
+            size,
+            &format!("{HOST} · Allowed · 0 cards"),
+        );
+        let mut downloaded = server.join().unwrap();
+        downloaded.sort();
+        assert_eq!(downloaded, ["/one.png", "/two.png"]);
+        let groups = db.image_access_groups().unwrap();
+        assert_eq!(
+            groups[1].cards.keys().copied().collect::<Vec<_>>(),
+            [pages[2]]
+        );
+        let read = rusqlite::Connection::open(&app.window.config.database_path).unwrap();
+        for (id, name) in pages.iter().zip(["one", "two"]) {
+            let images = db.page_repair_images(*id).unwrap();
+            assert_eq!(images.len(), 1);
+            assert!(download_dir
+                .join(images[0].1.local_file_path.as_ref().unwrap())
+                .is_file());
+            let title: String = read
+                .query_row("SELECT title FROM source_pages WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(title, format!("Saved card {name}"));
         }
     }
 
@@ -3574,6 +3928,86 @@ mod startup_ui_tests {
         assert_eq!(queue.pending, [url]);
         assert_eq!(queue.failed_total, 1);
         assert!(queue.paused);
+    }
+
+    #[test]
+    fn removing_one_failed_download_keeps_its_saved_card_and_file() {
+        use crate::models::{MetadataAttribute, ScrapedItem};
+        let (mut app, root, context) = test_app(false);
+        let url = "https://example.test/release";
+        let source = "https://example.test/release.torrent";
+        let db = Database::new(&app.window.config.database_path);
+        db.initialize().unwrap();
+        let id = db
+            .upsert_scraped_item(&ScrapedItem {
+                site_key: "fixture".into(),
+                page_url: url.into(),
+                title: "Saved release".into(),
+                raw_html: String::new(),
+                images: vec![],
+                attributes: vec![MetadataAttribute {
+                    kind: "attachment".into(),
+                    label: "release.torrent".into(),
+                    value: String::new(),
+                    source_url: Some(source.into()),
+                    is_female: None,
+                }],
+            })
+            .unwrap()
+            .page_id;
+        let local_file = root.path().join("release.torrent");
+        std::fs::write(&local_file, b"fixture torrent").unwrap();
+        db.save_page_attachment(id, source, "release.torrent", "release.torrent")
+            .unwrap();
+
+        app.queue_service
+            .mark_failed("https://example.test/other", "Other failure");
+        app.queue_service.mark_failed(url, "Remove this failure");
+        app.queue_service.pause();
+
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label(&mut app, &context, &output, "Failed downloads");
+        let output = click_label(&mut app, &context, &output, "Remove from list");
+        assert_labels(&output, &["Removed 1 failed download.", "Other failure"]);
+        let queue = app.queue_service.snapshot_for_ui(0..0, Some((None, 0)));
+        assert_eq!(queue.failed_total, 1);
+        assert_eq!(queue.failed_preview[0].url, "https://example.test/other");
+        assert_eq!(queue.pending_total, 0);
+        assert!(queue.paused);
+        let card = db.torrent_card(id).unwrap();
+        assert_eq!(card.title, "Saved release");
+        assert_eq!(card.attachments[0].filename, "release.torrent");
+        assert_eq!(std::fs::read(local_file).unwrap(), b"fixture torrent");
+    }
+
+    #[test]
+    fn removing_the_shown_failure_page_keeps_other_pages() {
+        let (mut app, _root, context) = test_app(false);
+        for number in 0..12 {
+            app.queue_service
+                .mark_failed(&format!("https://example.test/{number}"), "Failed");
+        }
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label(&mut app, &context, &output, "Failed downloads");
+        let output = click_label(&mut app, &context, &output, "Next errors");
+        let output = click_label(&mut app, &context, &output, "Remove this page (2)");
+        assert_labels(
+            &output,
+            &["Removed 2 failed downloads.", "10 failed downloads"],
+        );
+        let queue = app.queue_service.snapshot_for_ui(0..0, Some((None, 0)));
+        assert_eq!(queue.failed_total, 10);
+        let remaining: Vec<_> = queue
+            .failed_preview
+            .iter()
+            .map(|failure| failure.url.as_str())
+            .collect();
+        assert!(remaining.contains(&"https://example.test/2"));
+        assert!(remaining.contains(&"https://example.test/11"));
+        assert!(!remaining.contains(&"https://example.test/0"));
+        assert!(!remaining.contains(&"https://example.test/1"));
     }
 
     #[test]

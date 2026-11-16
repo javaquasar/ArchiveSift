@@ -17,9 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use archive_sift_scraper_api::{
-    check_json_size, Action, Content, Listing, Operation, Request, API_VERSION,
+    check_json_size, Action, Content, HttpMethod, HttpResponse, Listing, Operation, Request,
+    API_VERSION,
 };
 
+use crate::image_access::{is_granted, ImageAccessIssue, ImagePermissionRequired, VIEWER_HEADER};
 use crate::models::{
     ListingFetchBehavior, ListingPage, ListingPaginationBehavior, ListingUrl, MetadataAttribute,
     PageKind, ScrapedImage, ScrapedItem, ScraperCapabilities,
@@ -108,7 +110,7 @@ impl ExtensionScraper {
     }
 
     async fn run(&self, operation: Operation, url: &str) -> AppResult<Output> {
-        self.run_configured(operation, url, None).await
+        self.run_configured(operation, url, None, &[]).await
     }
 
     async fn run_configured(
@@ -116,6 +118,7 @@ impl ExtensionScraper {
         operation: Operation,
         url: &str,
         values: Option<&serde_json::Value>,
+        image_origins: &[String],
     ) -> AppResult<Output> {
         let values = self.settings.effective(values)?;
         let values = self.settings.guest_settings(&values);
@@ -128,7 +131,7 @@ impl ExtensionScraper {
         }
         tokio::time::timeout(
             Duration::from_millis(self.manifest.limits.timeout_ms),
-            self.run_steps(operation, url, &values),
+            self.run_steps(operation, url, &values, image_origins),
         )
         .await
         .map_err(|_| "extension execution timed out")?
@@ -139,6 +142,7 @@ impl ExtensionScraper {
         operation: Operation,
         url: &str,
         settings: &serde_json::Value,
+        image_origins: &[String],
     ) -> AppResult<Output> {
         let mut process = match &self.backend {
             Backend::Process(process) => {
@@ -151,11 +155,12 @@ impl ExtensionScraper {
             operation: operation.clone(),
             url: url.to_string(),
             response: None,
-            state: self.configured_state(settings, None)?,
+            state: self.configured_state(settings, None, image_origins)?,
         };
         let mut raw_html = String::new();
         let mut total_response_bytes = 0;
         let mut fetched_first_response = false;
+        let mut image_issues = Vec::new();
         for _ in 0..self.manifest.limits.max_steps {
             let action = match &self.backend {
                 Backend::Wasm(wasm) => wasm.execute(input).await?,
@@ -164,7 +169,7 @@ impl ExtensionScraper {
             check_json_size(&action, self.manifest.limits.max_output_bytes)
                 .map_err(|_| "extension result exceeds its output limit")?;
             match action {
-                Action::Fetch(request) => {
+                Action::Fetch(mut request) => {
                     if request
                         .state
                         .as_ref()
@@ -172,7 +177,47 @@ impl ExtensionScraper {
                     {
                         return Err("extension continuation state exceeds its limit".into());
                     }
-                    let response = self.broker.fetch(&request).await?;
+                    let mut viewer = false;
+                    request.headers.retain(|h| {
+                        let marker = h.name.eq_ignore_ascii_case(VIEWER_HEADER);
+                        viewer |= marker && h.value == "1";
+                        !marker
+                    });
+                    let response = if viewer
+                        && operation == Operation::Content
+                        && fetched_first_response
+                        && request.method == HttpMethod::Get
+                        && request.body.is_none()
+                        && self.manifest.allowed_url(&request.url).is_err()
+                    {
+                        let target = reqwest::Url::parse(&request.url)?;
+                        let result = if is_granted(&target, image_origins) {
+                            self.broker
+                                .fetch_public_viewer(&request.url, image_origins)
+                                .await
+                        } else {
+                            Err("Image viewer origin has no grant".into())
+                        };
+                        match result {
+                            Ok(response) => response,
+                            Err(error) => {
+                                let issue = error
+                                    .downcast_ref::<ImagePermissionRequired>()
+                                    .map(|e| e.0.clone())
+                                    .or_else(|| ImageAccessIssue::for_url(target, "viewer"))
+                                    .ok_or(error)?;
+                                image_issues.push(issue);
+                                HttpResponse {
+                                    url: request.url.clone(),
+                                    status: 403,
+                                    content_type: None,
+                                    body: String::new(),
+                                }
+                            }
+                        }
+                    } else {
+                        self.broker.fetch(&request).await?
+                    };
                     total_response_bytes += response.body.len();
                     if total_response_bytes > 8 * 1024 * 1024 {
                         return Err("extension exceeded total HTTP response budget".into());
@@ -186,12 +231,12 @@ impl ExtensionScraper {
                         operation: operation.clone(),
                         url: url.to_string(),
                         response: Some(response),
-                        state: self.configured_state(settings, request.state)?,
+                        state: self.configured_state(settings, request.state, image_origins)?,
                     };
                 }
                 Action::Content(content) if operation == Operation::Content => {
                     return self
-                        .convert_content(content, url, raw_html)
+                        .convert_content(content, url, raw_html, image_origins, image_issues)
                         .map(Output::Content)
                 }
                 Action::Listing(listing) if operation == Operation::Listing => {
@@ -207,10 +252,15 @@ impl ExtensionScraper {
         &self,
         settings: &serde_json::Value,
         state: Option<String>,
+        image_origins: &[String],
     ) -> AppResult<Option<String>> {
         if self.settings.schema.value()["x-archivesift-delivery"] == "state-v1" {
             Ok(Some(
-                archive_sift_scraper_api::settings_schema::settings_state(settings, state)?,
+                archive_sift_scraper_api::settings_schema::settings_state_with_image_origins(
+                    settings,
+                    state,
+                    image_origins,
+                )?,
             ))
         } else {
             Ok(state)
@@ -228,6 +278,8 @@ impl ExtensionScraper {
         content: Content,
         url: &str,
         raw_html: String,
+        image_origins: &[String],
+        mut image_issues: Vec<ImageAccessIssue>,
     ) -> AppResult<ScrapedItem> {
         if content.title.trim().is_empty()
             || content.title.len() > 4096
@@ -236,26 +288,35 @@ impl ExtensionScraper {
         {
             return Err("extension returned invalid title or too many images/attributes".into());
         }
-        let images = content
-            .images
-            .into_iter()
-            .enumerate()
-            .map(|(index, image)| {
-                Ok(ScrapedImage {
-                    source_url: self.resolve_url(url, &image.url)?,
-                    preview_url: image
-                        .preview_url
-                        .map(|value| self.resolve_url(url, &value))
-                        .transpose()?,
-                    alt_text: image.alt_text,
-                    width: image.width.map(i64::from),
-                    height: image.height.map(i64::from),
-                    sort_order: index as i64,
-                    local_file_path: None,
-                })
-            })
-            .collect::<AppResult<Vec<_>>>()?;
-        let attributes = content
+        let base = reqwest::Url::parse(url)?;
+        let permitted = |target: &reqwest::Url| {
+            self.manifest.allowed_url(target.as_str()).is_ok() || is_granted(target, image_origins)
+        };
+        let mut images = Vec::new();
+        for (index, image) in content.images.into_iter().enumerate() {
+            let target = base.join(&image.url)?;
+            if !permitted(&target) {
+                image_issues.push(
+                    ImageAccessIssue::for_url(target, "discovered")
+                        .ok_or("extension returned an invalid image URL")?,
+                );
+                continue;
+            }
+            images.push(ScrapedImage {
+                source_url: target.into(),
+                preview_url: image
+                    .preview_url
+                    .and_then(|value| base.join(&value).ok())
+                    .filter(permitted)
+                    .map(Into::into),
+                alt_text: image.alt_text,
+                width: image.width.map(i64::from),
+                height: image.height.map(i64::from),
+                sort_order: index as i64,
+                local_file_path: None,
+            });
+        }
+        let mut attributes = content
             .attributes
             .into_iter()
             .map(|attribute| {
@@ -289,6 +350,11 @@ impl ExtensionScraper {
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
+        attributes.extend(
+            image_issues
+                .into_iter()
+                .map(ImageAccessIssue::into_metadata),
+        );
         Ok(ScrapedItem {
             site_key: self.manifest.source_key.clone(),
             page_url: url.to_string(),
@@ -363,9 +429,18 @@ impl ContentScraper for ExtensionScraper {
         url: &'a str,
         settings: Option<&'a serde_json::Value>,
     ) -> Pin<Box<dyn Future<Output = AppResult<ScrapedItem>> + Send + 'a>> {
+        self.scrape_content_with_image_origins(url, settings, &[])
+    }
+
+    fn scrape_content_with_image_origins<'a>(
+        &'a self,
+        url: &'a str,
+        settings: Option<&'a serde_json::Value>,
+        image_origins: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = AppResult<ScrapedItem>> + Send + 'a>> {
         Box::pin(async move {
             match self
-                .run_configured(Operation::Content, url, settings)
+                .run_configured(Operation::Content, url, settings, image_origins)
                 .await?
             {
                 Output::Content(content) => Ok(content),
@@ -380,7 +455,7 @@ impl ContentScraper for ExtensionScraper {
     ) -> Pin<Box<dyn Future<Output = AppResult<ListingPage>> + Send + 'a>> {
         Box::pin(async move {
             match self
-                .run_configured(Operation::Listing, url, settings)
+                .run_configured(Operation::Listing, url, settings, &[])
                 .await?
             {
                 Output::Listing(listing) => Ok(listing),

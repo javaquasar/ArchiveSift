@@ -9,6 +9,7 @@ use crate::db::{Database, FileDownloadStore, ImageArtifactUpdate};
 use crate::error::ScraperError;
 use crate::fs::{DirectoryStrategy, StructuredDirectoryStrategy};
 use crate::http::{fetch_response, OriginRestrictedClient};
+use crate::image_access::{ImageAccessIssue, ImagePermissionRequired, ISSUE_KIND};
 use crate::models::{DownloadRequest, PageKind, ScrapedImage, ScrapedItem, ScraperDiagnosticLevel};
 use crate::scraper::ScraperRegistry;
 use crate::services::ThumbnailService;
@@ -226,11 +227,18 @@ impl
         source_url: &str,
         images_only: bool,
     ) -> AppResult<Vec<String>> {
-        let settings = scraper
-            .extension_id()
-            .and_then(|id| config.extension_settings.get(id));
+        let extension_id = scraper.extension_id();
+        let settings = extension_id.and_then(|id| config.extension_settings.get(id));
+        if extension_id.is_some() {
+            self.database
+                .seed_legacy_image_access(&self.scraper_registry)?;
+        }
+        let grants = extension_id
+            .map(|id| self.database.image_origin_grants(id))
+            .transpose()?
+            .unwrap_or_default();
         let mut page = scraper
-            .scrape_content_configured(source_url, settings)
+            .scrape_content_with_image_origins(source_url, settings, &grants)
             .await?;
         if images_only && page.page_url != source_url {
             if crate::db::collection_url_alternate(source_url).as_deref() != Some(&page.page_url) {
@@ -241,6 +249,7 @@ impl
             page.page_url = source_url.to_owned();
         }
         let _lease = self.lock_page(&page.page_url).await?;
+        let mut permission_issues = take_image_access_issues(&mut page);
         let image_sections = take_image_sections(&mut page);
         self.log_content_discovery(&page);
 
@@ -249,6 +258,14 @@ impl
         } else {
             self.database.upsert_scraped_item(&page)?
         };
+        if let Some(id) = extension_id.filter(|_| !permission_issues.is_empty()) {
+            self.database.update_image_access_issues(
+                persisted.page_id,
+                id,
+                &permission_issues,
+                false,
+            )?;
+        }
         // The diagnostic HTML has been archived transactionally. Release the
         // potentially large allocation before image downloads start.
         page.raw_html = String::new();
@@ -304,14 +321,30 @@ impl
             &sections_by_id,
             images_only,
         )?;
+        let restricted_client = scraper
+            .asset_origins()
+            .map(|origins| OriginRestrictedClient::with_grants(origins, &grants))
+            .transpose()?;
         let image_result = self
             .execute_downloads(
                 requests,
                 config.effective_concurrent_image_downloads(),
-                scraper.asset_origins(),
+                restricted_client.as_ref(),
                 images_only,
+                &mut permission_issues,
             )
             .await;
+        if let Some(id) = extension_id {
+            let replace = image_result.is_ok() && !page.images.is_empty();
+            if replace || !permission_issues.is_empty() {
+                self.database.update_image_access_issues(
+                    persisted.page_id,
+                    id,
+                    &permission_issues,
+                    replace,
+                )?;
+            }
+        }
 
         if images_only {
             return image_result.map(|()| Vec::new());
@@ -480,12 +513,17 @@ impl
         &self,
         requests: Vec<DownloadRequest>,
         max_concurrent_downloads: usize,
-        asset_origins: Option<&[String]>,
+        restricted_client: Option<&OriginRestrictedClient>,
         repair: bool,
+        permission_issues: &mut Vec<ImageAccessIssue>,
     ) -> AppResult<()> {
-        let restricted_client = asset_origins.map(OriginRestrictedClient::new).transpose()?;
+        self.ui.begin_image_batch(requests.len());
         let results = stream::iter(requests)
-            .map(|request| self.download_one(request, restricted_client.as_ref(), repair))
+            .map(|request| async move {
+                let result = self.download_one(request, restricted_client, repair).await;
+                self.ui.finish_image();
+                result
+            })
             .buffer_unordered(max_concurrent_downloads.max(1))
             .collect::<Vec<_>>()
             .await;
@@ -497,6 +535,10 @@ impl
             match result {
                 Ok(artifact) => artifacts.push(artifact),
                 Err(error) => {
+                    if let Some(permission) = error.downcast_ref::<ImagePermissionRequired>() {
+                        permission_issues.push(permission.0.clone());
+                        continue;
+                    }
                     failed += 1;
                     self.ui.print_download_failed(error.as_ref());
                     if cause.is_none() {
@@ -651,6 +693,20 @@ impl
             thumbnail_path,
         }
     }
+}
+
+fn take_image_access_issues(page: &mut ScrapedItem) -> Vec<ImageAccessIssue> {
+    let mut issues = Vec::new();
+    page.attributes.retain(|attribute| {
+        if let Some(issue) = ImageAccessIssue::from_metadata(attribute) {
+            issues.push(issue);
+            return false;
+        }
+        attribute.kind != ISSUE_KIND
+    });
+    issues.sort_unstable();
+    issues.dedup();
+    issues
 }
 
 fn take_image_sections(page: &mut ScrapedItem) -> HashMap<String, String> {
@@ -1833,19 +1889,23 @@ mod tests {
         }
         drop(connection);
 
+        let progress = crate::ui::QueueProgress::default();
         let service = ContentDownloadService::new(
             ScraperRegistry::with_public_scrapers(),
             database,
             FileDownloadStore::new(),
-            ConsoleUi::new(),
+            ConsoleUi::with_queue_progress(crate::ui::UiLog::default(), progress.clone()),
             StructuredDirectoryStrategy,
             base_dir,
             thumb_dir,
         );
         service
-            .execute_downloads(requests, 2, None, false)
+            .execute_downloads(requests, 2, None, false, &mut Vec::new())
             .await
             .expect("finalize existing files");
+        let progress = progress.snapshot();
+        assert_eq!(progress.images_total, 2);
+        assert_eq!(progress.images_processed, 2);
 
         let connection = rusqlite::Connection::open(&database_path).expect("reopen database");
         let finalized: i64 = connection

@@ -128,6 +128,24 @@ impl HttpBroker {
 
     pub async fn fetch(&self, request: &FetchRequest) -> AppResult<HttpResponse> {
         let limited = self.response(request).await?;
+        self.read_response(limited).await
+    }
+
+    pub async fn fetch_public_viewer(
+        &self,
+        url: &str,
+        grants: &[String],
+    ) -> AppResult<HttpResponse> {
+        let limited = crate::http::OriginRestrictedClient::with_grants(&[], grants)?
+            .fetch(url)
+            .await?;
+        self.read_response(limited).await
+    }
+
+    async fn read_response(
+        &self,
+        limited: crate::http::LimitedHttpResponse,
+    ) -> AppResult<HttpResponse> {
         let (response, _permit) = limited.into_parts();
         let url = response.url().to_string();
         if response

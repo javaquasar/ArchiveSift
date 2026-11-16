@@ -138,6 +138,7 @@ enum Outcome {
     Selected(TorrentCard),
     Planned(TorrentMovePlan),
     Saved(TorrentCard),
+    PrimaryImageSaved(TorrentCard),
 }
 enum Message {
     Progress(MoveProgress),
@@ -178,7 +179,7 @@ pub(super) struct TorrentLibraryUi {
     pub(super) startup_error: Option<String>,
     loader: Option<PreviewLoader>,
     textures: SizedLruCache<String, egui::TextureHandle>,
-    image_popup: Option<TorrentImage>,
+    viewer_request: Option<i64>,
 }
 
 impl Default for TorrentLibraryUi {
@@ -220,7 +221,7 @@ impl Default for TorrentLibraryUi {
             startup_error: None,
             loader: None,
             textures: SizedLruCache::new(96, 48 * 1024 * 1024),
-            image_popup: None,
+            viewer_request: None,
         }
     }
 }
@@ -235,6 +236,62 @@ impl TorrentLibraryUi {
 
     pub(super) fn take_description(&mut self) -> Option<(String, String)> {
         self.description.take()
+    }
+
+    pub(super) fn take_viewer_request(&mut self) -> Option<(i64, i64)> {
+        let image_id = self.viewer_request.take()?;
+        Some((self.selected.as_ref()?.page_id, image_id))
+    }
+
+    pub(super) fn viewer_card(&self, page_id: i64) -> Option<Arc<TorrentCard>> {
+        self.selected
+            .as_ref()
+            .filter(|card| card.page_id == page_id)
+            .cloned()
+    }
+
+    pub(super) fn viewer_primary_image(&self, card: &TorrentCard) -> Option<i64> {
+        if self.editing {
+            self.edit.primary_image_id
+        } else {
+            card.primary_image_id
+        }
+    }
+
+    pub(super) fn can_change_primary_image(&self) -> bool {
+        !self.busy && self.plan.is_none()
+    }
+
+    pub(super) fn viewer_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(super) fn set_viewer_primary_image(
+        &mut self,
+        ctx: &egui::Context,
+        config: &AppConfig,
+        card: Arc<TorrentCard>,
+        image_id: Option<i64>,
+    ) {
+        if !self.can_change_primary_image() {
+            return;
+        }
+        if self.editing {
+            self.edit.primary_image_id = image_id;
+            return;
+        }
+
+        let library = TorrentLibrary::new(
+            Database::new(&config.database_path),
+            config.effective_download_dir(),
+        );
+        self.status = Some("Saving main image…".into());
+        self.job(ctx, move |_, _| {
+            library
+                .set_primary_image(&card, image_id)
+                .map(Outcome::PrimaryImageSaved)
+                .map_err(|error| error.to_string())
+        });
     }
 
     pub(super) fn can_open_card(&self) -> bool {
@@ -373,6 +430,12 @@ impl TorrentLibraryUi {
                                 loader.advance_generation();
                             }
                         }
+                        Ok(Outcome::PrimaryImageSaved(card)) => {
+                            self.edit.primary_image_id = card.primary_image_id;
+                            self.cover_count = leading_covers(&card);
+                            self.selected = Some(Arc::new(card));
+                            self.status = Some("Main image saved.".into());
+                        }
                     }
                     self.recovering = false;
                 }
@@ -403,7 +466,7 @@ impl TorrentLibraryUi {
         self.inputs = Default::default();
         self.organize = false;
         self.plan = None;
-        self.image_popup = None;
+        self.viewer_request = None;
     }
 
     fn draft_edit(&self, card: &TorrentCard) -> TorrentEdit {
@@ -572,7 +635,7 @@ impl TorrentLibraryUi {
         let selected = self.details_open && self.selected.is_some();
         if selected && ui.available_width() >= 820.0 {
             ui.columns(2, |columns| {
-                self.render_cards(&mut columns[0], config, height);
+                self.render_cards(&mut columns[0], config, height, downloads);
                 self.render_details(&mut columns[1], config, height, downloads);
             });
         } else if selected {
@@ -582,19 +645,25 @@ impl TorrentLibraryUi {
             }
             self.render_details(ui, config, ui.available_height(), downloads);
         } else {
-            self.render_cards(ui, config, height);
+            self.render_cards(ui, config, height, downloads);
         }
         self.confirm(ui.ctx(), config);
-        self.preview_window(ui.ctx(), config);
     }
 
-    fn render_cards(&mut self, ui: &mut egui::Ui, config: &AppConfig, height: f32) {
+    fn render_cards(
+        &mut self,
+        ui: &mut egui::Ui,
+        config: &AppConfig,
+        height: f32,
+        downloads: &DownloadStatus,
+    ) {
         egui::ScrollArea::vertical()
             .id_salt("torrent_cards")
             .max_height(height)
             .show(ui, |ui| {
                 let mut choose = None;
                 let mut open_folder = None;
+                let can_act = !self.busy && !self.editing && self.plan.is_none();
                 for card in &self.page.cards {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         let mut checked = self.checked_cards.contains(&card.page_id);
@@ -647,7 +716,26 @@ impl TorrentLibraryUi {
                             ) {
                                 open_folder = Some(card.page_id);
                             }
+                            if self.applied.missing_torrent
+                                && torrent_file_button(
+                                    ui,
+                                    config,
+                                    can_act,
+                                    downloads,
+                                    &card.page_url,
+                                )
+                            {
+                                self.pending_command =
+                                    Some(crate::ui::UiCommand::DownloadTorrentFile {
+                                        url: card.page_url.clone(),
+                                    });
+                            }
                         });
+                        if self.applied.missing_torrent {
+                            if let Some(message) = downloads.result_for(&card.page_url) {
+                                ui.weak(message);
+                            }
+                        }
                     });
                 }
                 if let Some(id) = open_folder {
@@ -939,6 +1027,11 @@ impl TorrentLibraryUi {
             if folder_button(ui, config, !self.busy) {
                 self.locate_folder(ui.ctx(), config, card.page_id);
             }
+            if torrent_file_button(ui, config, !self.busy, downloads, &card.page_url) {
+                self.pending_command = Some(crate::ui::UiCommand::DownloadTorrentFile {
+                    url: card.page_url.clone(),
+                });
+            }
             if ui
                 .add_enabled(
                     !self.busy && config.peerlume.enabled,
@@ -963,17 +1056,6 @@ impl TorrentLibraryUi {
         });
         if downloads.render(ui, config, card.page_id, &card.page_url) {
             self.pending_command = Some(crate::ui::UiCommand::RepairPageImages {
-                url: card.page_url.clone(),
-            });
-        }
-        if ui
-            .add_enabled(
-                !self.busy && config.has_download_folder() && !downloads.is_pending(&card.page_url),
-                egui::Button::new("Download .torrent only"),
-            )
-            .clicked()
-        {
-            self.pending_command = Some(crate::ui::UiCommand::DownloadTorrentFile {
                 url: card.page_url.clone(),
             });
         }
@@ -1599,7 +1681,7 @@ impl TorrentLibraryUi {
                 )
                 .clicked()
             {
-                self.image_popup = Some(image.clone());
+                self.viewer_request = Some(image.image_id);
             }
         } else {
             let request = self.loader.get_or_insert_with(PreviewLoader::new).request(
@@ -1620,30 +1702,6 @@ impl TorrentLibraryUi {
             } else {
                 "Image preview…"
             });
-        }
-    }
-    fn preview_window(&mut self, ctx: &egui::Context, config: &AppConfig) {
-        let Some(image) = self.image_popup.clone() else {
-            return;
-        };
-        let mut open = true;
-        egui::Window::new("Torrent image")
-            .open(&mut open)
-            .default_size(egui::vec2(800.0, 700.0))
-            .vscroll(true)
-            .hscroll(true)
-            .show(ctx, |ui| {
-                self.preview(
-                    ui,
-                    config,
-                    &image,
-                    egui::Vec2::splat(f32::INFINITY),
-                    ImageLoadMode::Original,
-                );
-                self.primary_image_checkbox(ui, image.image_id);
-            });
-        if !open {
-            self.image_popup = None;
         }
     }
 }
@@ -1698,6 +1756,34 @@ fn folder_button(ui: &mut egui::Ui, config: &AppConfig, enabled: bool) -> bool {
         .add_enabled(enabled && configured, egui::Button::new("Open folder"))
         .on_hover_text("Open the folder containing this release's local files");
     if !configured {
+        response
+            .on_disabled_hover_text("Set the download folder in Settings → Storage.")
+            .clicked()
+    } else {
+        response.clicked()
+    }
+}
+
+fn torrent_file_button(
+    ui: &mut egui::Ui,
+    config: &AppConfig,
+    enabled: bool,
+    downloads: &DownloadStatus,
+    url: &str,
+) -> bool {
+    let pending = downloads.is_pending(url);
+    let label = if pending {
+        "Download queued"
+    } else {
+        "Download .torrent only"
+    };
+    let response = ui
+        .add_enabled(
+            enabled && config.has_download_folder() && !pending,
+            egui::Button::new(label),
+        )
+        .on_hover_text("Save the .torrent file in this card’s folder");
+    if !config.has_download_folder() {
         response
             .on_disabled_hover_text("Set the download folder in Settings → Storage.")
             .clicked()
@@ -1846,20 +1932,22 @@ mod tests {
     #[test]
     fn missing_torrent_filter_and_file_only_action_use_the_saved_card() {
         let (_root, config, db, mut editor, ctx) = fixture();
-        let url = editor.selected.as_ref().unwrap().page_url.clone();
+        let saved = editor.selected.as_ref().unwrap();
+        let id = saved.page_id;
+        let url = saved.page_url.clone();
         click(&mut editor, &config, &ctx, "Missing .torrent");
         click(&mut editor, &config, &ctx, "Apply filters");
         finish(&mut editor);
         assert!(editor.applied.missing_torrent);
         assert_eq!(editor.page.total, 1);
-        click(&mut editor, &config, &ctx, "Full torrent heading [2025]");
-        finish(&mut editor);
+        editor.details_open = false;
         click(&mut editor, &config, &ctx, "Download .torrent only");
+        assert!(!editor.details_open);
         assert!(matches!(
             editor.take_command(),
             Some(crate::ui::UiCommand::DownloadTorrentFile { url: queued }) if queued == url
         ));
-        let card = editor.selected.as_ref().unwrap();
+        let card = db.torrent_card(id).unwrap();
         let path = std::path::Path::new(card.directory.as_ref().unwrap()).join("release.torrent");
         std::fs::write(config.effective_download_dir().join(&path), b"test torrent").unwrap();
         db.save_page_attachment(
@@ -2472,13 +2560,14 @@ mod tests {
             .map(|image| preview_key(image, ImageLoadMode::Original))
             .collect::<Vec<_>>();
         let screenshot_key = preview_key(&card.images[2], ImageLoadMode::Preview);
-        let frame = |editor: &mut TorrentLibraryUi, width| {
+        let frame = |editor: &mut TorrentLibraryUi, width, events| {
             ctx.run(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
                         egui::vec2(width, 1000.0),
                     )),
+                    events,
                     ..Default::default()
                 },
                 |ctx| {
@@ -2491,7 +2580,7 @@ mod tests {
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let output = loop {
-            let output = frame(&mut editor, 1200.0);
+            let output = frame(&mut editor, 1200.0, vec![]);
             if cover_keys
                 .iter()
                 .chain([&screenshot_key])
@@ -2538,7 +2627,28 @@ mod tests {
         assert!(screenshot.top() > left.bottom().max(right.bottom()));
         assert!(screenshot.width() <= 70.0);
 
-        let narrow = frame(&mut editor, 480.0);
+        for pressed in [true, false] {
+            let pos = right.center();
+            frame(
+                &mut editor,
+                1200.0,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(
+            editor.take_viewer_request(),
+            Some((card.page_id, card.images[1].image_id)),
+        );
+
+        let narrow = frame(&mut editor, 480.0, vec![]);
         let [left, right, screenshot] = texture_ids.map(|texture| rect_for(texture, &narrow));
         assert_eq!(left.top(), right.top());
         assert!(left.right() <= right.left() && right.right() < 480.0);

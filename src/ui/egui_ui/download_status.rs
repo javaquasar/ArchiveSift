@@ -54,6 +54,13 @@ impl DownloadStatus {
         self.pending.contains(url)
     }
 
+    pub(super) fn result_for(&self, url: &str) -> Option<&str> {
+        self.results
+            .iter()
+            .find(|(page, _)| page == url)
+            .map(|(_, message)| message.as_str())
+    }
+
     pub(super) fn clear_pending(&mut self, active: &[(String, String)]) {
         self.pending
             .retain(|url| active.iter().any(|(running, _)| running == url));
@@ -166,7 +173,7 @@ impl DownloadStatus {
                 ui.weak("Checking local images…");
             }
         });
-        if let Some((_, message)) = self.results.iter().find(|(page, _)| page == url) {
+        if let Some(message) = self.result_for(url) {
             ui.weak(message);
         }
         repair

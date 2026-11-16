@@ -29,6 +29,15 @@ pub trait ContentScraper: Send + Sync {
         self.scrape_content(url)
     }
 
+    fn scrape_content_with_image_origins<'a>(
+        &'a self,
+        url: &'a str,
+        settings: Option<&'a serde_json::Value>,
+        _image_origins: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = AppResult<ScrapedItem>> + Send + 'a>> {
+        self.scrape_content_configured(url, settings)
+    }
+
     fn scrape_listing_configured<'a>(
         &'a self,
         url: &'a str,
@@ -178,6 +187,13 @@ impl ScraperRegistry {
             .iter()
             .find(|scraper| scraper.supports_url(url))
             .map(|scraper| scraper.as_ref())
+    }
+
+    pub(crate) fn extensions(&self) -> impl Iterator<Item = &dyn ContentScraper> {
+        self.scrapers
+            .iter()
+            .map(|scraper| scraper.as_ref())
+            .filter(|scraper| scraper.extension_id().is_some())
     }
 
     /// Returns `true` if any registered scraper supports `url`.
