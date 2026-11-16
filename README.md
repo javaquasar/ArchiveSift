@@ -11,6 +11,7 @@ without rebuilding the application. See [extension architecture and UML](docs/EX
 - URL queue and clipboard monitoring
 - Concurrent page processing and image downloads
 - SQLite metadata and full text search
+- [Knife catalog profile and legacy archive import preview](docs/knife-profile.md)
 - Filters by source, tag, actor, category, and studio
 - Local thumbnails and an image preview viewer
 - Structured download folders

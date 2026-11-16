@@ -405,6 +405,7 @@ impl
         repair: bool,
     ) -> AppResult<Vec<DownloadRequest>> {
         let directory = self.database.torrent_directory(page_id)?;
+        let knife_paths = self.database.knife_image_paths(page_id)?;
         let existing: HashMap<_, _> = self
             .database
             .get_page_images_with_paths(page_id)?
@@ -470,6 +471,8 @@ impl
                         images.push(section);
                     }
                     request.relative_path = images.join(filename);
+                } else if let Some(path) = knife_paths.get(image_id) {
+                    request.relative_path = path.clone();
                 } else if let Some(directory) = gallery_directory {
                     request.relative_path = directory.join(request.relative_path.file_name()?);
                 }
@@ -930,6 +933,146 @@ mod tests {
             requests[0].image_url,
             "https://cdn.example.test/media/known.jpg"
         );
+    }
+
+    #[tokio::test]
+    async fn knife_profile_downloads_and_repairs_multiple_sources_without_path_collisions() {
+        use std::io::Cursor;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let database = Database::new(root.path().join("archive.sqlite3"));
+        database.initialize().unwrap();
+        let base = root.path().join("downloads");
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn({
+            let png = png.clone();
+            async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    stream.read(&mut [0; 4096]).await.unwrap();
+                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                    stream.write_all(header.as_bytes()).await.unwrap();
+                    stream.write_all(&png).await.unwrap();
+                }
+            }
+        });
+        let product = |path: &str, brand: &str, model: &str| ScrapedItem {
+            site_key: format!("fixture-{path}"),
+            page_url: format!("https://{path}.example.test/products/1"),
+            title: format!("{brand} {model}"),
+            raw_html: String::new(),
+            images: vec![sample_image(&format!("{origin}/{path}.png"))],
+            attributes: [
+                ("catalog_profile", "knife"),
+                ("manufacturer", brand),
+                ("model", model),
+                ("steel", "CPM 3V"),
+            ]
+            .into_iter()
+            .map(|(kind, value)| crate::models::MetadataAttribute {
+                kind: kind.into(),
+                label: kind.into(),
+                value: value.into(),
+                source_url: None,
+                is_female: None,
+            })
+            .collect(),
+        };
+        let first = product("first", "Example Forge", "Ridge");
+        let second = product("second", "example forge", "ridge");
+        let service = |pages: &[ScrapedItem]| {
+            let mut registry = ScraperRegistry::new();
+            for page in pages {
+                registry.register(Box::new(RetryFixtureScraper {
+                    page: page.clone(),
+                    attachment_calls: Arc::default(),
+                    attachment_fails: false,
+                }));
+            }
+            ContentDownloadService::new(
+                registry,
+                database.clone(),
+                FileDownloadStore::new(),
+                ConsoleUi::new(),
+                StructuredDirectoryStrategy,
+                base.clone(),
+                root.path().join("thumbs"),
+            )
+        };
+        let downloader = service(&[first.clone(), second.clone()]);
+        let config = AppConfig::default();
+        for page in [&first, &second] {
+            downloader
+                .run_for_url(&config, &page.page_url)
+                .await
+                .unwrap();
+        }
+        let model_dir = Path::new("knife").join("Example Forge").join("Ridge");
+        let first_file = model_dir.join("Example Forge - Ridge - CPM 3V - 001.png");
+        let second_file = model_dir.join("Example Forge - Ridge - CPM 3V - 001 (1).png");
+        for (page, file) in [(&first, &first_file), (&second, &second_file)] {
+            let (page_id, _, _) = database
+                .saved_page_location(&page.page_url)
+                .unwrap()
+                .unwrap();
+            assert_eq!(std::fs::read(base.join(file)).unwrap(), png);
+            assert_eq!(
+                database
+                    .knife_image_paths(page_id)
+                    .unwrap()
+                    .into_values()
+                    .collect::<Vec<_>>(),
+                [file.clone()]
+            );
+        }
+
+        let mut refreshed = first.clone();
+        refreshed.attributes.clear();
+        refreshed
+            .images
+            .insert(0, sample_image(&format!("{origin}/opaque")));
+        std::fs::remove_file(base.join(&first_file)).unwrap();
+        service(&[refreshed])
+            .repair_page_images(&config, &first.page_url)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(base.join(&first_file)).unwrap(), png);
+        let restored = model_dir.join("Example Forge - Ridge - CPM 3V - 001 (2).png");
+        assert_eq!(std::fs::read(base.join(&restored)).unwrap(), png);
+
+        let connection = rusqlite::Connection::open(root.path().join("archive.sqlite3")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM knife_models", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM knife_sources", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM page_images WHERE local_file_path IS NOT NULL",
+                    [],
+                    |row| row.get::<_, usize>(0)
+                )
+                .unwrap(),
+            3
+        );
+        server.abort();
     }
 
     #[tokio::test]

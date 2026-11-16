@@ -6,6 +6,7 @@ pub mod error;
 pub mod fs;
 pub mod http;
 mod image_access;
+mod knife;
 pub mod logging;
 pub mod models;
 pub mod persistence;

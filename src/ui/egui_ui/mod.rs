@@ -9,6 +9,7 @@ mod download_status;
 mod extensions_manager;
 mod icon;
 mod image_access;
+mod knife_import;
 mod peerlume;
 mod preview_loader;
 mod raw_settings;

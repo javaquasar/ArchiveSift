@@ -1,5 +1,6 @@
 mod creators;
 pub(crate) mod image_access;
+mod knife;
 mod torrents;
 
 use std::collections::{HashMap, HashSet};
@@ -907,6 +908,7 @@ impl Database {
         }
 
         torrents::initialize(&mut connection)?;
+        knife::initialize(&connection)?;
         image_access::initialize(&connection)?;
         let _ = connection.execute_batch("PRAGMA optimize;");
 
@@ -1094,6 +1096,7 @@ impl Database {
         } else {
             torrents::after_scrape(&transaction, page, page_id)?;
         }
+        knife::after_scrape(&transaction, page, page_id, &image_ids_by_url, images_only)?;
         refresh_page_search_index(&transaction, page_id)?;
         refresh_page_counters(&transaction, page_id)?;
 

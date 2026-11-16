@@ -52,6 +52,7 @@ enum Tab {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsPage {
     Storage,
+    Import,
     Integrations,
     Accounts,
     Appearance,
@@ -178,6 +179,7 @@ pub struct AppWindow {
     active_tab: Tab,
     pub(super) agent_access: super::agent_access::AgentAccessPanel,
     storage_settings: StorageSettingsEditor,
+    knife_import: super::knife_import::KnifeImport,
     settings_page: SettingsPage,
     appearance_applied: Option<crate::app::AppearanceConfig>,
     scrape_options_open: bool,
@@ -341,6 +343,7 @@ impl AppWindow {
             active_tab: Tab::Scrape,
             agent_access: Default::default(),
             storage_settings,
+            knife_import: Default::default(),
             settings_page: SettingsPage::Storage,
             appearance_applied: None,
             scrape_options_open: false,
@@ -958,6 +961,7 @@ impl AppWindow {
         ui.horizontal_wrapped(|ui| {
             for (page, label) in [
                 (SettingsPage::Storage, "Storage"),
+                (SettingsPage::Import, "Import"),
                 (SettingsPage::Integrations, "Integrations"),
                 (SettingsPage::Accounts, "Accounts"),
                 (SettingsPage::Appearance, "Appearance"),
@@ -1035,6 +1039,11 @@ impl AppWindow {
                             editor.refresh_pristine_draft(&self.config);
                         }
                         editor.render(ui, &self.config, busy, applying)
+                    }
+                    SettingsPage::Import => {
+                        self.knife_import
+                            .render(ui, self.config.effective_download_dir());
+                        None
                     }
                     SettingsPage::Storage => unreachable!(),
                 };
