@@ -20,7 +20,7 @@ use crate::app::{AppConfig, PreviewOpenMode};
 use crate::fs::structured::actor_folder_name;
 use crate::models::{
     DateBrowseDirection, DateGroup, DateGroupCursor, DateGroupPage, DeleteMode, PageKind,
-    QueueFailureKind, SearchCursor, SearchImageResult, SearchQuery, SearchResultPage,
+    QueueFailureKind, SearchCursor, SearchImageResult, SearchQuery, SearchResultPage, TorrentFacet,
     UrlQueueDecision, UrlQueueOutcome, UrlQueueReport,
 };
 use crate::scraper::ScraperRegistry;
@@ -688,6 +688,19 @@ impl AppWindow {
                 .set_suggestions(database, query, values.clone());
             self.torrent_library
                 .set_creator_suggestions(database, query, values);
+        }
+    }
+
+    pub(super) fn set_torrent_facet_suggestions(
+        &mut self,
+        database: &str,
+        facet: TorrentFacet,
+        query: &str,
+        values: Vec<String>,
+    ) {
+        if database == self.config.database_path {
+            self.torrent_library
+                .set_facet_suggestions(facet, query, values);
         }
     }
 
@@ -4497,7 +4510,7 @@ fn last_comma_token(value: &str) -> String {
 
 /// Replaces the last token in a multi-value field with `suggestion`.
 /// Example: replace_last_token("blowjob, asi", "Asian") → "blowjob, Asian"
-fn replace_last_token(value: &str, suggestion: &str) -> String {
+pub(super) fn replace_last_token(value: &str, suggestion: &str) -> String {
     match value.rfind(',') {
         Some(pos) => format!("{}, {}", value[..pos].trim_end(), suggestion),
         None => suggestion.to_string(),
@@ -5687,20 +5700,25 @@ fn search_filter_label(ui: &mut egui::Ui, label: &str, width: f32, row_height: f
 }
 
 fn render_suggestions(ui: &mut egui::Ui, value: &mut String, suggestions: &mut Vec<String>) {
+    if let Some(choice) = suggestion_choice(ui, suggestions) {
+        *value = replace_last_token(value, &choice);
+        suggestions.clear();
+        ui.ctx().request_repaint();
+    }
+}
+
+pub(super) fn suggestion_choice(ui: &mut egui::Ui, suggestions: &[String]) -> Option<String> {
     if suggestions.is_empty() {
-        return;
+        return None;
     }
     ui.horizontal_wrapped(|ui| {
         ui.small("Suggestions:");
-        for suggestion in suggestions.clone() {
-            if ui.small_button(&suggestion).clicked() {
-                *value = replace_last_token(value, &suggestion);
-                suggestions.clear();
-                ui.ctx().request_repaint();
-                return;
-            }
-        }
-    });
+        suggestions
+            .iter()
+            .find(|suggestion| ui.small_button(suggestion.as_str()).clicked())
+            .cloned()
+    })
+    .inner
 }
 
 fn should_open_preview(mode: PreviewOpenMode, response: &egui::Response) -> bool {

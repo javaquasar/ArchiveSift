@@ -712,6 +712,7 @@ impl Database {
                 filename TEXT NOT NULL,
                 local_file_path TEXT NOT NULL,
                 downloaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                torrent_file_names TEXT,
                 PRIMARY KEY (page_id, source_url)
             );
 
@@ -922,16 +923,26 @@ impl Database {
         Self::write_page_attachment(&connection, page_id, source_url, filename, local_file_path)
     }
 
-    pub(crate) fn save_targeted_torrent_file(
+    pub(crate) fn save_torrent_file(
         &self,
         page_id: i64,
         source_url: &str,
         filename: &str,
         local_file_path: &str,
+        names: &[String],
+        targeted: bool,
     ) -> AppResult<()> {
         let mut connection = self.writer_connection()?;
         let tx = connection.transaction()?;
         Self::write_page_attachment(&tx, page_id, source_url, filename, local_file_path)?;
+        tx.execute(
+            "UPDATE page_attachments SET torrent_file_names=?3 WHERE page_id=?1 AND source_url=?2",
+            params![page_id, source_url, serde_json::to_string(names)?],
+        )?;
+        if !targeted {
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute(
             "UPDATE torrent_cards SET revision=revision+1 WHERE page_id=?1",
             [page_id],

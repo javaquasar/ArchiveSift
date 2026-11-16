@@ -7,6 +7,8 @@ pub(crate) const TORRENT_UNAVAILABLE_NOTICE: &str = "Torrent unavailable";
 pub struct TorrentQuery {
     pub text: String,
     pub title: String,
+    pub filename: String,
+    pub video: String,
     pub site_key: String,
     pub studio: String,
     pub actors: Vec<String>,
@@ -17,6 +19,33 @@ pub struct TorrentQuery {
     pub year: String,
     pub missing_torrent: bool,
     pub offset: usize,
+}
+
+pub(crate) const TORRENT_VIDEO_FIELDS: [(&str, &str); 7] = [
+    ("resolution", "Resolution"),
+    ("quality", "Video quality"),
+    ("video_format", "Container"),
+    ("video_codec", "Video codec"),
+    ("audio_codec", "Audio codec"),
+    ("video_details", "Video"),
+    ("audio_details", "Audio"),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TorrentFacet {
+    Studio,
+    Tag,
+    Genre,
+}
+
+impl TorrentFacet {
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Studio => "studio",
+            Self::Tag => "tag",
+            Self::Genre => "genre",
+        }
+    }
 }
 
 pub(crate) fn torrent_year_bounds(value: &str) -> Result<Option<(&str, &str)>, &'static str> {
@@ -51,6 +80,7 @@ pub struct TorrentAttachment {
     pub source_url: String,
     pub filename: String,
     pub local_file_path: String,
+    pub contents: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

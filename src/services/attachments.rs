@@ -6,6 +6,7 @@ use sha1::Digest;
 use crate::db::{Database, FileDownloadStore};
 use crate::error::IncompleteAttachments;
 use crate::fs::torrent::is_torrent_file;
+use crate::fs::torrent_metainfo::TorrentMetainfo;
 use crate::models::{MetadataAttribute, ScrapedItem, TorrentCard, TORRENT_UNAVAILABLE_NOTICE};
 use crate::scraper::ContentScraper;
 use crate::AppResult;
@@ -130,144 +131,7 @@ pub(crate) fn valid_magnet(value: &str) -> bool {
 
 /// Hash the original encoded info dictionary, avoiding changes from reserialization.
 pub(crate) fn torrent_magnet(bytes: &[u8]) -> AppResult<String> {
-    fn string<'a>(b: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
-        let start = *i;
-        while b.get(*i)?.is_ascii_digit() {
-            *i += 1;
-        }
-        if *i == start || b.get(*i) != Some(&b':') || (*i > start + 1 && b[start] == b'0') {
-            return None;
-        }
-        let length = std::str::from_utf8(&b[start..*i])
-            .ok()?
-            .parse::<usize>()
-            .ok()?;
-        *i += 1;
-        let end = i.checked_add(length)?;
-        let result = b.get(*i..end)?;
-        *i = end;
-        Some(result)
-    }
-    fn value(b: &[u8], i: &mut usize, depth: usize) -> Option<()> {
-        if depth > 64 {
-            return None;
-        }
-        match *b.get(*i)? {
-            b'i' => {
-                *i += 1;
-                let start = *i;
-                if b.get(*i) == Some(&b'-') {
-                    *i += 1;
-                }
-                let digits = *i;
-                while b.get(*i)?.is_ascii_digit() {
-                    *i += 1;
-                }
-                if *i == digits
-                    || b.get(*i) != Some(&b'e')
-                    || (*i > digits + 1 && b[digits] == b'0')
-                    || (digits != start && b[digits] == b'0')
-                {
-                    return None;
-                }
-                *i += 1;
-            }
-            b'l' | b'd' => {
-                let dict = b[*i] == b'd';
-                *i += 1;
-                while b.get(*i) != Some(&b'e') {
-                    if dict {
-                        string(b, i)?;
-                    }
-                    value(b, i, depth + 1)?;
-                }
-                *i += 1;
-            }
-            b'0'..=b'9' => {
-                string(b, i)?;
-            }
-            _ => return None,
-        }
-        Some(())
-    }
-    let invalid = || "attachment is not a valid torrent file";
-    if bytes.first() != Some(&b'd') {
-        return Err(invalid().into());
-    }
-    let mut index = 1;
-    let mut info = None;
-    let mut trackers = Vec::<String>::new();
-    while bytes.get(index) != Some(&b'e') {
-        let key = string(bytes, &mut index).ok_or_else(invalid)?;
-        let start = index;
-        value(bytes, &mut index, 0).ok_or_else(invalid)?;
-        if key == b"info" {
-            if info.is_some() || bytes[start] != b'd' {
-                return Err(invalid().into());
-            }
-            info = Some(&bytes[start..index]);
-        } else if key == b"announce" || key == b"announce-list" {
-            let mut cursor = start;
-            while cursor < index && trackers.len() < 32 {
-                if bytes[cursor].is_ascii_digit() {
-                    if let Some(raw) = string(bytes, &mut cursor) {
-                        if let Ok(text) = std::str::from_utf8(raw) {
-                            if reqwest::Url::parse(text).is_ok_and(|u| {
-                                matches!(u.scheme(), "http" | "https" | "udp" | "wss")
-                                    && u.host_str().is_some()
-                            }) && !trackers.iter().any(|s| s == text)
-                            {
-                                trackers.push(text.to_string());
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                } else {
-                    cursor += 1;
-                }
-            }
-        }
-    }
-    if index + 1 != bytes.len() {
-        return Err(invalid().into());
-    }
-    let info = info.ok_or_else(invalid)?;
-    let mut cursor = 1;
-    let mut version = None;
-    let mut v1_pieces = false;
-    while info.get(cursor) != Some(&b'e') {
-        let key = string(info, &mut cursor).ok_or_else(invalid)?;
-        let start = cursor;
-        value(info, &mut cursor, 0).ok_or_else(invalid)?;
-        if key == b"meta version" {
-            version = Some(&info[start..cursor]);
-        }
-        if key == b"pieces" {
-            v1_pieces = true;
-        }
-    }
-    if version.is_some_and(|v| v != b"i2e") {
-        return Err("unsupported torrent metadata version".into());
-    }
-    let mut magnet = if version.is_some() {
-        format!("magnet:?xt=urn:btmh:1220{:x}", sha2::Sha256::digest(info))
-    } else {
-        format!("magnet:?xt=urn:btih:{:x}", sha1::Sha1::digest(info))
-    };
-    if version.is_some() && v1_pieces {
-        magnet.push_str(&format!("&xt=urn:btih:{:x}", sha1::Sha1::digest(info)));
-    }
-    for tracker in trackers {
-        let parameter =
-            reqwest::Url::parse_with_params("https://example.invalid/", [("tr", tracker)])?;
-        let query = parameter.query().unwrap();
-        if magnet.len() + query.len() + 1 <= 16 * 1024 {
-            magnet.push('&');
-            magnet.push_str(query);
-        }
-    }
-    Ok(magnet)
+    TorrentMetainfo::parse(bytes)?.magnet()
 }
 
 fn relative_path(site_key: &str, page_id: i64, source: &str, name: &str) -> PathBuf {
@@ -439,21 +303,34 @@ async fn save_attachment(
         }
         data.bytes
     };
-    let magnet = is_torrent_file(&attribute.label)
-        .then(|| torrent_magnet(&data))
+    let torrent = is_torrent_file(&attribute.label)
+        .then(|| TorrentMetainfo::parse(&data))
+        .transpose()?;
+    let magnet = torrent
+        .as_ref()
+        .filter(|_| !torrent_only)
+        .map(TorrentMetainfo::magnet)
         .transpose()?;
     if size == 0 {
         store.write_bytes(&path.to_string_lossy(), &data).await?;
     }
-    if torrent_only {
-        return database.save_targeted_torrent_file(
+    if let Some(torrent) = torrent {
+        database.save_torrent_file(
             page_id,
             url,
             &attribute.label,
             &relative.to_string_lossy(),
-        );
+            &torrent.file_names(),
+            torrent_only,
+        )?;
+    } else {
+        database.save_page_attachment(
+            page_id,
+            url,
+            &attribute.label,
+            &relative.to_string_lossy(),
+        )?;
     }
-    database.save_page_attachment(page_id, url, &attribute.label, &relative.to_string_lossy())?;
     if let Some(magnet) = magnet {
         save_magnet(page, page_id, &magnet, database, base_dir, store).await?;
     }

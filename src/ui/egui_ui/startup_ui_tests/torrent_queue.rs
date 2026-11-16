@@ -18,7 +18,7 @@ use crate::services::url_queue::QueueJob;
 use crate::services::UrlQueueService;
 use crate::AppResult;
 
-const TORRENT: &[u8] = b"d4:infod6:lengthi1e4:name4:demoee";
+const TORRENT: &[u8] = b"d4:infod6:lengthi1e4:name16:feature-clip.mp4ee";
 const MAGNET: &str = "magnet:?xt=urn:btih:0123456789012345678901234567890123456789";
 const CARD_TITLE: &str = "Saved torrent queue fixture";
 
@@ -251,6 +251,16 @@ fn torrent_queue_button_downloads_one_file_through_the_worker() {
     assert_eq!(card.attachments.len(), 1);
     let attachment = &card.attachments[0];
     assert_eq!(attachment.filename, "release.torrent");
+    assert_eq!(attachment.contents, ["feature-clip.mp4"]);
+    assert_eq!(
+        db.search_torrent_summaries(&crate::models::TorrentQuery {
+            filename: "CLIP.MP4".into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .total,
+        1
+    );
     let folder = downloads.join(card.directory.unwrap());
     assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1);
     assert_eq!(

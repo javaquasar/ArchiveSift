@@ -258,6 +258,8 @@ impl AgentService {
                 let query = TorrentQuery {
                     text: args.text,
                     title: args.title,
+                    filename: args.filename,
+                    video: args.video,
                     site_key: args.site,
                     studio: args.studio,
                     actors: args.actors,
@@ -309,7 +311,8 @@ impl AgentService {
                 json!({"page_id":card.page_id,"title":clip(&card.title,4096),"content_title":clip(card.content_title(),1024),"page_url":safe_url(&card.page_url),
                     "description":card.attributes.iter().find(|a|a.kind=="description").map(|a|clip(&a.value,32768)),
                     "full_description":card.attributes.iter().find(|a|a.kind=="full_description").map(|a|clip(&a.value,32768)),
-                    "metadata":card.attributes.iter().filter(|a|allowed.contains(&a.kind.as_str())).take(128).map(|a|json!({"kind":a.kind,"value":clip(&a.value,512)})).collect::<Vec<_>>(),
+                    "metadata":card.attributes.iter().filter(|a|allowed.contains(&a.kind.as_str()) || crate::models::TORRENT_VIDEO_FIELDS.iter().any(|(kind, _)| a.kind == *kind)).take(128).map(|a|json!({"kind":a.kind,"value":clip(&a.value,512)})).collect::<Vec<_>>(),
+                    "torrent_file_names":card.attachments.iter().flat_map(|file| &file.contents).take(128).map(|name|clip(name,512)).collect::<Vec<_>>(),
                     "primary_image_id":card.primary_image().map(|image|image.image_id),"image_count":card.images.len(),"image_ids":card.images.iter().take(256).map(|image|image.image_id).collect::<Vec<_>>(),
                     "attachment_count":card.attachments.len(),"attachments":card.attachments.iter().take(32).map(|file|clip(&file.filename,256)).collect::<Vec<_>>()})
             }
@@ -395,6 +398,8 @@ impl SearchArgs {
 struct TorrentArgs {
     text: String,
     title: String,
+    filename: String,
+    video: String,
     site: String,
     studio: String,
     actors: Vec<String>,

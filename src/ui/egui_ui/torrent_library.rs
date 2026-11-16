@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 
-use super::app_window::{filter_chip, filter_value_chips, site_selector};
+use super::app_window::{
+    filter_chip, filter_value_chips, replace_last_token, site_selector, suggestion_choice,
+};
 use super::background_executor::spawn_background;
 use super::creator_filter::CreatorFilter;
 use super::download_status::DownloadStatus;
@@ -10,8 +13,8 @@ use super::texture_cache::SizedLruCache;
 use crate::app::{parse_comma_list, AppConfig};
 use crate::db::Database;
 use crate::models::{
-    torrent_year_bounds, TorrentCard, TorrentEdit, TorrentField, TorrentImage, TorrentQuery,
-    TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE,
+    torrent_year_bounds, TorrentCard, TorrentEdit, TorrentFacet, TorrentField, TorrentImage,
+    TorrentQuery, TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE, TORRENT_VIDEO_FIELDS,
 };
 use crate::services::torrent_library::{
     generated_directory, MoveProgress, TorrentLibrary, TorrentMovePlan,
@@ -21,6 +24,8 @@ use eframe::egui;
 #[derive(Default)]
 struct Filters {
     title: String,
+    filename: String,
+    video: String,
     text: String,
     site: String,
     studio: String,
@@ -31,12 +36,15 @@ struct Filters {
     categories: String,
     year: String,
     missing_torrent: bool,
+    facet_suggestions: HashMap<TorrentFacet, (String, Vec<String>)>,
     offset: usize,
 }
 impl Filters {
     fn query(&self) -> TorrentQuery {
         TorrentQuery {
             title: self.title.trim().into(),
+            filename: self.filename.trim().into(),
+            video: self.video.trim().into(),
             text: self.text.trim().into(),
             site_key: self.site.clone(),
             studio: self.studio.trim().into(),
@@ -50,6 +58,52 @@ impl Filters {
             offset: self.offset,
         }
     }
+
+    fn facet_value(&mut self, facet: TorrentFacet) -> &mut String {
+        match facet {
+            TorrentFacet::Studio => &mut self.studio,
+            TorrentFacet::Tag => &mut self.tags,
+            TorrentFacet::Genre => &mut self.genres,
+        }
+    }
+
+    fn facet_query(&self, facet: TorrentFacet) -> &str {
+        match facet {
+            TorrentFacet::Studio => self.studio.trim(),
+            TorrentFacet::Tag => self.tags.rsplit(',').next().unwrap_or_default().trim(),
+            TorrentFacet::Genre => self.genres.rsplit(',').next().unwrap_or_default().trim(),
+        }
+    }
+
+    fn facet_changed(
+        &mut self,
+        facet: TorrentFacet,
+        config: &AppConfig,
+    ) -> Option<crate::ui::UiCommand> {
+        self.facet_suggestions.remove(&facet);
+        let query = self.facet_query(facet);
+        (!query.is_empty()).then(|| crate::ui::UiCommand::SuggestTorrentFacet {
+            database_path: config.database_path.clone(),
+            facet,
+            query: query.into(),
+        })
+    }
+
+    fn render_facet_suggestions(&mut self, ui: &mut egui::Ui, facet: TorrentFacet) {
+        let choice = self
+            .facet_suggestions
+            .get(&facet)
+            .filter(|(query, _)| query == self.facet_query(facet))
+            .and_then(|(_, suggestions)| suggestion_choice(ui, suggestions));
+        if let Some(choice) = choice {
+            let value = self.facet_value(facet);
+            *value = match facet {
+                TorrentFacet::Studio => choice,
+                TorrentFacet::Tag | TorrentFacet::Genre => replace_last_token(value, &choice),
+            };
+            self.facet_suggestions.remove(&facet);
+        }
+    }
 }
 
 fn torrent_filter_count(query: &TorrentQuery) -> usize {
@@ -57,6 +111,8 @@ fn torrent_filter_count(query: &TorrentQuery) -> usize {
         + usize::from(!query.text.is_empty())
         + usize::from(!query.studio.is_empty())
         + usize::from(!query.year.is_empty())
+        + usize::from(!query.filename.is_empty())
+        + usize::from(!query.video.is_empty())
         + usize::from(query.missing_torrent)
         + query.actors.len()
         + query.tags.len()
@@ -221,6 +277,19 @@ impl TorrentLibraryUi {
     pub(super) fn set_actor_suggestions(&mut self, query: &str, suggestions: &[String]) {
         if self.editing && self.actor_input.trim() == query {
             self.actor_suggestions = suggestions.to_vec();
+        }
+    }
+
+    pub(super) fn set_facet_suggestions(
+        &mut self,
+        facet: TorrentFacet,
+        query: &str,
+        values: Vec<String>,
+    ) {
+        if self.filters.facet_query(facet) == query {
+            self.filters
+                .facet_suggestions
+                .insert(facet, (query.into(), values));
         }
     }
 
@@ -646,6 +715,9 @@ impl TorrentLibraryUi {
                         .hint_text("Tags")
                         .desired_width(105.0),
                 );
+                if tags.changed() {
+                    self.pending_command = self.filters.facet_changed(TorrentFacet::Tag, config);
+                }
                 ui.checkbox(&mut self.filters.missing_torrent, "Missing .torrent");
                 let enter = (title.lost_focus() || tags.lost_focus())
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -660,6 +732,7 @@ impl TorrentLibraryUi {
                     self.filters_open = !self.filters_open;
                 }
             });
+            self.filters.render_facet_suggestions(ui, TorrentFacet::Tag);
             if applied_count > 0 {
                 let mut removed = false;
                 ui.add_enabled_ui(!dirty, |ui| {
@@ -674,6 +747,8 @@ impl TorrentLibraryUi {
                         }
                         for (label, field, value) in [
                             ("Title", &mut self.filters.title, &query.title),
+                            ("Filename", &mut self.filters.filename, &query.filename),
+                            ("Video / audio", &mut self.filters.video, &query.video),
                             ("Text", &mut self.filters.text, &query.text),
                             ("Site", &mut self.filters.site, &query.site_key),
                             ("Studio", &mut self.filters.studio, &query.studio),
@@ -739,10 +814,31 @@ impl TorrentLibraryUi {
                 .vscroll(true)
                 .show(&ctx, |ui| {
                     ui.add_enabled_ui(can_search, |ui| {
+                        ui.label("File name contains");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filters.filename)
+                                .hint_text("Part of a file name"),
+                        );
+                        ui.label("Video / audio");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filters.video)
+                                .hint_text("2160p H.264 AAC"),
+                        );
+                        for (label, facet) in [
+                            ("Studio", TorrentFacet::Studio),
+                            ("Genres (comma separated)", TorrentFacet::Genre),
+                        ] {
+                            ui.label(label);
+                            if ui
+                                .text_edit_singleline(self.filters.facet_value(facet))
+                                .changed()
+                            {
+                                self.pending_command = self.filters.facet_changed(facet, config);
+                            }
+                            self.filters.render_facet_suggestions(ui, facet);
+                        }
                         for (label, value) in [
                             ("Actors (comma separated)", &mut self.filters.actors),
-                            ("Genres (comma separated)", &mut self.filters.genres),
-                            ("Studio", &mut self.filters.studio),
                             ("Categories (comma separated)", &mut self.filters.categories),
                             ("Any text", &mut self.filters.text),
                         ] {
@@ -901,6 +997,21 @@ impl TorrentLibraryUi {
                 ui.label(format!("{} · {}", field.label(), value));
             }
         }
+        if card.attributes.iter().any(|attribute| {
+            TORRENT_VIDEO_FIELDS
+                .iter()
+                .any(|(kind, _)| attribute.kind == *kind)
+        }) {
+            egui::CollapsingHeader::new("Video and audio")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (kind, label) in TORRENT_VIDEO_FIELDS {
+                        for attribute in card.attributes.iter().filter(|a| a.kind == kind) {
+                            ui.label(format!("{label} · {}", attribute.value));
+                        }
+                    }
+                });
+        }
         for kind in [
             "actor",
             "director",
@@ -936,6 +1047,26 @@ impl TorrentLibraryUi {
                         ui.ctx().copy_text(attachment.source_url.clone());
                     }
                 });
+                if !attachment.contents.is_empty() {
+                    ui.push_id(&attachment.filename, |ui| {
+                        ui.collapsing(
+                            format!("{} files in torrent", attachment.contents.len()),
+                            |ui| {
+                                let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                                egui::ScrollArea::vertical().max_height(180.0).show_rows(
+                                    ui,
+                                    row_height,
+                                    attachment.contents.len(),
+                                    |ui, range| {
+                                        for filename in &attachment.contents[range] {
+                                            ui.add(egui::Label::new(filename).truncate());
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                    });
+                }
             }
         });
     }
@@ -1558,6 +1689,8 @@ mod tests {
     fn torrent_filters_reuse_creator_names_across_pagination() {
         let mut filters = Filters {
             title: "  Example film ".into(),
+            filename: " Clip.MKV ".into(),
+            video: " 2160p AAC ".into(),
             actors: "Alice, , Bob".into(),
             tags: "Restored".into(),
             genres: "Drama, Mystery".into(),
@@ -1569,6 +1702,8 @@ mod tests {
         filters.creators.text = "Alice Creator, Bob Author".into();
         let query = filters.query();
         assert_eq!(query.title, "Example film");
+        assert_eq!(query.filename, "Clip.MKV");
+        assert_eq!(query.video, "2160p AAC");
         assert_eq!(query.actors, ["Alice", "Bob"]);
         assert_eq!(query.tags, ["Restored"]);
         assert_eq!(query.genres, ["Drama", "Mystery"]);
@@ -1576,7 +1711,31 @@ mod tests {
         assert_eq!(query.creators, ["Alice Creator", "Bob Author"]);
         assert_eq!(query.offset, 40);
         assert_eq!(query.site_key, "example-source");
-        assert_eq!(torrent_filter_count(&query), 9);
+        assert_eq!(torrent_filter_count(&query), 11);
+    }
+
+    #[test]
+    fn torrent_facet_suggestions_replace_the_typed_value_without_losing_other_tags() {
+        let (_root, config, _db, mut editor, ctx) = fixture();
+        editor.filters.studio = "Ex".into();
+        editor.filters.tags = "Saved, ex".into();
+        editor.filters.genres = "Dr".into();
+        editor.set_facet_suggestions(TorrentFacet::Studio, "E", vec!["Stale studio".into()]);
+        assert!(!editor
+            .filters
+            .facet_suggestions
+            .contains_key(&TorrentFacet::Studio));
+        editor.set_facet_suggestions(TorrentFacet::Studio, "Ex", vec!["Example, LLC".into()]);
+        editor.set_facet_suggestions(TorrentFacet::Tag, "ex", vec!["Example tag".into()]);
+        editor.set_facet_suggestions(TorrentFacet::Genre, "Dr", vec!["Drama".into()]);
+        click(&mut editor, &config, &ctx, "Example tag");
+        editor.filters_open = true;
+        click(&mut editor, &config, &ctx, "Example, LLC");
+        click(&mut editor, &config, &ctx, "Drama");
+        let query = editor.filters.query();
+        assert_eq!(query.studio, "Example, LLC");
+        assert_eq!(query.tags, ["Saved", "Example tag"]);
+        assert_eq!(query.genres, ["Drama"]);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use crate::app::AppConfig;
 use crate::models::{
     DateBrowseDirection, DateGroupCursor, DeleteMode, MetadataAttribute, SearchCursor, SearchQuery,
+    TorrentFacet,
 };
 use crate::AppResult;
 
@@ -284,6 +285,11 @@ pub enum UiCommand {
     },
     SuggestCreators {
         database_path: String,
+        query: String,
+    },
+    SuggestTorrentFacet {
+        database_path: String,
+        facet: TorrentFacet,
         query: String,
     },
     AddTagsToImages {

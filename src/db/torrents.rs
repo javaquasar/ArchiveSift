@@ -1,10 +1,52 @@
 use super::*;
 use crate::fs::torrent::{valid_year, RELEASE_DATE_KINDS};
+use crate::fs::torrent_metainfo::TorrentMetainfo;
 use crate::models::{
-    torrent_year_bounds, TorrentAttachment, TorrentCard, TorrentEdit, TorrentField, TorrentImage,
-    TorrentPage, TorrentQuery, TorrentSummary, TorrentSummaryPage, TORRENT_UNAVAILABLE_NOTICE,
+    torrent_year_bounds, TorrentAttachment, TorrentCard, TorrentEdit, TorrentFacet, TorrentField,
+    TorrentImage, TorrentPage, TorrentQuery, TorrentSummary, TorrentSummaryPage,
+    TORRENT_UNAVAILABLE_NOTICE, TORRENT_VIDEO_FIELDS,
 };
 use rusqlite::functions::FunctionFlags;
+use std::io::Read;
+
+fn fold(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn fold_video(value: &str) -> String {
+    fold(value).replace('.', "").replace('×', "x")
+}
+
+fn read_torrent_names(root: &Path, relative: &str) -> Option<Vec<String>> {
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    let portable = relative.replace('\\', "/");
+    let path = Path::new(&portable);
+    if !crate::fs::torrent::is_torrent_file(&portable)
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let path = root.join(path).canonicalize().ok()?;
+    if !path.starts_with(root) {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > LIMIT {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > LIMIT {
+        return None;
+    }
+    Some(TorrentMetainfo::parse(&bytes).ok()?.file_names())
+}
 
 pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
     let tx = connection.transaction()?;
@@ -55,6 +97,16 @@ pub(super) fn initialize(connection: &mut Connection) -> AppResult<()> {
         .any(|name| name == "folder_name");
     if !has_folder_name {
         tx.execute_batch("ALTER TABLE torrent_cards ADD COLUMN folder_name TEXT;")?;
+    }
+    let attachment_columns = tx
+        .prepare("PRAGMA table_info(page_attachments)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !attachment_columns
+        .iter()
+        .any(|name| name == "torrent_file_names")
+    {
+        tx.execute_batch("ALTER TABLE page_attachments ADD COLUMN torrent_file_names TEXT;")?;
     }
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_torrent_cards_primary_image ON torrent_cards(primary_image_id) WHERE primary_image_id IS NOT NULL;
@@ -251,6 +303,28 @@ fn replace_field(
     Ok(())
 }
 
+fn read_attachment(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<TorrentAttachment> {
+    let contents = row
+        .get::<_, Option<String>>(start + 3)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    start + 3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(TorrentAttachment {
+        source_url: row.get(start)?,
+        filename: row.get(start + 1)?,
+        local_file_path: row.get(start + 2)?,
+        contents,
+    })
+}
+
 fn read_cards(connection: &Connection, ids: &[i64]) -> AppResult<Vec<TorrentCard>> {
     if ids.is_empty() {
         return Ok(vec![]);
@@ -302,16 +376,9 @@ fn read_cards(connection: &Connection, ids: &[i64]) -> AppResult<Vec<TorrentCard
             card.images.push(image);
         }
     }
-    let mut statement = connection.prepare(&format!("SELECT page_id,source_url,filename,local_file_path FROM page_attachments WHERE page_id IN ({placeholders}) ORDER BY page_id,filename,source_url"))?;
+    let mut statement = connection.prepare(&format!("SELECT page_id,source_url,filename,local_file_path,torrent_file_names FROM page_attachments WHERE page_id IN ({placeholders}) ORDER BY page_id,filename,source_url"))?;
     let rows = statement.query_map(params_from_iter(ids), |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            TorrentAttachment {
-                source_url: r.get(1)?,
-                filename: r.get(2)?,
-                local_file_path: r.get(3)?,
-            },
-        ))
+        Ok((r.get::<_, i64>(0)?, read_attachment(r, 1)?))
     })?;
     for row in rows {
         let (id, attachment) = row?;
@@ -346,15 +413,9 @@ fn read_card(connection: &Connection, page_id: i64) -> AppResult<TorrentCard> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut q = connection.prepare("SELECT source_url,filename,local_file_path FROM page_attachments WHERE page_id=?1 ORDER BY filename,source_url")?;
+    let mut q = connection.prepare("SELECT source_url,filename,local_file_path,torrent_file_names FROM page_attachments WHERE page_id=?1 ORDER BY filename,source_url")?;
     card.attachments = q
-        .query_map([page_id], |r| {
-            Ok(TorrentAttachment {
-                source_url: r.get(0)?,
-                filename: r.get(1)?,
-                local_file_path: r.get(2)?,
-            })
-        })?
+        .query_map([page_id], |r| read_attachment(r, 0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(card)
 }
@@ -362,6 +423,152 @@ fn read_card(connection: &Connection, page_id: i64) -> AppResult<TorrentCard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn searchable_page(db: &Database, id: usize, fields: &[(&str, &str)]) -> i64 {
+        let page = ScrapedItem {
+            site_key: "example-source".into(),
+            page_url: format!("https://example.test/release/{id}"),
+            title: format!("Example release {id}"),
+            raw_html: String::new(),
+            images: vec![],
+            attributes: fields
+                .iter()
+                .chain([("notice", "unavailable")].iter())
+                .map(|&(kind, value)| MetadataAttribute {
+                    kind: kind.into(),
+                    label: if kind == "notice" {
+                        TORRENT_UNAVAILABLE_NOTICE
+                    } else {
+                        kind
+                    }
+                    .into(),
+                    value: value.into(),
+                    source_url: None,
+                    is_female: None,
+                })
+                .collect(),
+        };
+        db.upsert_scraped_item(&page).unwrap().page_id
+    }
+
+    #[test]
+    fn legacy_payload_file_search_indexes_only_files_inside_the_library() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::new(root.path().join("search.sqlite3"));
+        db.initialize().unwrap();
+        let base = root.path().join("library");
+        fs::create_dir_all(base.join("nested")).unwrap();
+        let inside = searchable_page(&db, 1, &[("quality", "WEB-DL"), ("audio_codec", "AAC")]);
+        let outside = searchable_page(&db, 2, &[("quality", "WEB-DL"), ("audio_codec", "AAC")]);
+        for file in [
+            base.join("nested/legacy.torrent"),
+            root.path().join("outside.torrent"),
+        ] {
+            fs::write(file, b"d4:infod6:lengthi1e4:name16:feature-clip.mp4ee").unwrap();
+        }
+        db.save_page_attachment(
+            inside,
+            "https://example.test/1",
+            "legacy.torrent",
+            r"nested\legacy.torrent",
+        )
+        .unwrap();
+        db.save_page_attachment(
+            outside,
+            "https://example.test/2",
+            "outside.torrent",
+            "../outside.torrent",
+        )
+        .unwrap();
+        let query = TorrentQuery {
+            filename: "CLIP.MP4".into(),
+            video: "web-dl aac".into(),
+            ..Default::default()
+        };
+        assert!(db.torrent_card(inside).unwrap().attachments[0]
+            .contents
+            .is_empty());
+        let result = db
+            .search_torrent_summaries_with_storage(&query, Some(&base), None)
+            .unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.cards[0].page_id, inside);
+        assert_eq!(
+            db.torrent_card(inside).unwrap().attachments[0].contents,
+            ["feature-clip.mp4"]
+        );
+        assert!(db.torrent_card(outside).unwrap().attachments[0]
+            .contents
+            .is_empty());
+        assert_eq!(db.search_torrents(&query).unwrap().total, 1);
+    }
+
+    #[test]
+    fn torrent_video_terms_match_structured_data_and_older_full_descriptions() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::new(root.path().join("search.sqlite3"));
+        db.initialize().unwrap();
+        let modern = searchable_page(
+            &db,
+            1,
+            &[
+                ("resolution", "3840×2160"),
+                ("video_codec", "H.264/AVC"),
+                ("audio_codec", "AAC"),
+                ("video_filename", "Proper Cut.mkv"),
+            ],
+        );
+        searchable_page(
+            &db,
+            2,
+            &[("full_description", "Video: 3840x2160 H.264\nAudio: AAC")],
+        );
+        searchable_page(
+            &db,
+            3,
+            &[
+                ("resolution", "3840x2160"),
+                ("video_codec", "H.264"),
+                ("audio_codec", "FLAC"),
+            ],
+        );
+        let mut query = TorrentQuery {
+            video: "3840x2160 H264 aac".into(),
+            ..Default::default()
+        };
+        assert_eq!(db.search_torrents(&query).unwrap().total, 2);
+        query.filename = "per cut.MKV".into();
+        let result = db.search_torrents(&query).unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.cards[0].page_id, modern);
+    }
+
+    #[test]
+    fn torrent_facet_suggestions_match_effective_studios_tags_and_genres() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::new(root.path().join("search.sqlite3"));
+        db.initialize().unwrap();
+        searchable_page(
+            &db,
+            1,
+            &[
+                ("studio", "Primary Studio"),
+                ("tag", "Drama Camera"),
+                ("genre", "Drama"),
+            ],
+        );
+        searchable_page(&db, 2, &[("tag", "Drama Legacy")]);
+        let choices = |facet, prefix| db.suggest_torrent_facet(facet, prefix, 8).unwrap();
+        assert_eq!(choices(TorrentFacet::Studio, "ARY st"), ["Primary Studio"]);
+        assert_eq!(
+            choices(TorrentFacet::Tag, "dram"),
+            ["Drama Camera", "Drama Legacy"]
+        );
+        assert_eq!(
+            choices(TorrentFacet::Genre, "dram"),
+            ["Drama", "Drama Legacy"]
+        );
+    }
 
     #[test]
     fn previously_unclassified_releases_can_be_organized_into_their_recorded_studio() {
@@ -511,6 +718,117 @@ mod tests {
 }
 
 impl Database {
+    pub(crate) fn suggest_torrent_facet(
+        &self,
+        facet: TorrentFacet,
+        query: &str,
+        limit: usize,
+    ) -> AppResult<Vec<String>> {
+        let connection = self.connect()?;
+        connection.create_scalar_function(
+            "torrent_fold",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(fold(ctx.get_raw(0).as_str()?)),
+        )?;
+        let mut sql = String::from(
+            "WITH facets(value) AS (
+             SELECT a.value FROM attributes a WHERE a.kind=?1 AND EXISTS(
+                 SELECT 1 FROM page_attributes pa JOIN torrent_cards tc ON tc.page_id=pa.page_id
+                 WHERE pa.attribute_id=a.id)",
+        );
+        match facet {
+            TorrentFacet::Studio => {
+                sql.push_str(" UNION ALL SELECT primary_studio FROM torrent_cards")
+            }
+            TorrentFacet::Tag => {}
+            TorrentFacet::Genre => sql.push_str(
+                " UNION ALL SELECT a.value FROM attributes a WHERE a.kind='tag' AND EXISTS(
+                    SELECT 1 FROM page_attributes pa JOIN torrent_cards tc ON tc.page_id=pa.page_id
+                    WHERE pa.attribute_id=a.id AND NOT EXISTS(
+                        SELECT 1 FROM page_attributes pg JOIN attributes g ON g.id=pg.attribute_id
+                        WHERE pg.page_id=pa.page_id AND g.kind='genre' AND trim(g.value)<>''))",
+            ),
+        }
+        sql.push_str(
+            ") SELECT min(value) FROM facets
+             WHERE trim(value)<>'' AND instr(torrent_fold(value),?2)>0
+             GROUP BY torrent_fold(value)
+             ORDER BY instr(torrent_fold(value),?2)=1 DESC, torrent_fold(value) LIMIT ?3",
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let values = statement
+            .query_map(params![facet.kind(), fold(query), limit as i64], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(values)
+    }
+
+    fn index_legacy_torrent_names(
+        &self,
+        root: &Path,
+        site: &str,
+        cancellation: Option<&QueryCancellation>,
+    ) -> AppResult<()> {
+        let Ok(root) = root.canonicalize() else {
+            return Ok(());
+        };
+        let connection = self.connect()?;
+        let guard = cancellation
+            .map(|token| token.register(&connection))
+            .transpose()?;
+        let paths = {
+            let mut statement = connection.prepare(
+                "SELECT f.page_id, f.source_url, f.local_file_path
+                 FROM page_attachments f JOIN source_pages sp ON sp.id=f.page_id
+                 WHERE f.torrent_file_names IS NULL AND lower(substr(f.filename,-8))='.torrent'
+                   AND (?1='' OR sp.site_key=?1)",
+            )?;
+            let paths = statement
+                .query_map([site], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            paths
+        };
+        drop(guard);
+        drop(connection);
+        let mut indexed = Vec::new();
+        for (id, source, path) in paths {
+            if cancellation.is_some_and(QueryCancellation::is_cancelled) {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                    None,
+                )
+                .into());
+            }
+            if let Some(names) = read_torrent_names(&root, &path) {
+                indexed.push((id, source, path, serde_json::to_string(&names)?));
+            }
+        }
+        if !indexed.is_empty() {
+            let mut writer = self.writer_connection()?;
+            let tx = writer.transaction()?;
+            {
+                let mut update = tx.prepare(
+                    "UPDATE page_attachments SET torrent_file_names=?4
+                     WHERE page_id=?1 AND source_url=?2 AND local_file_path=?3
+                       AND torrent_file_names IS NULL",
+                )?;
+                for (id, source, path, names) in indexed {
+                    update.execute(params![id, source, path, names])?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_torrent_page(&self, page_id: i64) -> AppResult<bool> {
         Ok(self.connect()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM torrent_cards WHERE page_id=?1)",
@@ -607,13 +925,17 @@ impl Database {
         cancellation: Option<&QueryCancellation>,
     ) -> AppResult<(Vec<i64>, usize)> {
         let year_bounds = torrent_year_bounds(&query.year)?;
+        let filename = fold(&query.filename);
+        if let Some(root) = root.filter(|_| !filename.is_empty()) {
+            self.index_legacy_torrent_names(root, query.site_key.trim(), cancellation)?;
+        }
         let connection = self.connect()?;
         let _guard = cancellation
             .map(|token| token.register(&connection))
             .transpose()?;
         let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
         connection.create_scalar_function("torrent_fold", 1, flags, |ctx| {
-            Ok(ctx.get_raw(0).as_str()?.trim().to_lowercase())
+            Ok(fold(ctx.get_raw(0).as_str()?))
         })?;
         let mut sql = String::from(
             " FROM torrent_cards tc JOIN source_pages sp ON sp.id=tc.page_id WHERE 1=1",
@@ -634,6 +956,39 @@ impl Database {
             );
             let title = title.to_lowercase();
             values.extend([title.clone(), title]);
+        }
+        if !filename.is_empty() {
+            sql.push_str(
+                " AND (EXISTS(SELECT 1 FROM page_attachments f WHERE f.page_id=sp.id
+                    AND (instr(torrent_fold(f.filename),?)>0 OR EXISTS(
+                      SELECT 1 FROM json_each(f.torrent_file_names) n
+                      WHERE instr(torrent_fold(n.value),?)>0)))
+                    OR EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+                      WHERE pa.page_id=sp.id AND a.kind='video_filename' AND instr(torrent_fold(a.value),?)>0))",
+            );
+            values.extend([filename.clone(), filename.clone(), filename]);
+        }
+        let mut video_terms = query
+            .video
+            .split_whitespace()
+            .map(fold_video)
+            .filter(|term| !term.is_empty())
+            .peekable();
+        if video_terms.peek().is_some() {
+            connection.create_scalar_function("torrent_video_fold", 1, flags, |ctx| {
+                Ok(fold_video(ctx.get_raw(0).as_str()?))
+            })?;
+            let kinds = TORRENT_VIDEO_FIELDS
+                .map(|(kind, _)| format!("'{kind}'"))
+                .join(",");
+            for term in video_terms {
+                sql.push_str(&format!(
+                    " AND EXISTS(SELECT 1 FROM page_attributes pa JOIN attributes a ON a.id=pa.attribute_id
+                      WHERE pa.page_id=sp.id AND a.kind IN ({kinds}, 'full_description')
+                        AND instr(torrent_video_fold(a.value),?)>0)"
+                ));
+                values.push(term);
+            }
         }
         if !query.site_key.trim().is_empty() {
             sql.push_str(" AND sp.site_key=?");

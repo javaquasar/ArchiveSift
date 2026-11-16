@@ -33,7 +33,7 @@ use crate::db::{Database, FileDownloadStore, ImageLocalPathUpdate, QueryCancella
 use crate::fs::StructuredDirectoryStrategy;
 use crate::models::{
     DateBrowseDirection, DateGroupCursor, DateGroupPage, DeleteMode, SearchCursor,
-    SearchImageResult, SearchQuery, SearchResultPage, UrlQueueReport,
+    SearchImageResult, SearchQuery, SearchResultPage, TorrentFacet, UrlQueueReport,
 };
 use crate::services::url_queue::{self, QueueJob};
 use crate::services::{
@@ -80,6 +80,7 @@ enum SuggestionKind {
     Category,
     Studio,
     Creator,
+    Torrent(TorrentFacet),
 }
 
 impl SuggestionKind {
@@ -90,6 +91,7 @@ impl SuggestionKind {
             Self::Category => "category",
             Self::Studio => "studio",
             Self::Creator => "creator",
+            Self::Torrent(facet) => facet.kind(),
         }
     }
 }
@@ -280,12 +282,8 @@ fn suggestion_worker(
     let suggestion_tx = state_tx.clone();
     CoalescingWorker::new(move |job: SuggestionJob| {
         let database_path = job.database_path.clone();
-        let results = run_suggestions(
-            job.database_path,
-            job.kind.database_kind(),
-            job.query.clone(),
-        )
-        .unwrap_or_default();
+        let results =
+            run_suggestions(job.database_path, job.kind, job.query.clone()).unwrap_or_default();
         let state = match job.kind {
             SuggestionKind::Tag => WorkerState::TagSuggestions {
                 query: job.query,
@@ -305,6 +303,12 @@ fn suggestion_worker(
             },
             SuggestionKind::Creator => WorkerState::CreatorSuggestions {
                 database_path,
+                query: job.query,
+                results,
+            },
+            SuggestionKind::Torrent(facet) => WorkerState::TorrentFacetSuggestions {
+                database_path,
+                facet,
                 query: job.query,
                 results,
             },
@@ -1391,6 +1395,19 @@ impl DesktopApp {
                     self.window
                         .set_creator_suggestions(&database_path, &query, results);
                 }
+                WorkerState::TorrentFacetSuggestions {
+                    database_path,
+                    facet,
+                    query,
+                    results,
+                } => {
+                    self.window.set_torrent_facet_suggestions(
+                        &database_path,
+                        facet,
+                        &query,
+                        results,
+                    );
+                }
                 WorkerState::MetadataUpdated { message, results } => {
                     self.cancel_metadata();
                     let w = &mut self.window;
@@ -1662,6 +1679,21 @@ impl DesktopApp {
                     database_path,
                     query,
                 } => self.start_creator_suggestions(database_path, query),
+                UiCommand::SuggestTorrentFacet {
+                    database_path,
+                    facet,
+                    query,
+                } => {
+                    let kind = SuggestionKind::Torrent(facet);
+                    self.suggestion_worker.submit(
+                        kind,
+                        SuggestionJob {
+                            database_path,
+                            query,
+                            kind,
+                        },
+                    );
+                }
                 UiCommand::AddTagsToImages {
                     database_path,
                     image_ids,
@@ -2119,6 +2151,12 @@ enum WorkerState {
         query: String,
         results: Vec<String>,
     },
+    TorrentFacetSuggestions {
+        database_path: String,
+        facet: TorrentFacet,
+        query: String,
+        results: Vec<String>,
+    },
     MetadataUpdated {
         message: String,
         results: Result<SearchMutationResult, String>,
@@ -2393,13 +2431,17 @@ fn run_search_recent_pages(
     )
 }
 
-fn run_suggestions(database_path: String, kind: &str, query: String) -> AppResult<Vec<String>> {
+fn run_suggestions(
+    database_path: String,
+    kind: SuggestionKind,
+    query: String,
+) -> AppResult<Vec<String>> {
     let database = Database::new(database_path);
     database.initialize()?;
-    if kind == "creator" {
-        database.suggest_creators(&query, 8)
-    } else {
-        database.suggest_attribute_values(kind, &query, 8)
+    match kind {
+        SuggestionKind::Creator => database.suggest_creators(&query, 8),
+        SuggestionKind::Torrent(facet) => database.suggest_torrent_facet(facet, &query, 8),
+        _ => database.suggest_attribute_values(kind.database_kind(), &query, 8),
     }
 }
 

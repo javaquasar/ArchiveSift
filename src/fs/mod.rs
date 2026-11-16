@@ -45,3 +45,4 @@ pub trait DirectoryStrategy: Send + Sync {
     ) -> PathBuf;
 }
 pub mod torrent;
+pub(crate) mod torrent_metainfo;
