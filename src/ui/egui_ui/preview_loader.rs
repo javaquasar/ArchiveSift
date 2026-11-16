@@ -462,10 +462,17 @@ fn decode_with_queue_timing(
 fn decode_preview(source: PreviewSource) -> PreviewDecodeOutcome {
     let mut timings = ImageLoadTimings::default();
     let lazy_thumbnail = source.thumb_dir.join(thumb_rel_path(source.image_id));
-    let viewer_proxy = source
-        .thumb_dir
-        .join("viewer")
-        .join(thumb_rel_path(source.image_id));
+    let viewer_proxy = source.max_side.map(|max_side| {
+        let directory = if max_side == VIEWER_PROXY_MAX_SIDE {
+            "viewer".to_owned()
+        } else {
+            format!("viewer-{max_side}")
+        };
+        source
+            .thumb_dir
+            .join(directory)
+            .join(thumb_rel_path(source.image_id))
+    });
     let local_original = || {
         let local_path = source.local_file_path.as_deref()?;
         let local_path = PathBuf::from(local_path);
@@ -479,8 +486,8 @@ fn decode_preview(source: PreviewSource) -> PreviewDecodeOutcome {
 
     let (source_path, save_lazy_thumbnail, save_viewer_proxy) = match source.mode {
         ImageLoadMode::Original => {
-            if source.max_side.is_some() && viewer_proxy.is_file() {
-                (viewer_proxy.clone(), false, false)
+            if let Some(proxy) = viewer_proxy.as_ref().filter(|proxy| proxy.is_file()) {
+                (proxy.clone(), false, false)
             } else {
                 let Some(local_path) = local_original() else {
                     return PreviewDecodeOutcome::Unavailable;
@@ -534,10 +541,13 @@ fn decode_preview(source: PreviewSource) -> PreviewDecodeOutcome {
     };
     timings.decode = decode_started.elapsed();
     let transform_started = Instant::now();
+    let needs_proxy = source
+        .max_side
+        .is_some_and(|side| raw.width().max(raw.height()) > side);
     let decoded = match source.mode {
         ImageLoadMode::Preview => raw.thumbnail(PREVIEW_MAX_SIDE, PREVIEW_MAX_SIDE),
-        ImageLoadMode::Original => match source.max_side {
-            Some(max_side) => raw.thumbnail(max_side, max_side),
+        ImageLoadMode::Original => match source.max_side.filter(|_| needs_proxy) {
+            Some(side) => raw.thumbnail(side, side),
             None => raw,
         },
     };
@@ -550,10 +560,10 @@ fn decode_preview(source: PreviewSource) -> PreviewDecodeOutcome {
             }
         }
     }
-    if save_viewer_proxy {
-        if let Some(parent) = viewer_proxy.parent() {
+    if let Some(proxy) = viewer_proxy.filter(|_| save_viewer_proxy && needs_proxy) {
+        if let Some(parent) = proxy.parent() {
             if std::fs::create_dir_all(parent).is_ok() {
-                let _ = decoded.save(&viewer_proxy);
+                let _ = decoded.save(&proxy);
             }
         }
     }
@@ -1017,11 +1027,22 @@ mod tests {
         let proxy = root.join("thumbs").join("viewer").join(thumb_rel_path(11));
         assert!(proxy.is_file());
 
+        let cover_request = PreviewSource {
+            max_side: Some(2048),
+            ..request.clone()
+        };
+        let PreviewDecodeOutcome::Ready(cover) = decode_preview(cover_request.clone()) else {
+            panic!("cover proxy should use its own size limit");
+        };
+        assert_eq!(cover.image.size[0], 2048);
+
         std::fs::remove_file(&original).unwrap();
-        assert!(matches!(
-            decode_preview(request),
-            PreviewDecodeOutcome::Ready(_)
-        ));
+        for (source, width) in [(request, 4096), (cover_request, 2048)] {
+            let PreviewDecodeOutcome::Ready(decoded) = decode_preview(source) else {
+                panic!("cached proxy should decode");
+            };
+            assert_eq!(decoded.image.size[0], width);
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

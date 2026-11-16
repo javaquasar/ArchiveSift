@@ -8,7 +8,9 @@ use super::app_window::{
 use super::background_executor::spawn_background;
 use super::creator_filter::CreatorFilter;
 use super::download_status::DownloadStatus;
-use super::preview_loader::{ImageLoadMode, PreviewLoader, PreviewSource};
+use super::preview_loader::{
+    ImageLoadMode, PreviewLoader, PreviewRequestDisposition, PreviewSource,
+};
 use super::texture_cache::SizedLruCache;
 use crate::app::{parse_comma_list, AppConfig};
 use crate::db::Database;
@@ -20,6 +22,8 @@ use crate::services::torrent_library::{
     generated_directory, MoveProgress, TorrentLibrary, TorrentMovePlan,
 };
 use eframe::egui;
+
+const COVER_TEXTURE_MAX_SIDE: u32 = 2048;
 
 #[derive(Default)]
 struct Filters {
@@ -152,6 +156,7 @@ pub(super) struct TorrentLibraryUi {
     description: Option<(String, String)>,
     page: TorrentSummaryPage,
     selected: Option<Arc<TorrentCard>>,
+    cover_count: usize,
     edit: TorrentEdit,
     folder_name: String,
     inputs: [String; 3],
@@ -193,6 +198,7 @@ impl Default for TorrentLibraryUi {
                 total: 0,
             },
             selected: None,
+            cover_count: 0,
             edit: TorrentEdit::default(),
             folder_name: String::new(),
             inputs: Default::default(),
@@ -390,6 +396,7 @@ impl TorrentLibraryUi {
         self.actor_suggestions.clear();
         self.folder_name = card.directory_name().unwrap_or("").to_owned();
         self.organize_available = needs_organization(&card);
+        self.cover_count = leading_covers(&card);
         self.selected = Some(card);
         self.details_open = true;
         self.editing = false;
@@ -1075,30 +1082,56 @@ impl TorrentLibraryUi {
         if card.images.is_empty() {
             return;
         }
-        let primary = if self.editing {
-            self.edit
-                .primary_image_id
-                .and_then(|id| card.images.iter().find(|image| image.image_id == id))
-                .or_else(|| card.images.first())
+        let cover_count = self.cover_count.min(card.images.len());
+        let primary_index = if cover_count > 0 {
+            ui.heading("Cover");
+            for row in card.images[..cover_count].chunks(2) {
+                ui.columns(row.len(), |columns| {
+                    for (ui, image) in columns.iter_mut().zip(row) {
+                        self.preview(
+                            ui,
+                            config,
+                            image,
+                            egui::vec2(ui.available_width().max(1.0), f32::INFINITY),
+                            ImageLoadMode::Original,
+                        );
+                        if self.editing {
+                            self.primary_image_checkbox(ui, image.image_id);
+                        }
+                    }
+                });
+            }
+            None
         } else {
-            card.primary_image()
-        };
-        if let Some(image) = primary {
-            self.preview(ui, config, image, egui::vec2(280.0, 200.0));
+            let preferred = if self.editing {
+                self.edit.primary_image_id
+            } else {
+                card.primary_image_id
+            };
+            let index = preferred
+                .and_then(|id| card.images.iter().position(|image| image.image_id == id))
+                .unwrap_or_default();
+            let image = &card.images[index];
+            self.preview(
+                ui,
+                config,
+                image,
+                egui::vec2(280.0, 200.0),
+                ImageLoadMode::Preview,
+            );
             if self.editing {
                 self.primary_image_checkbox(ui, image.image_id);
             }
+            Some(index)
+        };
+        let count = card.images.len() - cover_count - usize::from(primary_index.is_some());
+        if count == 0 {
+            return;
+        }
+        if cover_count > 0 {
+            ui.heading("Screenshots");
         }
         let columns = (ui.available_width() / 118.0).floor().max(1.0) as usize;
-        let primary_index = primary.and_then(|image| {
-            card.images
-                .iter()
-                .position(|entry| entry.image_id == image.image_id)
-        });
-        let count = card
-            .images
-            .len()
-            .saturating_sub(usize::from(primary_index.is_some()));
         egui::ScrollArea::vertical()
             .id_salt(("torrent_thumbnails", card.page_id))
             .max_height(280.0)
@@ -1106,11 +1139,18 @@ impl TorrentLibraryUi {
                 for row in rows {
                     ui.horizontal(|ui| {
                         for slot in row * columns..((row + 1) * columns).min(count) {
-                            let index = slot
+                            let index = cover_count
+                                + slot
                                 + usize::from(primary_index.is_some_and(|index| slot >= index));
                             let image = &card.images[index];
                             ui.allocate_ui(egui::vec2(110.0, 92.0), |ui| {
-                                self.preview(ui, config, image, egui::vec2(70.0, 60.0));
+                                self.preview(
+                                    ui,
+                                    config,
+                                    image,
+                                    egui::vec2(70.0, 60.0),
+                                    ImageLoadMode::Preview,
+                                );
                                 if self.editing {
                                     self.primary_image_checkbox(ui, image.image_id);
                                 }
@@ -1536,16 +1576,24 @@ impl TorrentLibraryUi {
         config: &AppConfig,
         image: &TorrentImage,
         size: egui::Vec2,
+        mode: ImageLoadMode,
     ) {
-        let key = format!(
-            "torrent:{}:{}",
-            image.image_id,
-            image.local_file_path.as_deref().unwrap_or("")
-        );
+        let mut mode = mode;
+        let mut key = preview_key(image, mode);
+        if mode == ImageLoadMode::Original
+            && self
+                .loader
+                .as_ref()
+                .is_some_and(|loader| loader.is_unavailable(&key))
+        {
+            mode = ImageLoadMode::Preview;
+            key = preview_key(image, mode);
+        }
         if let Some(texture) = self.textures.get(&key) {
             if ui
                 .add(
                     egui::Image::new(texture)
+                        .fit_to_original_size(1.0)
                         .max_size(size)
                         .sense(egui::Sense::click()),
                 )
@@ -1554,7 +1602,7 @@ impl TorrentLibraryUi {
                 self.image_popup = Some(image.clone());
             }
         } else {
-            self.loader.get_or_insert_with(PreviewLoader::new).request(
+            let request = self.loader.get_or_insert_with(PreviewLoader::new).request(
                 PreviewSource {
                     key,
                     image_id: image.image_id,
@@ -1562,12 +1610,16 @@ impl TorrentLibraryUi {
                     thumb_dir: config.thumb_dir(),
                     local_file_path: image.local_file_path.clone(),
                     thumbnail_path: image.thumbnail_path.clone(),
-                    mode: ImageLoadMode::Preview,
-                    max_side: None,
+                    mode,
+                    max_side: (mode == ImageLoadMode::Original).then_some(COVER_TEXTURE_MAX_SIDE),
                 },
                 ui.ctx(),
             );
-            ui.label("Image preview…");
+            ui.label(if request == PreviewRequestDisposition::Unavailable {
+                "Image unavailable"
+            } else {
+                "Image preview…"
+            });
         }
     }
     fn preview_window(&mut self, ctx: &egui::Context, config: &AppConfig) {
@@ -1577,14 +1629,67 @@ impl TorrentLibraryUi {
         let mut open = true;
         egui::Window::new("Torrent image")
             .open(&mut open)
+            .default_size(egui::vec2(800.0, 700.0))
+            .vscroll(true)
+            .hscroll(true)
             .show(ctx, |ui| {
-                self.preview(ui, config, &image, egui::vec2(800.0, 700.0));
+                self.preview(
+                    ui,
+                    config,
+                    &image,
+                    egui::Vec2::splat(f32::INFINITY),
+                    ImageLoadMode::Original,
+                );
                 self.primary_image_checkbox(ui, image.image_id);
             });
         if !open {
             self.image_popup = None;
         }
     }
+}
+
+fn preview_key(image: &TorrentImage, mode: ImageLoadMode) -> String {
+    let kind = match mode {
+        ImageLoadMode::Preview => "torrent",
+        ImageLoadMode::Original => "torrent:original",
+    };
+    format!(
+        "{kind}:{}:{}",
+        image.image_id,
+        image.local_file_path.as_deref().unwrap_or("")
+    )
+}
+
+fn leading_covers(card: &TorrentCard) -> usize {
+    let Some(directory) = &card.directory else {
+        return 0;
+    };
+    let prefix = format!(
+        "{}/images/",
+        directory.replace('\\', "/").trim_end_matches('/')
+    )
+    .to_ascii_lowercase();
+    let mut leading = 0;
+    for (index, image) in card.images.iter().enumerate() {
+        let Some(path) = image.local_file_path.as_deref() else {
+            continue;
+        };
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
+        if let Some(relative) = normalized
+            .strip_prefix(&prefix)
+            .filter(|path| !path.is_empty())
+        {
+            if relative.contains('/') {
+                // Subfolders are created for source image sections. The preceding
+                // files kept at the top level are the cover pages.
+                return leading;
+            }
+            if index == leading {
+                leading += 1;
+            }
+        }
+    }
+    0
 }
 
 fn folder_button(ui: &mut egui::Ui, config: &AppConfig, enabled: bool) -> bool {
@@ -2327,6 +2432,119 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&snapshot, editor.selected.as_ref().unwrap()));
         assert_eq!(snapshot.images.len(), 200);
+    }
+
+    #[test]
+    fn grouped_torrent_draws_two_original_cover_pages_side_by_side_above_screenshots() {
+        let (_root, config, _, mut editor, ctx) = fixture();
+        let mut card = editor.selected.as_deref().unwrap().clone();
+        let directory = card.directory.as_deref().unwrap();
+        let fixtures = [
+            ("images/001.png", [500, 695], [255u8, 0, 0]),
+            ("images/002.png", [490, 695], [0, 255, 0]),
+            ("images/01 - Scenes/003.png", [600, 400], [0, 0, 255]),
+        ];
+        card.images = fixtures
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, [width, height], color))| {
+                let relative = std::path::Path::new(directory).join(path);
+                let absolute = config.effective_download_dir().join(&relative);
+                std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+                image::RgbImage::from_pixel(width, height, image::Rgb(color))
+                    .save(&absolute)
+                    .unwrap();
+                TorrentImage {
+                    image_id: index as i64 + 1,
+                    source_url: format!("https://example.test/assets/{index}.png"),
+                    local_file_path: Some(relative.to_string_lossy().into_owned()),
+                    thumbnail_path: None,
+                }
+            })
+            .collect();
+        card.primary_image_id = Some(card.images[2].image_id);
+        editor.select(card);
+        let card = editor.selected.clone().unwrap();
+        assert_eq!(editor.cover_count, 2);
+
+        let cover_keys = card.images[..2]
+            .iter()
+            .map(|image| preview_key(image, ImageLoadMode::Original))
+            .collect::<Vec<_>>();
+        let screenshot_key = preview_key(&card.images[2], ImageLoadMode::Preview);
+        let frame = |editor: &mut TorrentLibraryUi, width| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    editor.install_previews(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        editor.render_gallery(ui, &config, &card);
+                    });
+                },
+            )
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let output = loop {
+            let output = frame(&mut editor, 1200.0);
+            if cover_keys
+                .iter()
+                .chain([&screenshot_key])
+                .all(|key| editor.textures.contains_key(key))
+            {
+                break output;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cover and screenshot textures did not load"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let texture_ids = [
+            editor.textures.get(&cover_keys[0]).unwrap().id(),
+            editor.textures.get(&cover_keys[1]).unwrap().id(),
+            editor.textures.get(&screenshot_key).unwrap().id(),
+        ];
+        fn rect_for(texture: egui::TextureId, output: &egui::FullOutput) -> egui::Rect {
+            fn find(shape: &egui::Shape, texture: egui::TextureId) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Rect(rect) => rect
+                        .brush
+                        .as_ref()
+                        .filter(|brush| brush.fill_texture_id == texture)
+                        .map(|_| rect.rect),
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().find_map(|shape| find(shape, texture))
+                    }
+                    _ => None,
+                }
+            }
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| find(&shape.shape, texture))
+                .unwrap()
+        }
+        let [left, right, screenshot] = texture_ids.map(|texture| rect_for(texture, &output));
+        assert_eq!(left.size(), egui::vec2(500.0, 695.0));
+        assert_eq!(right.size(), egui::vec2(490.0, 695.0));
+        assert_eq!(left.top(), right.top());
+        assert!(left.right() <= right.left());
+        assert!(screenshot.top() > left.bottom().max(right.bottom()));
+        assert!(screenshot.width() <= 70.0);
+
+        let narrow = frame(&mut editor, 480.0);
+        let [left, right, screenshot] = texture_ids.map(|texture| rect_for(texture, &narrow));
+        assert_eq!(left.top(), right.top());
+        assert!(left.right() <= right.left() && right.right() < 480.0);
+        assert!((left.width() / left.height() - 500.0 / 695.0).abs() < 0.01);
+        assert!((right.width() / right.height() - 490.0 / 695.0).abs() < 0.01);
+        assert!(screenshot.top() > left.bottom().max(right.bottom()));
     }
 
     #[test]
