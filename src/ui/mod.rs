@@ -447,6 +447,10 @@ pub enum UiCommand {
     DownloadTorrentFile {
         url: String,
     },
+    ImportTorrentFile {
+        url: String,
+        file: std::path::PathBuf,
+    },
     RepairSavedCollection {
         url: String,
     },

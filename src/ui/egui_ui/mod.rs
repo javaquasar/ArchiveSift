@@ -629,6 +629,35 @@ impl DesktopApp {
         }
     }
 
+    fn import_torrent_file(&mut self, url: String, file: std::path::PathBuf) {
+        if self.window.storage_settings_applying() || !self.window.config.has_download_folder() {
+            return;
+        }
+        let database_path = self.window.config.database_path.clone();
+        let base_dir = self.window.config.effective_download_dir();
+        let queue = Arc::clone(&self.queue_service);
+        let tx = self.state_tx.clone();
+        if let Err(error) = spawn_background(move || {
+            let library = crate::services::torrent_library::TorrentLibrary::new(
+                Database::new(&database_path),
+                &base_dir,
+            );
+            let result = library
+                .import_torrent(&queue.registry(), &url, &file)
+                .and_then(|_| {
+                    queue.finish_imported_torrent(&url)?;
+                    Ok(())
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(WorkerState::TorrentImported {
+                database_path,
+                result,
+            });
+        }) {
+            self.window.torrent_import_finished(Err(error));
+        }
+    }
+
     fn start_import_url_file(&mut self, file_path: String) {
         let window = &mut self.window;
         if !window.config.has_download_folder() {
@@ -1369,6 +1398,14 @@ impl DesktopApp {
                     self.window.page_download_finished(&url, &message, repair);
                     self.window.image_access.invalidate();
                 }
+                WorkerState::TorrentImported {
+                    database_path,
+                    result,
+                } => {
+                    if self.window.config.database_path == database_path {
+                        self.window.torrent_import_finished(result);
+                    }
+                }
                 WorkerState::ImageAccessLoaded {
                     database_path,
                     result,
@@ -2022,6 +2059,7 @@ impl DesktopApp {
                 } => {
                     self.load_image_access(Some((extension_id, origin, action)));
                 }
+                UiCommand::ImportTorrentFile { url, file } => self.import_torrent_file(url, file),
                 UiCommand::DownloadTorrentFile { url } => {
                     if self.window.config.has_download_folder()
                         && !self.window.storage_settings_applying()
@@ -2230,6 +2268,10 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    TorrentImported {
+        database_path: String,
+        result: Result<(), String>,
+    },
     ImageAccessLoaded {
         database_path: String,
         result: Result<Vec<crate::db::image_access::ImageAccessGroup>, String>,

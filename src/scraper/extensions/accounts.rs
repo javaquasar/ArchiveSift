@@ -429,6 +429,9 @@ impl<'a> LoginFlow<'a> {
                     .body(body.bytes().to_vec());
             }
             let response = request.send().await.map_err(|_| AccountError::Network)?;
+            if crate::http::requires_browser_verification(response.headers()) {
+                return Err(AccountError::BrowserRequired);
+            }
             if response.status().is_redirection() {
                 let target = response
                     .headers()

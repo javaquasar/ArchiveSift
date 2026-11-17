@@ -88,6 +88,16 @@ impl<'a> TorrentMetainfo<'a> {
         Ok(magnet)
     }
 
+    pub(crate) fn name(&self) -> Option<String> {
+        [b"name.utf-8".as_slice(), b"name"]
+            .into_iter()
+            .filter_map(|key| field(self.info, key).and_then(string))
+            .filter_map(|name| std::str::from_utf8(name).ok())
+            .map(str::trim)
+            .find(|name| !name.is_empty())
+            .map(str::to_owned)
+    }
+
     pub(crate) fn file_names(&self) -> Vec<String> {
         let encoding = field(self.root, b"encoding")
             .and_then(string)

@@ -98,6 +98,9 @@ impl HttpBroker {
                 builder = builder.body(body.clone());
             }
             let response = builder.send().await?;
+            if crate::http::requires_browser_verification(response.headers()) {
+                return Err(crate::error::BrowserVerificationRequired.into());
+            }
             if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 let location = response
                     .headers()

@@ -61,6 +61,17 @@ impl Display for IncompleteContent {
 impl Error for IncompleteContent {}
 
 #[derive(Debug)]
+pub(crate) struct BrowserVerificationRequired;
+
+impl Display for BrowserVerificationRequired {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The site requires browser verification. Open the source in your browser and complete the verification there.")
+    }
+}
+
+impl Error for BrowserVerificationRequired {}
+
+#[derive(Debug)]
 pub enum HttpClientError {
     RequestFailed { url: String, source: reqwest::Error },
     ResponseTooLarge { url: String, max_bytes: usize },

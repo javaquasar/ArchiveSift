@@ -48,7 +48,10 @@ pub(crate) fn download_failure_kind(
     use crate::error::{IncompleteAttachments, IncompleteContent};
     let mut fallback = QueueFailureKind::Download;
     loop {
-        use crate::error::FileStoreError;
+        use crate::error::{BrowserVerificationRequired, FileStoreError};
+        if error.is::<BrowserVerificationRequired>() {
+            return QueueFailureKind::BrowserVerification;
+        }
         if let Some(incomplete) = error.downcast_ref::<IncompleteContent>() {
             let images = download_failure_kind(incomplete.images.as_ref());
             let attachments = download_failure_kind(incomplete.attachments.as_ref());
@@ -60,6 +63,7 @@ pub(crate) fn download_failure_kind(
                         QueueFailureKind::Storage
                             | QueueFailureKind::RateLimit
                             | QueueFailureKind::Authorization
+                            | QueueFailureKind::BrowserVerification
                     )
                 })
                 .unwrap_or(attachments);
@@ -69,7 +73,15 @@ pub(crate) fn download_failure_kind(
                 .failures
                 .iter()
                 .map(|(_, cause)| download_failure_kind(cause.as_ref()))
-                .find(|kind| *kind != QueueFailureKind::Download)
+                .find(|kind| {
+                    matches!(
+                        kind,
+                        QueueFailureKind::Authorization
+                            | QueueFailureKind::BrowserVerification
+                            | QueueFailureKind::RateLimit
+                            | QueueFailureKind::Storage
+                    )
+                })
                 .unwrap_or(QueueFailureKind::Attachment);
         }
         if error.is::<StorageUnavailable>()
@@ -755,6 +767,15 @@ impl UrlQueueService {
              WHERE state = 'failed' AND url = ?1",
             [url],
         )? == 1)
+    }
+
+    pub(crate) fn finish_imported_torrent(&self, url: &str) -> rusqlite::Result<()> {
+        let connection = self.store.connection.lock().unwrap();
+        connection.execute(
+            "DELETE FROM queue_items WHERE url = ?1 AND state = 'failed' AND torrent_only = 1",
+            [url],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn remove_failed_downloads(&self, urls: &[String]) -> rusqlite::Result<usize> {

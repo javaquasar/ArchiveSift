@@ -155,7 +155,9 @@ pub(crate) fn torrent_magnet(bytes: &[u8]) -> AppResult<String> {
 }
 
 fn relative_path(site_key: &str, page_id: i64, source: &str, name: &str) -> PathBuf {
-    let clean = |s: &str| {
+    const NAME_LIMIT: usize = 100;
+    const TORRENT_SUFFIX: &str = ".torrent";
+    let clean = |s: &str, limit: usize| {
         s.chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
@@ -164,21 +166,30 @@ fn relative_path(site_key: &str, page_id: i64, source: &str, name: &str) -> Path
                     '_'
                 }
             })
-            .take(100)
+            .take(limit)
             .collect::<String>()
             .trim_matches('.')
             .to_string()
     };
+    let filename = if is_torrent_file(name) {
+        let stem = &name[..name.len() - TORRENT_SUFFIX.len()];
+        format!(
+            "{}{TORRENT_SUFFIX}",
+            clean(stem, NAME_LIMIT - TORRENT_SUFFIX.len())
+        )
+    } else {
+        clean(name, NAME_LIMIT)
+    };
     let hash = sha2::Sha256::digest(source.as_bytes());
-    PathBuf::from(clean(site_key))
+    PathBuf::from(clean(site_key, NAME_LIMIT))
         .join("attachments")
         .join(page_id.to_string())
-        .join(format!("{:.12}_{}", format!("{hash:x}"), clean(name)))
+        .join(format!("{:.12}_{filename}", format!("{hash:x}")))
 }
 
-fn stored_relative_path(
+pub(super) fn stored_relative_path(
     database: &Database,
-    page: &ScrapedItem,
+    site_key: &str,
     page_id: i64,
     source: &str,
     name: &str,
@@ -186,7 +197,7 @@ fn stored_relative_path(
     if let Some(path) = database.attachment_path(page_id, source)? {
         return Ok(path);
     }
-    let old = relative_path(&page.site_key, page_id, source, name);
+    let old = relative_path(site_key, page_id, source, name);
     Ok(match database.torrent_directory(page_id)? {
         Some(directory) => directory.join(old.file_name().ok_or("attachment has no filename")?),
         None => old,
@@ -288,7 +299,7 @@ async fn save_attachment(
         .source_url
         .as_deref()
         .ok_or("attachment has no download URL")?;
-    let relative = stored_relative_path(database, page, page_id, url, &attribute.label)?;
+    let relative = stored_relative_path(database, &page.site_key, page_id, url, &attribute.label)?;
     let path = if torrent_only {
         super::torrent_library::checked_path(
             &base_dir.canonicalize()?,
@@ -368,7 +379,13 @@ async fn save_magnet(
     if !valid_magnet(magnet) {
         return Err("invalid magnet reference".into());
     }
-    let relative = stored_relative_path(database, page, page_id, magnet, "download.magnet.txt")?;
+    let relative = stored_relative_path(
+        database,
+        &page.site_key,
+        page_id,
+        magnet,
+        "download.magnet.txt",
+    )?;
     let path = base_dir.join(&relative);
     let text = format!("{magnet}\n");
     let already_saved = tokio::fs::metadata(&path)

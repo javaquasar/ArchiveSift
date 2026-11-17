@@ -506,6 +506,66 @@ fn manifest_limits_and_paths_are_checked_before_reading_the_module() {
 }
 
 #[tokio::test]
+async fn broker_distinguishes_browser_verification_from_plain_http_errors() {
+    use crate::models::QueueFailureKind;
+    use crate::services::url_queue::download_failure_kind;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for challenge in [true, true, false] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            stream.read(&mut request).await.unwrap();
+            let headers = if challenge {
+                "cf-mitigated: challenge\r\n"
+            } else {
+                ""
+            };
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let mut manifest = manifest();
+    manifest.allow_http = true;
+    manifest.network_origins = vec![origin.clone()];
+    let broker = HttpBroker::new(&manifest).unwrap();
+    let challenge = broker
+        .fetch(&archive_sift_scraper_api::FetchRequest::get(&origin))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        download_failure_kind(challenge.as_ref()),
+        QueueFailureKind::BrowserVerification
+    );
+    let challenge = broker
+        .attachment(&origin)
+        .await
+        .err()
+        .expect("challenge error");
+    let attachments = crate::error::IncompleteAttachments {
+        failures: vec![("release.torrent".into(), challenge)],
+    };
+    assert_eq!(
+        download_failure_kind(&attachments),
+        QueueFailureKind::BrowserVerification
+    );
+    let plain = broker
+        .attachment(&origin)
+        .await
+        .err()
+        .expect("HTTP 403 error");
+    assert_eq!(
+        download_failure_kind(plain.as_ref()),
+        QueueFailureKind::Authorization
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn broker_bounds_chunked_bodies_without_a_content_length() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

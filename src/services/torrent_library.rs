@@ -11,8 +11,14 @@ use super::attachments::{
     description_path, description_text, DESCRIPTION_FILENAME, DESCRIPTION_SOURCE,
 };
 use crate::db::Database;
-use crate::fs::torrent::{production_year, safe_component, torrent_directory_with_year};
-use crate::models::{TorrentCard, TorrentEdit, TorrentField};
+use crate::fs::torrent::{
+    is_torrent_file, production_year, safe_component, torrent_directory_with_year,
+};
+use crate::fs::torrent_metainfo::TorrentMetainfo;
+use crate::models::{
+    MetadataAttribute, PageKind, ScrapedItem, TorrentCard, TorrentEdit, TorrentField,
+};
+use crate::scraper::ScraperRegistry;
 use crate::AppResult;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,6 +66,145 @@ impl TorrentLibrary {
             database,
             base_dir: base_dir.into(),
         }
+    }
+
+    /// Adds a browser-downloaded torrent to the selected source page.
+    /// A page blocked before its first scrape gets a card with just the local torrent.
+    pub fn import_torrent(
+        &self,
+        registry: &ScraperRegistry,
+        source_url: &str,
+        file: &Path,
+    ) -> AppResult<i64> {
+        let scraper = registry
+            .scraper_for_url(source_url)
+            .filter(|scraper| scraper.classify_url(source_url) == PageKind::Content)
+            .ok_or("Enable the extension for this source page before importing its torrent.")?;
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| is_torrent_file(name))
+            .ok_or("Select a .torrent file.")?;
+        let bytes = read_import_torrent(file)?;
+        let torrent = TorrentMetainfo::parse(&bytes)?;
+        let file_names = torrent.file_names();
+        if file_names.is_empty() {
+            return Err("The .torrent file contains no file entries.".into());
+        }
+
+        let root = self.base_dir.canonicalize()?;
+        if !root.is_dir() {
+            return Err("Library storage is not a directory.".into());
+        }
+        self.database.initialize()?;
+        let current_page = self.database.saved_page_location(source_url)?;
+        let page_url = current_page.as_ref().map_or(source_url, |(_, _, url)| url);
+        let lock = self.database.content_lock(page_url);
+        let busy = "This card is being updated. Try again when the operation finishes.";
+        let _guard = lock.try_lock().map_err(|_| busy)?;
+        let _lease = self.database.try_content_lease(page_url)?.ok_or(busy)?;
+        self.recover_page_locked(page_url)?;
+
+        const IMPORT_SOURCE: &str = "archivesift:imported-torrent";
+        let page_id = match self.database.saved_page_location(page_url)? {
+            Some((id, true, _)) => id,
+            Some((_, false, _)) => return Err("This source already has a non-torrent card.".into()),
+            None => {
+                self.database
+                    .upsert_scraped_item(&ScrapedItem {
+                        site_key: scraper.site_key().to_owned(),
+                        page_url: page_url.to_owned(),
+                        title: torrent
+                            .name()
+                            .unwrap_or_else(|| name[..name.len() - ".torrent".len()].into()),
+                        raw_html: String::new(),
+                        images: Vec::new(),
+                        attributes: vec![MetadataAttribute {
+                            kind: "attachment".into(),
+                            label: "imported.torrent".into(),
+                            value: String::new(),
+                            source_url: None,
+                            is_female: None,
+                        }],
+                    })?
+                    .page_id
+            }
+        };
+        let card = self.database.torrent_card(page_id)?;
+        let mut torrent_links = card
+            .attributes
+            .iter()
+            .filter(|attribute| attribute.kind == "attachment" && is_torrent_file(&attribute.label))
+            .filter_map(|attribute| attribute.source_url.as_deref());
+        let first_link = torrent_links.next();
+        let attachment_source = match self.database.attachment_path(page_id, IMPORT_SOURCE)? {
+            Some(_) => IMPORT_SOURCE,
+            None => first_link
+                .filter(|_| torrent_links.next().is_none())
+                .unwrap_or(IMPORT_SOURCE),
+        };
+        let filename = format!(
+            "{}.torrent",
+            safe_component(
+                file.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(""),
+                "imported",
+                95,
+            )
+        );
+        let stored = super::attachments::stored_relative_path(
+            &self.database,
+            &card.site_key,
+            page_id,
+            attachment_source,
+            &filename,
+        )?;
+        let mut previous_file = None;
+        let relative = if is_torrent_file(&stored.to_string_lossy()) {
+            stored
+        } else {
+            let previous = checked_path(&root, &stored.to_string_lossy())?;
+            if previous.try_exists()? {
+                if read_import_torrent(&previous)? != bytes {
+                    return Err(
+                        "This card already has a different .torrent file at that location.".into(),
+                    );
+                }
+                previous_file = Some(previous);
+            }
+            stored.with_extension("torrent")
+        };
+        let path = checked_path(&root, &relative.to_string_lossy())?;
+        match fs::metadata(&path) {
+            Ok(_) if read_import_torrent(&path)? != bytes => {
+                return Err(
+                    "This card already has a different .torrent file at that location.".into(),
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path.parent().ok_or("Torrent file has no parent folder.")?;
+                fs::create_dir_all(parent)?;
+                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+                temporary.write_all(&bytes)?;
+                temporary.as_file().sync_all()?;
+                temporary.persist_noclobber(&path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.database.save_torrent_file(
+            page_id,
+            attachment_source,
+            &filename,
+            &relative.to_string_lossy(),
+            &file_names,
+            true,
+        )?;
+        if let Some(previous_file) = previous_file {
+            fs::remove_file(previous_file)?;
+        }
+        Ok(page_id)
     }
 
     pub(crate) fn local_folder(&self, page_id: i64) -> AppResult<PathBuf> {
@@ -912,6 +1057,20 @@ pub(crate) fn checked_path(root: &Path, relative: &str) -> AppResult<PathBuf> {
     Ok(current)
 }
 
+fn read_import_torrent(path: &Path) -> AppResult<Vec<u8>> {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    if !fs::metadata(path)?.is_file() {
+        return Err("Select a regular .torrent file.".into());
+    }
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err("Torrent file exceeds the 8 MiB limit.".into());
+    }
+    Ok(bytes)
+}
+
 fn list_files(directory: &Path) -> AppResult<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -1034,6 +1193,58 @@ fn prune_empty(mut directory: Option<&Path>, root: &Path) {
 mod tests {
     use super::*;
     use crate::models::{MetadataAttribute, ScrapedItem};
+
+    #[test]
+    fn imports_browser_torrent_for_an_unsaved_card_and_reuses_the_same_file() {
+        const TORRENT: &[u8] = b"d4:infod6:lengthi1e4:name16:feature-clip.mp4ee";
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("library");
+        fs::create_dir(&base).unwrap();
+        let db = Database::new(root.path().join("library.sqlite3"));
+        let library = TorrentLibrary::new(db.clone(), &base);
+        let registry = ScraperRegistry::with_public_scrapers();
+        let url = "https://demo.example.test/galleries/example";
+        let file = root
+            .path()
+            .join(format!("{}.torrent", "browser".repeat(16)));
+
+        fs::write(&file, b"<html>Verification</html>").unwrap();
+        assert!(library.import_torrent(&registry, url, &file).is_err());
+        db.initialize().unwrap();
+        assert!(db.saved_page_location(url).unwrap().is_none());
+
+        fs::write(&file, TORRENT).unwrap();
+        let id = library.import_torrent(&registry, url, &file).unwrap();
+        assert_eq!(library.import_torrent(&registry, url, &file).unwrap(), id);
+        let card = db.torrent_card(id).unwrap();
+        assert_eq!(card.title, "feature-clip.mp4");
+        assert_eq!(card.page_url, url);
+        assert_eq!(card.attachments.len(), 1);
+        let stored = base.join(&card.attachments[0].local_file_path);
+        assert_eq!(stored.extension().unwrap(), "torrent");
+        assert_eq!(fs::read(&stored).unwrap(), TORRENT);
+        assert!(card.has_downloaded_torrent(&base));
+
+        let legacy = stored.with_extension("torr");
+        fs::rename(&stored, &legacy).unwrap();
+        let attachment = &card.attachments[0];
+        db.save_page_attachment(
+            id,
+            &attachment.source_url,
+            &attachment.filename,
+            &legacy.strip_prefix(&base).unwrap().to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(library.import_torrent(&registry, url, &file).unwrap(), id);
+        let card = db.torrent_card(id).unwrap();
+        assert_eq!(card.attachments.len(), 1);
+        assert_eq!(base.join(&card.attachments[0].local_file_path), stored);
+        assert!(!legacy.exists());
+
+        fs::write(&file, b"d4:infod6:lengthi2e4:name16:feature-clip.mp4ee").unwrap();
+        assert!(library.import_torrent(&registry, url, &file).is_err());
+        assert_eq!(fs::read(stored).unwrap(), TORRENT);
+    }
 
     #[test]
     fn catalog_dates_and_durations_validate_when_changed() {

@@ -49,6 +49,12 @@ impl LimitedHttpResponse {
     }
 }
 
+pub(crate) fn requires_browser_verification(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("cf-mitigated")
+        .is_some_and(|value| value == "challenge")
+}
+
 pub(crate) fn shared_request_limiter() -> &'static RequestLimiter {
     static LIMITER: OnceLock<RequestLimiter> = OnceLock::new();
     LIMITER.get_or_init(|| RequestLimiter::new(MAX_GLOBAL_HTTP_REQUESTS))

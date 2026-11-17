@@ -1587,6 +1587,15 @@ impl AppWindow {
         }
     }
 
+    pub(super) fn torrent_import_finished(&mut self, result: Result<(), String>) {
+        let message = match result {
+            Ok(()) => "Torrent imported. Open the card in Torrents.".into(),
+            Err(error) => format!("Could not import torrent: {error}"),
+        };
+        self.log.push(message.clone());
+        self.failure_feedback = Some(message);
+    }
+
     pub(super) fn failed_downloads_removed(&mut self, result: rusqlite::Result<usize>) {
         let message = match result {
             Ok(0) => "The selected downloads have already left the failure list.".into(),
@@ -1945,6 +1954,25 @@ impl AppWindow {
                                                         });
                                                 }
                                                 ui.hyperlink_to("Open source", &failure.url);
+                                                if failure.kind == QueueFailureKind::BrowserVerification
+                                                    && ui.add_enabled(
+                                                        storage_ready && self.config.has_download_folder(),
+                                                        egui::Button::new("Import .torrent"),
+                                                    )
+                                                    .on_hover_text("Choose the .torrent downloaded from this source in your browser")
+                                                    .clicked()
+                                                {
+                                                    if let Some(file) = rfd::FileDialog::new()
+                                                        .set_title("Choose the .torrent downloaded from this source")
+                                                        .add_filter("Torrent file", &["torrent"])
+                                                        .pick_file()
+                                                    {
+                                                        self.pending_command = Some(UiCommand::ImportTorrentFile {
+                                                            url: failure.url.clone(),
+                                                            file,
+                                                        });
+                                                    }
+                                                }
                                             });
                                             ui.separator();
                                         });

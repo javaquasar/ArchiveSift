@@ -252,6 +252,7 @@ pub struct QueueSnapshot {
 pub enum QueueFailureKind {
     Storage,
     Authorization,
+    BrowserVerification,
     RateLimit,
     Attachment,
     #[default]
@@ -259,9 +260,10 @@ pub enum QueueFailureKind {
 }
 
 impl QueueFailureKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Storage,
         Self::Authorization,
+        Self::BrowserVerification,
         Self::RateLimit,
         Self::Attachment,
         Self::Download,
@@ -271,6 +273,7 @@ impl QueueFailureKind {
         match self {
             Self::Storage => "Storage",
             Self::Authorization => "Authorization",
+            Self::BrowserVerification => "Browser verification",
             Self::RateLimit => "Download limit",
             Self::Attachment => "Attachment",
             Self::Download => "Download",
@@ -281,6 +284,7 @@ impl QueueFailureKind {
         match self {
             Self::Storage => "storage",
             Self::Authorization => "authorization",
+            Self::BrowserVerification => "browser_verification",
             Self::RateLimit => "rate_limit",
             Self::Attachment => "attachment",
             Self::Download => "download",
