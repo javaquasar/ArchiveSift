@@ -84,11 +84,13 @@ pub(super) struct SqlQueryResult {
 struct SearchForm {
     text: String,
     site_key: String,
+    catalog_profile: String,
     tags: String,
     actors: String,
     creators: CreatorFilter,
     categories: String,
     studios: String,
+    manufacturers: String,
     channels: String,
     favorites_only: bool,
 }
@@ -99,15 +101,26 @@ impl SearchForm {
         (!key.is_empty()).then(|| key.to_owned())
     }
 
+    fn profile_filter(&self) -> Option<String> {
+        let profile = self.catalog_profile.trim();
+        (!profile.is_empty()).then(|| profile.to_owned())
+    }
+
     fn to_query(&self) -> SearchQuery {
         SearchQuery {
             text: self.text.trim().to_string(),
             site_key: self.site_filter(),
+            catalog_profile: self.profile_filter(),
             tags: split_filter_values(&self.tags),
             actors: split_filter_values(&self.actors),
             creators: self.creators.values(),
             categories: split_filter_values(&self.categories),
             studios: split_filter_values(&self.studios),
+            manufacturers: Some(self.manufacturers.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
             channels: split_filter_values(&self.channels),
             favorites_only: self.favorites_only,
             page_id: None,
@@ -197,6 +210,7 @@ pub struct AppWindow {
     search_form: SearchForm,
     applied_search: SearchQuery,
     library_sites: Option<Vec<String>>,
+    library_profiles: Vec<String>,
     pub(super) download_status: DownloadStatus,
     download_refresh: bool,
     search_filters_open: bool,
@@ -220,6 +234,7 @@ pub struct AppWindow {
     actor_suggestions: Vec<String>,
     category_suggestions: Vec<String>,
     studio_suggestions: Vec<String>,
+    manufacturer_suggestions: Vec<String>,
     last_tag_query: String,
     last_actor_query: String,
     last_category_query: String,
@@ -312,6 +327,7 @@ pub struct AppWindow {
     date_browse_total: usize,
     /// Source captured by the latest date-group request.
     date_browse_site_key: Option<String>,
+    date_browse_profile: Option<String>,
     /// `true` = older first (ascending); `false` = newer first (descending, default).
     date_browse_asc: bool,
     /// When `true`, groups with ≥ `date_browse_fav_threshold` favorites are hidden.
@@ -361,6 +377,7 @@ impl AppWindow {
             search_form: SearchForm::default(),
             applied_search: SearchQuery::default(),
             library_sites: None,
+            library_profiles: Vec::new(),
             download_status: DownloadStatus::default(),
             download_refresh: false,
             search_filters_open: false,
@@ -379,6 +396,7 @@ impl AppWindow {
             actor_suggestions: Vec::new(),
             category_suggestions: Vec::new(),
             studio_suggestions: Vec::new(),
+            manufacturer_suggestions: Vec::new(),
             last_tag_query: String::new(),
             last_actor_query: String::new(),
             last_category_query: String::new(),
@@ -435,6 +453,7 @@ impl AppWindow {
             date_browse_current: None,
             date_browse_total: 0,
             date_browse_site_key: None,
+            date_browse_profile: None,
             date_browse_asc: false,
             date_browse_fav_enabled: true,
             date_browse_fav_threshold: 3,
@@ -466,6 +485,7 @@ impl AppWindow {
                 SearchRefresh::Query(SearchQuery {
                     page_id: self.date_browse_current.as_ref().map(|group| group.page_id),
                     site_key: self.date_browse_site_key.clone(),
+                    catalog_profile: self.date_browse_profile.clone(),
                     ..Default::default()
                 })
             } else {
@@ -682,6 +702,12 @@ impl AppWindow {
         }
     }
 
+    pub fn set_manufacturer_suggestions(&mut self, query: &str, suggestions: Vec<String>) {
+        if self.search_form.manufacturers.trim() == query {
+            self.manufacturer_suggestions = suggestions;
+        }
+    }
+
     pub fn set_studio_suggestions(&mut self, query: &str, suggestions: Vec<String>) {
         if last_comma_token(&self.search_form.studios) == query {
             self.studio_suggestions = suggestions.clone();
@@ -756,6 +782,9 @@ impl AppWindow {
     }
 
     pub fn render(&mut self, ctx: &egui::Context) {
+        if self.knife_import.poll() {
+            self.invalidate_library_sites();
+        }
         if self.appearance_applied != Some(self.config.appearance) {
             super::appearance::apply(ctx, self.config.appearance);
             self.appearance_applied = Some(self.config.appearance);
@@ -850,6 +879,7 @@ impl AppWindow {
             || self.raw_settings.as_ref().is_some_and(|e| e.busy())
             || self.queue_worker_running
             || self.import_running
+            || self.knife_import.importing()
             || self.sql_running
             || self.sql_export_running
             || self.date_browse_loading
@@ -1041,8 +1071,12 @@ impl AppWindow {
                         editor.render(ui, &self.config, busy, applying)
                     }
                     SettingsPage::Import => {
-                        self.knife_import
-                            .render(ui, self.config.effective_download_dir());
+                        self.knife_import.render(
+                            ui,
+                            self.config.effective_download_dir(),
+                            self.config.database_path.clone().into(),
+                            busy,
+                        );
                         None
                     }
                     SettingsPage::Storage => unreachable!(),
@@ -1472,8 +1506,9 @@ impl AppWindow {
             .then_some((self.failure_kind, self.failure_offset))
     }
 
-    pub(super) fn set_library_sites(&mut self, sites: Vec<String>) {
+    pub(super) fn set_library_sources(&mut self, sites: Vec<String>, profiles: Vec<String>) {
         self.library_sites = Some(sites);
+        self.library_profiles = profiles;
     }
 
     pub(super) fn begin_library_sites_load(&mut self) -> bool {
@@ -2359,7 +2394,9 @@ impl AppWindow {
                                 metadata_to_request.insert(result.image_id);
                             }
                             ui.add(egui::Label::new(egui::RichText::new(result.page_title()).heading()).wrap().selectable(true));
-                            ui.hyperlink_to("Open scene/page", result.page_url());
+                            if !result.page_url().starts_with("urn:archivesift:knife:") {
+                                ui.hyperlink_to("Open scene/page", result.page_url());
+                            }
                             if self.download_status.render(ui, &self.config, result.page_id(), result.page_url()) {
                                 self.pending_command = Some(UiCommand::RepairPageImages { url: result.page_url().to_owned() });
                             }
@@ -2787,6 +2824,45 @@ impl AppWindow {
         });
     }
 
+    fn render_image_source_selector(&mut self, ui: &mut egui::Ui) {
+        let site = &mut self.search_form.site_key;
+        let profile = &mut self.search_form.catalog_profile;
+        let label = if !profile.is_empty() {
+            format!("{} (group)", profile_name(profile))
+        } else if !site.is_empty() {
+            truncate(site, 18)
+        } else {
+            "All sites".to_owned()
+        };
+        egui::ComboBox::from_id_salt("search_site_filter")
+            .width(108.0)
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(site.is_empty() && profile.is_empty(), "All sites")
+                    .clicked()
+                {
+                    site.clear();
+                    profile.clear();
+                }
+                for key in &self.library_profiles {
+                    if ui
+                        .selectable_label(profile == key, format!("{} (group)", profile_name(key)))
+                        .clicked()
+                    {
+                        profile.clone_from(key);
+                        site.clear();
+                    }
+                }
+                for key in self.library_sites.as_deref().unwrap_or_default() {
+                    if ui.selectable_label(site == key, key).clicked() {
+                        site.clone_from(key);
+                        profile.clear();
+                    }
+                }
+            });
+    }
+
     fn render_image_search_controls(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_width();
         let draft = self.search_form.to_query();
@@ -2798,12 +2874,7 @@ impl AppWindow {
                     .hint_text("Search images")
                     .desired_width((available * 0.32).clamp(115.0, 320.0)),
             );
-            site_selector(
-                ui,
-                "search_site_filter",
-                &mut self.search_form.site_key,
-                self.library_sites.as_deref().unwrap_or_default(),
-            );
+            self.render_image_source_selector(ui);
             let tags = ui.add(
                 egui::TextEdit::singleline(&mut self.search_form.tags)
                     .hint_text("Tags")
@@ -2892,6 +2963,12 @@ impl AppWindow {
                             removed = true;
                         }
                     }
+                    if let Some(profile) = &query.catalog_profile {
+                        if filter_chip(ui, "Group", profile_name(profile), &mut remaining) {
+                            self.search_form.catalog_profile.clear();
+                            removed = true;
+                        }
+                    }
                     if !self.date_browse_active {
                         if !query.text.is_empty()
                             && filter_chip(ui, "Text", &query.text, &mut remaining)
@@ -2911,6 +2988,12 @@ impl AppWindow {
                             ("Channel", &mut self.search_form.channels, &query.channels),
                         ] {
                             removed |= filter_value_chips(ui, label, field, values, &mut remaining);
+                        }
+                        for manufacturer in &query.manufacturers {
+                            if filter_chip(ui, "Manufacturer", manufacturer, &mut remaining) {
+                                self.search_form.manufacturers.clear();
+                                removed = true;
+                            }
                         }
                         for value in &query.creators {
                             if filter_chip(ui, "Creator", value, &mut remaining) {
@@ -2948,6 +3031,7 @@ impl AppWindow {
         self.last_actor_query.clear();
         self.last_category_query.clear();
         self.last_studio_query.clear();
+        self.manufacturer_suggestions.clear();
     }
 
     fn render_search_filters(&mut self, ui: &mut egui::Ui) {
@@ -3049,6 +3133,31 @@ impl AppWindow {
                         &mut self.search_form.studios,
                         &mut self.studio_suggestions,
                     );
+                    ui.end_row();
+                }
+
+                search_filter_label(ui, "Manufacturers", label_width, row_height);
+                let resp = ui.add_sized(
+                    field_size,
+                    egui::TextEdit::singleline(&mut self.search_form.manufacturers),
+                );
+                if resp.changed() {
+                    self.manufacturer_suggestions.clear();
+                    let query = self.search_form.manufacturers.trim().to_owned();
+                    if !query.is_empty() {
+                        self.pending_command = Some(UiCommand::SuggestManufacturers {
+                            database_path: self.config.database_path.clone(),
+                            query,
+                        });
+                    }
+                }
+                ui.end_row();
+                if !self.manufacturer_suggestions.is_empty() {
+                    search_filter_label(ui, "", label_width, row_height);
+                    if let Some(name) = suggestion_choice(ui, &self.manufacturer_suggestions) {
+                        self.search_form.manufacturers = name;
+                        self.manufacturer_suggestions.clear();
+                    }
                     ui.end_row();
                 }
 
@@ -4241,6 +4350,7 @@ impl AppWindow {
             query: crate::models::SearchQuery {
                 page_id: Some(page_id),
                 site_key: self.search_form.site_filter(),
+                catalog_profile: self.search_form.profile_filter(),
                 ..Default::default()
             },
             seq,
@@ -4274,6 +4384,7 @@ impl AppWindow {
         self.date_browse_current = None;
         self.date_browse_total = 0;
         self.date_browse_site_key = self.search_form.site_filter();
+        self.date_browse_profile = self.search_form.profile_filter();
         self.search_seq = self.search_seq.wrapping_add(1);
         self.running = false;
         self.error = None;
@@ -4281,6 +4392,7 @@ impl AppWindow {
         self.pending_command = Some(UiCommand::BrowseDateGroups {
             database_path: self.config.database_path.clone(),
             site_key: self.date_browse_site_key.clone(),
+            catalog_profile: self.date_browse_profile.clone(),
             seq: self.search_seq,
             cursor,
             direction,
@@ -4292,7 +4404,10 @@ impl AppWindow {
     }
 
     fn sync_date_browse_site(&mut self) {
-        if self.date_browse_active && self.date_browse_site_key != self.search_form.site_filter() {
+        if self.date_browse_active
+            && (self.date_browse_site_key != self.search_form.site_filter()
+                || self.date_browse_profile != self.search_form.profile_filter())
+        {
             self.request_date_group(DateBrowseDirection::Initial);
         }
     }
@@ -6029,13 +6144,23 @@ pub(super) fn filter_chip(
         .clicked()
 }
 
+fn profile_name(key: &str) -> &str {
+    if key.eq_ignore_ascii_case("knife") {
+        "Knives"
+    } else {
+        key
+    }
+}
+
 fn image_filter_count(query: &SearchQuery) -> usize {
     usize::from(query.site_key.is_some())
+        + usize::from(query.catalog_profile.is_some())
         + query.tags.len()
         + query.actors.len()
         + query.creators.len()
         + query.categories.len()
         + query.studios.len()
+        + query.manufacturers.len()
         + query.channels.len()
         + usize::from(query.favorites_only)
 }

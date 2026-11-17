@@ -83,6 +83,7 @@ enum SuggestionKind {
     Actor,
     Category,
     Studio,
+    Manufacturer,
     Creator,
     Torrent(TorrentFacet),
 }
@@ -95,6 +96,7 @@ impl SuggestionKind {
             Self::Category => "category",
             Self::Studio => "studio",
             Self::Creator => "creator",
+            Self::Manufacturer => "manufacturer",
             Self::Torrent(facet) => facet.kind(),
         }
     }
@@ -302,6 +304,11 @@ fn suggestion_worker(
                 results,
             },
             SuggestionKind::Studio => WorkerState::StudioSuggestions {
+                query: job.query,
+                results,
+            },
+            SuggestionKind::Manufacturer => WorkerState::ManufacturerSuggestions {
+                database_path,
                 query: job.query,
                 results,
             },
@@ -1387,7 +1394,9 @@ impl DesktopApp {
                 } => {
                     if self.window.config.database_path == database_path {
                         match result {
-                            Ok(sites) => self.window.set_library_sites(sites),
+                            Ok((sites, profiles)) => {
+                                self.window.set_library_sources(sites, profiles)
+                            }
                             Err(error) => self
                                 .window
                                 .log
@@ -1483,6 +1492,15 @@ impl DesktopApp {
                 WorkerState::StudioSuggestions { query, results } => {
                     let w = &mut self.window;
                     w.set_studio_suggestions(&query, results);
+                }
+                WorkerState::ManufacturerSuggestions {
+                    database_path,
+                    query,
+                    results,
+                } => {
+                    if database_path == self.window.config.database_path {
+                        self.window.set_manufacturer_suggestions(&query, results);
+                    }
                 }
                 WorkerState::CreatorSuggestions {
                     database_path,
@@ -1768,6 +1786,19 @@ impl DesktopApp {
                     database_path,
                     query,
                 } => self.start_category_suggestions(database_path, query),
+                UiCommand::SuggestManufacturers {
+                    database_path,
+                    query,
+                } => {
+                    self.suggestion_worker.submit(
+                        SuggestionKind::Manufacturer,
+                        SuggestionJob {
+                            database_path,
+                            query,
+                            kind: SuggestionKind::Manufacturer,
+                        },
+                    );
+                }
                 UiCommand::SuggestStudios {
                     database_path,
                     query,
@@ -2067,6 +2098,7 @@ impl DesktopApp {
                 UiCommand::BrowseDateGroups {
                     database_path,
                     site_key,
+                    catalog_profile,
                     seq,
                     cursor,
                     direction,
@@ -2076,6 +2108,7 @@ impl DesktopApp {
                     self.start_browse_date_groups(
                         database_path,
                         site_key,
+                        catalog_profile,
                         seq,
                         cursor,
                         direction,
@@ -2090,8 +2123,14 @@ impl DesktopApp {
             let database_path = self.window.config.database_path.clone();
             let state_tx = self.state_tx.clone();
             if let Err(error) = spawn_background(move || {
-                let result = Database::new(&database_path)
+                let database = Database::new(&database_path);
+                let result = database
                     .library_sites()
+                    .and_then(|sites| {
+                        database
+                            .library_profiles()
+                            .map(|profiles| (sites, profiles))
+                    })
                     .map_err(|error| error.to_string());
                 let _ = state_tx.send(WorkerState::LibrarySitesLoaded {
                     database_path,
@@ -2156,6 +2195,7 @@ impl DesktopApp {
         &mut self,
         database_path: String,
         site_key: Option<String>,
+        catalog_profile: Option<String>,
         seq: u64,
         cursor: Option<DateGroupCursor>,
         direction: DateBrowseDirection,
@@ -2168,12 +2208,13 @@ impl DesktopApp {
         }
         let state_tx = self.state_tx.clone();
         if let Err(error) = spawn_background(move || {
-            let result = Database::new(database_path).get_date_group_page_for_site(
+            let result = Database::new(database_path).get_date_group_page_for_scope(
                 cursor.as_ref(),
                 direction,
                 ascending,
                 max_favorites_exclusive,
                 site_key.as_deref(),
+                catalog_profile.as_deref(),
             );
             let worker_state = WorkerState::DateGroupsLoaded {
                 seq,
@@ -2220,7 +2261,7 @@ enum WorkerState {
     },
     LibrarySitesLoaded {
         database_path: String,
-        result: Result<Vec<String>, String>,
+        result: Result<(Vec<String>, Vec<String>), String>,
     },
     QueuedCardLoaded {
         database_path: String,
@@ -2260,6 +2301,11 @@ enum WorkerState {
         results: Vec<String>,
     },
     StudioSuggestions {
+        query: String,
+        results: Vec<String>,
+    },
+    ManufacturerSuggestions {
+        database_path: String,
         query: String,
         results: Vec<String>,
     },
@@ -2562,6 +2608,7 @@ fn run_suggestions(
     database.initialize()?;
     match kind {
         SuggestionKind::Creator => database.suggest_creators(&query, 8),
+        SuggestionKind::Manufacturer => database.suggest_knife_manufacturers(&query, 8),
         SuggestionKind::Torrent(facet) => database.suggest_torrent_facet(facet, &query, 8),
         _ => database.suggest_attribute_values(kind.database_kind(), &query, 8),
     }

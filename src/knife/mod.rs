@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::models::ScrapedItem;
 
+pub(crate) mod archive;
 pub(crate) mod preview;
 
 pub(crate) const PROFILE: &str = "knife";

@@ -386,6 +386,8 @@ impl SearchArgs {
             actors: self.actors.clone(),
             creators: self.creators.clone(),
             studios: self.studios.clone(),
+            manufacturers: Vec::new(),
+            catalog_profile: None,
             categories: self.categories.clone(),
             channels: self.channels.clone(),
             favorites_only: self.favorites_only,

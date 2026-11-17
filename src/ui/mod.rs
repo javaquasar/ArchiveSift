@@ -326,6 +326,10 @@ pub enum UiCommand {
         database_path: String,
         query: String,
     },
+    SuggestManufacturers {
+        database_path: String,
+        query: String,
+    },
     SuggestStudios {
         database_path: String,
         query: String,
@@ -465,6 +469,7 @@ pub enum UiCommand {
     BrowseDateGroups {
         database_path: String,
         site_key: Option<String>,
+        catalog_profile: Option<String>,
         seq: u64,
         cursor: Option<DateGroupCursor>,
         direction: DateBrowseDirection,

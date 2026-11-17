@@ -97,12 +97,14 @@ pub struct SearchQuery {
     pub text: String,
     /// Exact scraper/site identifier, for example `demo-site`.
     pub site_key: Option<String>,
+    pub catalog_profile: Option<String>,
     pub tags: Vec<String>,
     pub actors: Vec<String>,
     /// Exact people names across director, author, photographer and creator roles.
     pub creators: Vec<String>,
     pub categories: Vec<String>,
     pub studios: Vec<String>,
+    pub manufacturers: Vec<String>,
     pub channels: Vec<String>,
     pub favorites_only: bool,
     /// When set, restrict results to images belonging to this specific page.

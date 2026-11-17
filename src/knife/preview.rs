@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::de::{DeserializeSeed, Error, SeqAccess, Visitor};
 use serde_json::Value;
 
+use super::archive::{web_url, ArchiveImage, ArchiveKnife};
 use super::{identity, image_extension, KnifeProfile, MAX_NAME};
 
 const MAX_PREVIEW_ROWS: usize = 1000;
@@ -21,6 +22,8 @@ pub(crate) struct ImportPreview {
     pub rejected_files: usize,
     pub conflicting_files: usize,
     pub rows: Vec<PreviewRow>,
+    pub archive_images: Option<PathBuf>,
+    pub(crate) importable: Vec<ArchiveKnife>,
 }
 
 #[derive(Debug, Default)]
@@ -86,8 +89,12 @@ impl<'de> Visitor<'de> for PreviewVisitor<'_> {
     }
 
     fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<ImportPreview, S::Error> {
-        let mut summary = ImportPreview::default();
+        let mut summary = ImportPreview {
+            archive_images: self.images.clone(),
+            ..Default::default()
+        };
         let mut ids = HashSet::new();
+        let mut import_ids = HashSet::new();
         let mut manufacturers = HashMap::new();
         let mut models = HashMap::new();
         let mut destinations = HashSet::new();
@@ -103,8 +110,10 @@ impl<'de> Visitor<'de> for PreviewVisitor<'_> {
             let manufacturer = value("company", MAX_NAME);
             let model = value("knifeName", MAX_NAME);
             let steel = value("steel", MAX_NAME);
-            let duplicate_id =
-                value("id", MAX_NAME * 2).is_some_and(|id| !ids.insert(identity(id)));
+            let id = value("id", MAX_NAME * 2).map(identity);
+            let duplicate_id = id.as_ref().is_some_and(|id| !ids.insert(id.clone()));
+            let already_planned =
+                manufacturer.zip(model).is_some() && id.is_some_and(|id| !import_ids.insert(id));
             let directory = manufacturer.zip(model).map(|(manufacturer, model)| {
                 let brand_key = identity(manufacturer);
                 let manufacturer = manufacturers
@@ -134,6 +143,22 @@ impl<'de> Visitor<'de> for PreviewVisitor<'_> {
                         .map(std::slice::from_ref)
                 })
                 .unwrap_or_default();
+            let mut importable = manufacturer.zip(model).filter(|_| !already_planned).map(
+                |(manufacturer, model)| {
+                    ArchiveKnife::from_json(
+                        summary.records,
+                        &record,
+                        KnifeProfile {
+                            manufacturer,
+                            model,
+                            steel,
+                        },
+                    )
+                },
+            );
+            let image_urls = record["imageUrls"]
+                .as_array()
+                .filter(|urls| urls.len() == refs.len());
             let mut row = PreviewRow {
                 number: summary.records,
                 manufacturer: manufacturer.map(str::to_owned),
@@ -143,7 +168,7 @@ impl<'de> Visitor<'de> for PreviewVisitor<'_> {
                 files: refs.len(),
                 ..Default::default()
             };
-            for file in refs {
+            for (index, file) in refs.iter().enumerate() {
                 let Some(relative) = file.as_str().and_then(safe_image_path) else {
                     row.rejected += 1;
                     continue;
@@ -167,6 +192,19 @@ impl<'de> Visitor<'de> for PreviewVisitor<'_> {
                 let Some(directory) = &directory else {
                     continue;
                 };
+                if let Some(item) = &mut importable {
+                    let url = image_urls
+                        .and_then(|urls| web_url(&urls[index]))
+                        .or_else(|| {
+                            (index == 0)
+                                .then(|| web_url(&record["imageSourceUrl"]))
+                                .flatten()
+                        });
+                    item.images.push(ArchiveImage {
+                        relative: relative.clone(),
+                        url,
+                    });
+                }
                 let target =
                     directory.join(relative.file_name().expect("validated image filename"));
                 if row.first_destination.is_none() {
@@ -190,6 +228,9 @@ impl<'de> Visitor<'de> for PreviewVisitor<'_> {
             summary.missing_files += row.missing;
             summary.rejected_files += row.rejected;
             summary.conflicting_files += row.conflicts;
+            if let Some(record) = importable {
+                summary.importable.push(record);
+            }
             row.directory = directory;
             if summary.rows.len() < MAX_PREVIEW_ROWS {
                 summary.rows.push(row);
@@ -286,6 +327,26 @@ mod tests {
             b"pre-existing"
         );
         assert_eq!(fs::read_to_string(index).unwrap(), input.to_string());
+    }
+
+    #[test]
+    fn invalid_row_does_not_reserve_a_repeated_id_for_import() {
+        let archive = tempfile::tempdir().unwrap();
+        let index = archive.path().join("knives.json");
+        fs::write(
+            &index,
+            r#"[
+            {"id":"ridge","company":"Forge"},
+            {"id":"RIDGE","company":"Forge","knifeName":"Ridge"},
+            {"id":"Ridge","company":"Forge","knifeName":"Ridge, repeated"}
+        ]"#,
+        )
+        .unwrap();
+        let report = preview(&index, archive.path()).unwrap();
+        assert_eq!(report.duplicate_ids, 2);
+        assert_eq!(report.invalid_records, 1);
+        assert_eq!(report.importable.len(), 1);
+        assert_eq!(report.importable[0].row, 2);
     }
 
     #[test]

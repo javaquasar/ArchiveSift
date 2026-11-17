@@ -8,6 +8,8 @@ use crate::knife::{identity, image_extension, KnifeProfile};
 use crate::models::ScrapedItem;
 use crate::AppResult;
 
+mod archive;
+
 pub(super) fn initialize(connection: &Connection) -> AppResult<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS knife_models (
@@ -24,6 +26,12 @@ pub(super) fn initialize(connection: &Connection) -> AppResult<()> {
             page_id INTEGER PRIMARY KEY REFERENCES source_pages(id) ON DELETE CASCADE,
             model_id INTEGER NOT NULL REFERENCES knife_models(id)
         );
+        CREATE INDEX IF NOT EXISTS knife_sources_model ON knife_sources(model_id);
+        CREATE TABLE IF NOT EXISTS knife_import_keys (
+            record_key TEXT PRIMARY KEY,
+            page_id INTEGER NOT NULL REFERENCES knife_sources(page_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS knife_import_keys_page ON knife_import_keys(page_id);
         CREATE TABLE IF NOT EXISTS knife_image_paths (
             page_id INTEGER NOT NULL,
             image_id INTEGER NOT NULL,
@@ -176,7 +184,47 @@ fn link_model(
     Ok((manufacturer, model, directory))
 }
 
+pub(super) fn append_manufacturer_filter(
+    sql: &mut String,
+    params: &mut Vec<String>,
+    names: &[String],
+) {
+    let keys = names
+        .iter()
+        .map(|name| identity(name))
+        .filter(|name| !name.is_empty());
+    let start = params.len();
+    params.extend(keys);
+    if params.len() == start {
+        return;
+    }
+    let placeholders = std::iter::repeat_n("?", params.len() - start)
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql.push_str(&format!(
+        " AND EXISTS (SELECT 1 FROM knife_sources ks JOIN knife_models km ON km.id = ks.model_id
+         WHERE ks.page_id = source_pages.id AND km.manufacturer_key IN ({placeholders}))"
+    ));
+}
+
 impl Database {
+    pub(crate) fn suggest_knife_manufacturers(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> AppResult<Vec<String>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT min(manufacturer) FROM knife_models
+             WHERE instr(manufacturer_key, ?1) > 0
+               AND EXISTS (SELECT 1 FROM knife_sources WHERE model_id = knife_models.id)
+             GROUP BY manufacturer_key
+             ORDER BY (instr(manufacturer_key, ?1) = 1) DESC, manufacturer_key LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![identity(prefix), limit], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub(crate) fn knife_image_paths(&self, page_id: i64) -> AppResult<HashMap<i64, PathBuf>> {
         let connection = self.connect()?;
         let mut statement = connection

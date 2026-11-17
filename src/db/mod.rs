@@ -23,6 +23,11 @@ use crate::models::{
 };
 use crate::AppResult;
 
+const CATALOG_PROFILE_FILTER: &str = " AND EXISTS (
+    SELECT 1 FROM attributes a JOIN page_attributes pa ON pa.attribute_id = a.id
+    WHERE pa.page_id = source_pages.id AND a.kind = 'catalog_profile' AND a.normalized_value = ?
+)";
+
 pub struct FileDownloadStore;
 
 pub(crate) fn collection_url_alternate(url: &str) -> Option<String> {
@@ -1375,6 +1380,18 @@ impl Database {
         Ok(sites)
     }
 
+    pub(crate) fn library_profiles(&self) -> AppResult<Vec<String>> {
+        let connection = self.connect()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT min(a.value) FROM attributes a
+             WHERE a.kind = 'catalog_profile' AND a.normalized_value <> ''
+               AND EXISTS (SELECT 1 FROM page_attributes pa WHERE pa.attribute_id = a.id)
+             GROUP BY a.normalized_value ORDER BY a.normalized_value",
+        )?;
+        let values = statement.query_map([], |row| row.get(0))?;
+        Ok(values.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub(crate) fn saved_page_location(&self, url: &str) -> AppResult<Option<(i64, bool, String)>> {
         let mut parsed = url::Url::parse(url.trim())?;
         parsed.set_fragment(None);
@@ -1923,10 +1940,20 @@ impl Database {
             }
         }
 
+        if let Some(profile) = query
+            .catalog_profile
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|key| !key.is_empty())
+        {
+            sql.push_str(CATALOG_PROFILE_FILTER);
+            params.push(profile);
+        }
         append_attribute_filter(&mut sql, &mut params, "tag", &query.tags);
         append_attribute_filter(&mut sql, &mut params, "actor", &query.actors);
         append_attribute_filter(&mut sql, &mut params, "category", &query.categories);
         append_attribute_filter(&mut sql, &mut params, "studio", &query.studios);
+        knife::append_manufacturer_filter(&mut sql, &mut params, &query.manufacturers);
         append_attribute_filter(&mut sql, &mut params, "channel", &query.channels);
         creators::append_filter(
             self,
@@ -2350,12 +2377,38 @@ impl Database {
         max_favorites_exclusive: Option<usize>,
         site_key: Option<&str>,
     ) -> AppResult<DateGroupPage> {
+        self.get_date_group_page_for_scope(
+            cursor,
+            direction,
+            ascending,
+            max_favorites_exclusive,
+            site_key,
+            None,
+        )
+    }
+
+    pub(crate) fn get_date_group_page_for_scope(
+        &self,
+        cursor: Option<&DateGroupCursor>,
+        direction: DateBrowseDirection,
+        ascending: bool,
+        max_favorites_exclusive: Option<usize>,
+        site_key: Option<&str>,
+        catalog_profile: Option<&str>,
+    ) -> AppResult<DateGroupPage> {
         let connection = self.connect()?;
         let mut filter = String::new();
         let mut filter_values = Vec::<rusqlite::types::Value>::new();
         if let Some(site_key) = site_key.map(str::trim).filter(|key| !key.is_empty()) {
             filter.push_str(" AND site_key = ?");
             filter_values.push(site_key.to_owned().into());
+        }
+        if let Some(profile) = catalog_profile
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|key| !key.is_empty())
+        {
+            filter.push_str(CATALOG_PROFILE_FILTER);
+            filter_values.push(profile.into());
         }
         if let Some(limit) = max_favorites_exclusive {
             filter.push_str(" AND favorite_count < ?");
