@@ -126,6 +126,32 @@ pub(super) fn manifest() -> PluginManifest {
 }
 
 #[test]
+fn discovery_exposes_manifest_display_name_and_unique_route_hosts() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("example.parser");
+    std::fs::create_dir(&directory).unwrap();
+    let mut manifest = manifest();
+    manifest.display_name = "Example Movies".into();
+    manifest.enabled = false;
+    let mut another_route = manifest.routes[0].clone();
+    another_route.path_prefix = "/release".into();
+    manifest.routes.push(another_route);
+    std::fs::write(
+        directory.join("plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let status = discover(&mut ScraperRegistry::new(), root.path());
+    assert_eq!(status.len(), 1);
+    let identity = status[0].identity.as_ref().unwrap();
+    assert_eq!(identity.name, "Example Movies");
+    assert_eq!(identity.hosts, ["example.test"]);
+    assert_eq!(status[0].id, "example.parser");
+    assert!(!status[0].loaded);
+}
+
+#[test]
 fn manifest_rejects_incompatible_versions_and_unsafe_permissions() {
     let base = manifest();
     base.validate().unwrap();

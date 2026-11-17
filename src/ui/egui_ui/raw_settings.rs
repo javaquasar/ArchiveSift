@@ -158,20 +158,35 @@ impl RawSettingsEditor {
             if prefix.is_some_and(|prefix| !target.starts_with(prefix)) {
                 continue;
             }
-            let hint = self.catalog.plugins.values().find_map(|plugin| {
+            let plugin = target
+                .strip_prefix("ArchiveSift/")
+                .and_then(|name| name.split_once('/'))
+                .and_then(|(id, _)| self.catalog.plugins.get(id));
+            let property = plugin.and_then(|plugin| {
                 plugin.schema.value()["properties"]
                     .as_object()?
                     .values()
-                    .find_map(|node| {
-                        (node["format"] == "secret-reference"
-                            && node["const"].as_str() == Some(target.as_str()))
-                        .then(|| node["description"].as_str())
-                        .flatten()
+                    .find(|node| {
+                        node["format"] == "secret-reference"
+                            && node["const"].as_str() == Some(target.as_str())
                     })
             });
             ui.push_id(target, |ui| {
-                ui.add(egui::Label::new(target.as_str()).wrap());
-                if let Some(hint) = hint {
+                if let Some(plugin) = plugin {
+                    let label = property
+                        .and_then(|node| node["title"].as_str())
+                        .unwrap_or("Credential");
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{} · {label}", plugin.identity.name,))
+                                .strong(),
+                        )
+                        .wrap(),
+                    );
+                    ui.add(egui::Label::new(plugin.identity.hosts.join(", ")).wrap());
+                }
+                ui.add(egui::Label::new(egui::RichText::new(target.as_str()).weak()).wrap());
+                if let Some(hint) = property.and_then(|node| node["description"].as_str()) {
                     ui.add(egui::Label::new(egui::RichText::new(hint).weak()).wrap());
                 }
                 input.poll_presence(ui.ctx(), target);
@@ -402,7 +417,17 @@ impl RawSettingsEditor {
         }
         ui.collapsing("Plugin requirements and credentials", |ui| {
             for plugin in self.catalog.plugins.values() {
-                ui.strong(format!("{} {}", plugin.id, plugin.version));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            format!("{} {}", plugin.identity.name, plugin.version,),
+                        )
+                        .strong(),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text(&plugin.id);
+                ui.add(egui::Label::new(plugin.identity.hosts.join(", ")).wrap());
                 if !plugin.declared {
                     ui.weak("Legacy package: no configurable guest settings declared.");
                 }
@@ -473,9 +498,27 @@ mod tests {
     #[test]
     fn extension_credentials_show_only_the_requested_namespace_and_mask_the_input() {
         let ctx = egui::Context::default();
-        let mut editor = RawSettingsEditor::new(&AppConfig::default(), SettingsCatalog::default());
+        ctx.style_mut(|style| style.animation_time = 0.0);
         let chosen = "ArchiveSift/example.first/api";
         let other = "ArchiveSift/example.second/api";
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("example.first");
+        std::fs::create_dir(&directory).unwrap();
+        let manifest = serde_json::json!({
+            "schema":1,"api":"1.0","id":"example.first","version":"1.0.0",
+            "display_name":"Example Movies","source_key":"example-movies",
+            "runtime":"wasm","entry":"adapter.wasm","sha256":"0".repeat(64),
+            "routes":[{"host":"movies.example.test","path_prefix":"/movies","kind":"content"}],
+            "network_origins":["https://movies.example.test"]
+        });
+        let schema = serde_json::json!({"type":"object","properties":{
+            "api_key_ref":{"type":"string","format":"secret-reference","const":chosen,"title":"API token"}
+        }});
+        std::fs::write(directory.join("plugin.json"), manifest.to_string()).unwrap();
+        std::fs::write(directory.join("settings.schema.json"), schema.to_string()).unwrap();
+        let catalog = SettingsCatalog::discover(root.path());
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+        let mut editor = RawSettingsEditor::new(&AppConfig::default(), catalog);
         for target in [chosen, other] {
             editor.secrets.insert(
                 target.into(),
@@ -518,6 +561,8 @@ mod tests {
         frame(&mut editor, events(pos, false));
         let (output, _) = frame(&mut editor, Vec::new());
         position(&output, chosen);
+        position(&output, "Example Movies · API token");
+        position(&output, "movies.example.test");
         position(&output, "Saved in system password store");
         let rendered = format!("{:?}", output.shapes);
         assert!(!rendered.contains(other));

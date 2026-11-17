@@ -1,5 +1,5 @@
 //! Declarative settings discovery. Reading a schema never executes guest code.
-use super::manifest::PluginManifest;
+use super::manifest::{PluginIdentity, PluginManifest};
 use crate::AppResult;
 use archive_sift_scraper_api::settings_schema::{
     SettingsSchema, ValidationIssue, MAX_SCHEMA_BYTES,
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub struct PluginSettings {
     pub id: String,
     pub version: String,
+    pub identity: PluginIdentity,
     pub enabled: bool,
     pub schema: SettingsSchema,
     pub directory: PathBuf,
@@ -47,6 +48,7 @@ impl PluginSettings {
         Ok(Self {
             id: manifest.id.clone(),
             version: manifest.version.clone(),
+            identity: manifest.identity(),
             enabled: manifest.enabled,
             schema,
             directory: directory.to_owned(),

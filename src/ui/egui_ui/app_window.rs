@@ -2836,6 +2836,7 @@ impl AppWindow {
         };
         egui::ComboBox::from_id_salt("search_site_filter")
             .width(108.0)
+            .height(460.0)
             .selected_text(label)
             .show_ui(ui, |ui| {
                 if ui
@@ -2854,9 +2855,16 @@ impl AppWindow {
                         site.clear();
                     }
                 }
-                for key in self.library_sites.as_deref().unwrap_or_default() {
+                let registry = ScraperRegistry::with_all_scrapers();
+                let saved_sites = self.library_sites.as_deref().unwrap_or_default();
+                let new_sites: std::collections::BTreeSet<_> = registry
+                    .list_site_keys()
+                    .into_iter()
+                    .filter(|key| !saved_sites.iter().any(|saved| saved == key))
+                    .collect();
+                for key in saved_sites.iter().map(String::as_str).chain(new_sites) {
                     if ui.selectable_label(site == key, key).clicked() {
-                        site.clone_from(key);
+                        *site = key.to_owned();
                         profile.clear();
                     }
                 }
@@ -4722,12 +4730,7 @@ fn render_extension_card(
     extension: &crate::scraper::extensions::ExtensionStatus,
 ) -> egui::Response {
     super::extensions_manager::extension_frame(ui, |ui| {
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(format!("{} {}", extension.id, extension.version)).strong(),
-            )
-            .wrap(),
-        );
+        super::extensions_manager::render_extension_identity(ui, extension);
         ui.add(egui::Label::new(format!("{:?}: {}", extension.runtime, extension.message)).wrap());
         ui.add(
             egui::Label::new(egui::RichText::new(extension.directory.to_string_lossy()).small())
@@ -5387,6 +5390,7 @@ mod tests {
             directory: Path::new("plugins").join(id),
             id: id.to_string(),
             version: "1.0.0".to_string(),
+            identity: None,
             runtime: Some(crate::scraper::extensions::manifest::RuntimeKind::Wasm),
             loaded: true,
             message: message.to_string(),

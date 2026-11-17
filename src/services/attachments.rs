@@ -56,6 +56,26 @@ pub(super) fn description_text(card: &TorrentCard) -> String {
         text.push_str("\n\n");
         text.push_str(description);
     }
+    for (kind, title) in [
+        ("release_details", "Release details"),
+        ("media_info", "MediaInfo"),
+    ] {
+        let mut values = card
+            .attributes
+            .iter()
+            .filter(|attribute| attribute.kind == kind && !attribute.value.trim().is_empty())
+            .map(|attribute| attribute.value.as_str());
+        if let Some(first) = values.next() {
+            text.push_str("\n\n");
+            text.push_str(title);
+            text.push('\n');
+            text.push_str(first);
+            for value in values {
+                text.push_str("\n\n");
+                text.push_str(value);
+            }
+        }
+    }
     if !text.ends_with('\n') {
         text.push('\n');
     }

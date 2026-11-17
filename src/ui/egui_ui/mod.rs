@@ -4183,6 +4183,114 @@ mod startup_ui_tests {
         );
     }
 
+    #[test]
+    fn image_search_selects_knife_group_and_registered_sites_without_saved_pages() {
+        use crate::models::{MetadataAttribute, ScrapedImage, ScrapedItem};
+
+        let (mut app, _root, context) = test_app(false);
+        let database = Database::new(&app.window.config.database_path);
+        database.initialize().unwrap();
+        let attributes = [
+            ("catalog_profile", "knife"),
+            ("manufacturer", "Example Forge"),
+            ("model", "Ridge"),
+        ]
+        .into_iter()
+        .map(|(kind, value)| MetadataAttribute {
+            kind: kind.into(),
+            label: kind.into(),
+            value: value.into(),
+            source_url: None,
+            is_female: None,
+        })
+        .collect();
+        database
+            .upsert_scraped_item(&ScrapedItem {
+                site_key: "archived-example".into(),
+                page_url: "https://example.test/archived".into(),
+                title: "Archived knife".into(),
+                raw_html: String::new(),
+                images: vec![ScrapedImage {
+                    source_url: "https://example.test/archived/knife.jpg".into(),
+                    preview_url: None,
+                    alt_text: None,
+                    width: None,
+                    height: None,
+                    sort_order: 0,
+                    local_file_path: None,
+                }],
+                attributes,
+            })
+            .unwrap();
+
+        let size = egui::vec2(1900.0, 1400.0);
+        let output = render(&mut app, &context, size, Vec::new());
+        let output = click_label(&mut app, &context, &output, "Search");
+        click_label(&mut app, &context, &output, "All sites");
+        let output = wait_for_label(&mut app, &context, size, "Knives (group)");
+        let output = click_label(&mut app, &context, &output, "Knives (group)");
+        click_label(&mut app, &context, &output, "Apply filters");
+        let mut output = wait_for_label(&mut app, &context, size, "Results (1)");
+        assert_labels(&output, &["Group Knives ×"]);
+
+        let expected = std::env::var("ARCHIVESIFT_VERIFY_SEARCH_SITES").unwrap_or_else(|_| {
+            crate::scraper::ScraperRegistry::with_public_scrapers()
+                .list_site_keys()
+                .join(",")
+        });
+        let mut selected = "Knives (group)";
+        for site in expected.split(',') {
+            let selector_pos = rendered_text(&output)
+                .into_iter()
+                .find(|(label, _)| label == selected)
+                .unwrap()
+                .1
+                .left_bottom();
+            let mut menu = click_label(&mut app, &context, &output, selected);
+            let scroll_pos = selector_pos + egui::vec2(12.0, 45.0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut delta = 600.0;
+            while !rendered_text(&menu).iter().any(|(label, _)| label == site)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                menu = render(
+                    &mut app,
+                    &context,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(scroll_pos),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, delta),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                delta = -110.0;
+            }
+            assert_labels(&menu, &[site]);
+            let draft = click_label(&mut app, &context, &menu, site);
+            output = click_label(&mut app, &context, &draft, "Apply filters");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.window.running {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "search for {site} did not complete"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                output = render(&mut app, &context, size, Vec::new());
+            }
+            let SearchRefresh::Query(query) = app.window.search_refresh() else {
+                panic!("expected an image search")
+            };
+            assert_eq!(query.site_key.as_deref(), Some(site));
+            assert!(query.catalog_profile.is_none());
+            selected = site;
+            println!("Search can select {site}");
+        }
+    }
+
     fn wait_for_label(
         app: &mut DesktopApp,
         context: &egui::Context,

@@ -1099,6 +1099,8 @@ mod tests {
             ("actor", "Actor", "Example Actor"),
             ("studio", "Studio", "First Studio"),
             ("studio", "Studio", "Second Studio"),
+            ("media_info", "MediaInfo", "Video\nFormat : AVC"),
+            ("release_details", "Release details", "Size: 2.9 GB"),
             (
                 "notice",
                 crate::models::TORRENT_UNAVAILABLE_NOTICE,
@@ -1123,7 +1125,10 @@ mod tests {
         super::super::attachments::save_description(persisted.page_id, &database, &base)
             .await
             .unwrap();
-        assert!(base.join(&studio_dir).join("description.txt").is_file());
+        let export =
+            std::fs::read_to_string(base.join(&studio_dir).join("description.txt")).unwrap();
+        assert!(export
+            .contains("\n\nRelease details\nSize: 2.9 GB\n\nMediaInfo\nVideo\nFormat : AVC\n"));
         let make_requests = || {
             service
                 .build_download_requests(

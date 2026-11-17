@@ -103,6 +103,24 @@ pub struct PluginManifest {
     pub limits: Limits,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginIdentity {
+    pub name: String,
+    pub hosts: Vec<String>,
+}
+
+impl PluginManifest {
+    pub fn identity(&self) -> PluginIdentity {
+        let mut hosts: Vec<_> = self.routes.iter().map(|route| route.host.clone()).collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        PluginIdentity {
+            name: self.display_name.trim().to_owned(),
+            hosts,
+        }
+    }
+}
+
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128

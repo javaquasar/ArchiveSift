@@ -38,6 +38,7 @@ pub struct ExtensionStatus {
     pub directory: PathBuf,
     pub id: String,
     pub version: String,
+    pub identity: Option<manifest::PluginIdentity>,
     pub runtime: Option<RuntimeKind>,
     pub loaded: bool,
     pub message: String,
@@ -563,6 +564,7 @@ pub fn discover(registry: &mut ScraperRegistry, root: &Path) -> Vec<ExtensionSta
                 directory: root.into(),
                 id: String::new(),
                 version: String::new(),
+                identity: None,
                 runtime: None,
                 loaded: false,
                 message: error.to_string(),
@@ -584,6 +586,7 @@ fn discover_entries(
             directory: directory.clone(),
             id: String::new(),
             version: String::new(),
+            identity: None,
             runtime: None,
             loaded: false,
             message: String::new(),
@@ -616,6 +619,7 @@ fn discover_entries(
             let manifest = manifest?;
             status.id = manifest.id.clone();
             status.version = manifest.version.clone();
+            status.identity = Some(manifest.identity());
             status.runtime = Some(manifest.runtime);
             if !manifest.enabled {
                 status.message = "Disabled".into();

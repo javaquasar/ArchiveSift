@@ -1069,11 +1069,22 @@ impl TorrentLibraryUi {
         for (kind, label) in [
             ("description", "Description"),
             ("full_description", "Full description"),
+            ("media_info", "MediaInfo"),
+            ("release_details", "Release details"),
         ] {
-            if let Some(attribute) = card.attributes.iter().find(|a| a.kind == kind) {
-                if ui.button(label).clicked() {
-                    self.description = Some((card.title.clone(), attribute.value.clone()));
-                }
+            let mut text = card
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.kind == kind && !attribute.value.trim().is_empty())
+                .map(|attribute| attribute.value.as_str())
+                .peekable();
+            if text.peek().is_some() && ui.button(label).clicked() {
+                let title = if matches!(kind, "media_info" | "release_details") {
+                    format!("{} · {label}", card.title)
+                } else {
+                    card.title.clone()
+                };
+                self.description = Some((title, text.collect::<Vec<_>>().join("\n\n")));
             }
         }
         self.render_gallery(ui, config, &card);
@@ -2016,6 +2027,13 @@ mod tests {
                     is_female: None,
                 },
                 MetadataAttribute {
+                    kind: "media_info".into(),
+                    label: "MediaInfo".into(),
+                    value: "Video\nWidth : 1152 pixels".into(),
+                    source_url: None,
+                    is_female: None,
+                },
+                MetadataAttribute {
                     kind: "actor".into(),
                     label: "Actor".into(),
                     value: "Fixture Actor".into(),
@@ -2172,6 +2190,14 @@ mod tests {
             Some((
                 "Full torrent heading [2025]".into(),
                 "A complete fixture description.\nSecond line.".into()
+            ))
+        );
+        click(&mut editor, &config, &ctx, "MediaInfo");
+        assert_eq!(
+            editor.take_description(),
+            Some((
+                "Full torrent heading [2025] · MediaInfo".into(),
+                "Video\nWidth : 1152 pixels".into(),
             ))
         );
         click(&mut editor, &config, &ctx, "Edit");

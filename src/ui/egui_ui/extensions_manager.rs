@@ -10,6 +10,26 @@ use crate::{
     ui::UiCommand,
 };
 use eframe::egui;
+
+pub(super) fn render_extension_identity(
+    ui: &mut egui::Ui,
+    status: &crate::scraper::extensions::ExtensionStatus,
+) {
+    let name = status
+        .identity
+        .as_ref()
+        .map_or(status.id.as_str(), |identity| identity.name.as_str());
+    if !name.is_empty() {
+        ui.add(
+            egui::Label::new(egui::RichText::new(format!("{name} {}", status.version)).strong())
+                .wrap(),
+        )
+        .on_hover_text(&status.id);
+    }
+    if let Some(identity) = &status.identity {
+        ui.add(egui::Label::new(identity.hosts.join(", ")).wrap());
+    }
+}
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -338,13 +358,7 @@ impl ExtensionsManagerUi {
             for status in registry.extension_statuses() {
                 ui.push_id(&status.directory, |ui| {
                     extension_frame(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("{} {}", status.id, status.version))
-                                    .strong(),
-                            )
-                            .wrap(),
-                        );
+                        render_extension_identity(ui, status);
                         ui.add(egui::Label::new(&status.message).wrap());
                         if let Some(action) = credentials(ui, &status.id, busy || self.busy()) {
                             command = Some(action);
