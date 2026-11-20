@@ -447,6 +447,10 @@ pub enum UiCommand {
     DownloadTorrentFile {
         url: String,
     },
+    DownloadMissingTorrentFiles {
+        query: crate::models::TorrentQuery,
+        limit: usize,
+    },
     ImportTorrentFile {
         url: String,
         file: std::path::PathBuf,

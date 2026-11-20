@@ -23,6 +23,10 @@ use crate::AppResult;
 const QUEUE_PREVIEW_LIMIT: usize = 6;
 pub(crate) const QUEUE_FAILURE_PAGE_SIZE: usize = 10;
 const URL_ENQUEUE_BATCH_SIZE: usize = 512;
+const ENQUEUE_TORRENT_SQL: &str =
+    "INSERT INTO queue_items(url, connector, state, torrent_only) VALUES (?1, ?2, 'pending', 1)
+     ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 0, torrent_only = 1,
+         updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueJob {
@@ -816,12 +820,31 @@ impl UrlQueueService {
             );
         }
         let connection = self.store.connection.lock().unwrap();
-        Ok(connection.execute(
-            "INSERT INTO queue_items(url, connector, state, torrent_only) VALUES (?1, ?2, 'pending', 1)
-             ON CONFLICT(url) DO UPDATE SET state = 'pending', repair_images = 0, torrent_only = 1,
-                 updated_at = CURRENT_TIMESTAMP WHERE state = 'failed'",
-            params![url, url_hostname(url)],
-        )? == 1)
+        Ok(connection.execute(ENQUEUE_TORRENT_SQL, params![url, url_hostname(url)])? == 1)
+    }
+
+    pub(crate) fn enqueue_torrent_downloads(
+        &self,
+        urls: &[String],
+        limit: usize,
+    ) -> AppResult<usize> {
+        let registry = self.registry();
+        let mut connection = self.store.connection.lock().unwrap();
+        let transaction = connection.transaction()?;
+        let mut queued = 0;
+        {
+            let mut insert = transaction.prepare(ENQUEUE_TORRENT_SQL)?;
+            for url in urls {
+                if queued == limit {
+                    break;
+                }
+                if registry.supports_url(url) {
+                    queued += insert.execute(params![url, url_hostname(url)])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(queued)
     }
 
     pub(crate) fn enqueue_rescrape(&self, url: &str) -> AppResult<()> {

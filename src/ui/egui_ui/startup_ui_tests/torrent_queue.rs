@@ -60,6 +60,7 @@ impl TorrentFixtureServer {
                 }
                 let (status, content_type, bytes) = match path.as_str() {
                     "/topic" => ("200 OK", "text/html", topic.as_bytes()),
+                    path if path.starts_with("/topic?") => ("200 OK", "text/html", topic.as_bytes()),
                     "/release.torrent" => ("200 OK", "application/x-bittorrent", TORRENT),
                     _ => ("404 Not Found", "text/plain", b"Unexpected request".as_slice()),
                 };
@@ -101,6 +102,9 @@ impl ContentScraper for TorrentFixtureScraper {
 
     fn supports_url(&self, url: &str) -> bool {
         url == self.page_url
+            || url
+                .strip_prefix(&self.page_url)
+                .is_some_and(|suffix| suffix.starts_with('?'))
     }
 
     fn scrape_content<'a>(
@@ -274,6 +278,140 @@ fn missing_torrent_filter_button_downloads_one_file_through_the_worker() {
         TORRENT
     );
     server.assert_requests(&["/topic", "/release.torrent"]);
+}
+
+#[test]
+fn torrent_batch_downloads_only_the_requested_missing_files_across_search_pages() {
+    let (mut app, root, context) = test_app(true);
+    let server = TorrentFixtureServer::start(true);
+    let (db, beyond_limit) = saved_card(&mut app, &root, &server);
+    let downloads = app.window.config.effective_download_dir();
+    std::fs::create_dir(&downloads).unwrap();
+    let add_card = |url: String, title: &str| {
+        db.upsert_scraped_item(&ScrapedItem {
+            site_key: "torrent-queue-fixture".into(),
+            page_url: url,
+            title: title.into(),
+            raw_html: String::new(),
+            images: vec![],
+            attributes: vec![magnet_attribute()],
+        })
+        .unwrap()
+        .page_id
+    };
+    let second = add_card(format!("{}?batch=second", server.page_url), CARD_TITLE);
+    let first_url = format!("{}?batch=first", server.page_url);
+    let first = add_card(first_url.clone(), CARD_TITLE);
+    db.save_page_attachment(first, "old", "deleted.torrent", "deleted.torrent")
+        .unwrap();
+    app.queue_service
+        .mark_failed(&first_url, "Previous failure");
+    let pending_url = format!("{}?batch=pending", server.page_url);
+    let pending = add_card(pending_url.clone(), CARD_TITLE);
+    assert!(app
+        .queue_service
+        .enqueue_torrent_download(&pending_url)
+        .unwrap());
+    let unsupported = add_card("https://example.test/unsupported".into(), CARD_TITLE);
+    let excluded = add_card(format!("{}?batch=excluded", server.page_url), "Other film");
+    std::fs::write(downloads.join("existing.torrent"), TORRENT).unwrap();
+    let mut connection = rusqlite::Connection::open(&app.window.config.database_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..41 {
+        let saved: i64 = transaction
+            .query_row(
+                "INSERT INTO source_pages(site_key,page_url,title,raw_html)
+                 VALUES ('torrent-queue-fixture', ?1, ?2, '') RETURNING id",
+                rusqlite::params![format!("{}?saved={index}", server.page_url), CARD_TITLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        transaction
+            .execute("INSERT INTO torrent_cards(page_id) VALUES (?1)", [saved])
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO page_attachments(page_id,source_url,filename,local_file_path)
+                 VALUES (?1, 'saved', 'existing.torrent', 'existing.torrent')",
+                [saved],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+
+    let size = egui::vec2(1900.0, 1400.0);
+    let output = render(&mut app, &context, size, vec![]);
+    let output = click_label(&mut app, &context, &output, "Search");
+    click_label(&mut app, &context, &output, "Torrents");
+    let output = wait_for_label(&mut app, &context, size, "47 torrent cards");
+    click_label(&mut app, &context, &output, "Movie title");
+    render(
+        &mut app,
+        &context,
+        size,
+        vec![egui::Event::Text(CARD_TITLE.into())],
+    );
+    let output = wait_for_label(&mut app, &context, size, "Apply filters");
+    click_label(&mut app, &context, &output, "Apply filters");
+    let output = wait_for_label(&mut app, &context, size, "46 torrent cards");
+    click_label(&mut app, &context, &output, "10");
+    render(
+        &mut app,
+        &context,
+        size,
+        vec![egui::Event::Text("2".into())],
+    );
+    let output = render(
+        &mut app,
+        &context,
+        size,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    click_label(
+        &mut app,
+        &context,
+        &output,
+        "Download missing .torrent files",
+    );
+    wait_for_label(
+        &mut app,
+        &context,
+        size,
+        "Queued 2 of 2 requested .torrent downloads.",
+    );
+    wait_for_label(&mut app, &context, size, "3/3 pages");
+
+    for id in [first, second, pending] {
+        let card = db.torrent_card(id).unwrap();
+        assert!(
+            card.has_downloaded_torrent(&downloads),
+            "Missing file for card {id}"
+        );
+        assert!(card.images.is_empty());
+    }
+    for id in [beyond_limit, unsupported, excluded] {
+        assert!(db.torrent_card(id).unwrap().attachments.is_empty());
+    }
+    let mut requests = server.requests.lock().unwrap().clone();
+    requests.sort();
+    assert_eq!(
+        requests,
+        [
+            "/release.torrent",
+            "/release.torrent",
+            "/release.torrent",
+            "/topic?batch=first",
+            "/topic?batch=pending",
+            "/topic?batch=second"
+        ]
+    );
+    assert_eq!(app.queue_service.snapshot().failed_total, 0);
 }
 
 #[test]

@@ -35,7 +35,7 @@ use crate::db::{Database, FileDownloadStore, ImageLocalPathUpdate, QueryCancella
 use crate::fs::StructuredDirectoryStrategy;
 use crate::models::{
     DateBrowseDirection, DateGroupCursor, DateGroupPage, DeleteMode, SearchCursor,
-    SearchImageResult, SearchQuery, SearchResultPage, TorrentFacet, UrlQueueReport,
+    SearchImageResult, SearchQuery, SearchResultPage, TorrentFacet, TorrentQuery, UrlQueueReport,
 };
 use crate::services::url_queue::{self, QueueJob};
 use crate::services::{
@@ -655,6 +655,25 @@ impl DesktopApp {
             });
         }) {
             self.window.torrent_import_finished(Err(error));
+        }
+    }
+
+    fn queue_missing_torrent_files(&mut self, query: TorrentQuery, limit: usize) {
+        if !self.window.begin_torrent_batch() {
+            return;
+        }
+        let database = Database::new(&self.window.config.database_path);
+        let root = self.window.config.effective_download_dir();
+        let queue = Arc::clone(&self.queue_service);
+        let tx = self.state_tx.clone();
+        if let Err(error) = spawn_background(move || {
+            let result = database
+                .missing_torrent_urls(query, &root)
+                .and_then(|urls| queue.enqueue_torrent_downloads(&urls, limit))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(WorkerState::TorrentBatchQueued { limit, result });
+        }) {
+            self.window.finish_torrent_batch(limit, Err(error));
         }
     }
 
@@ -1406,6 +1425,13 @@ impl DesktopApp {
                         self.window.torrent_import_finished(result);
                     }
                 }
+                WorkerState::TorrentBatchQueued { limit, result } => {
+                    let start = result.as_ref().is_ok_and(|queued| *queued > 0);
+                    self.window.finish_torrent_batch(limit, result);
+                    if start {
+                        self.start_processor_if_needed(self.window.config.clone());
+                    }
+                }
                 WorkerState::ImageAccessLoaded {
                     database_path,
                     result,
@@ -2087,6 +2113,10 @@ impl DesktopApp {
                         ctx.request_repaint();
                     }
                 }
+                UiCommand::DownloadMissingTorrentFiles { query, limit } => {
+                    self.queue_missing_torrent_files(query, limit);
+                    ctx.request_repaint();
+                }
                 UiCommand::RepairSavedCollection { url } => {
                     if self.window.config.has_download_folder()
                         && !self.window.storage_settings_applying()
@@ -2268,6 +2298,10 @@ impl DesktopApp {
 // ── Worker state & background jobs ───────────────────────────────────────────
 
 enum WorkerState {
+    TorrentBatchQueued {
+        limit: usize,
+        result: Result<usize, String>,
+    },
     TorrentImported {
         database_path: String,
         result: Result<(), String>,

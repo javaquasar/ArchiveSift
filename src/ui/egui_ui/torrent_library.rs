@@ -23,7 +23,9 @@ use crate::services::torrent_library::{
 };
 use eframe::egui;
 
+const MAX_COVER_PAGES: usize = 2;
 const COVER_TEXTURE_MAX_SIDE: u32 = 2048;
+const COVER_CACHE_BYTES: usize = MAX_COVER_PAGES * (COVER_TEXTURE_MAX_SIDE as usize).pow(2) * 4;
 
 #[derive(Default)]
 struct Filters {
@@ -151,6 +153,7 @@ pub(super) struct TorrentLibraryUi {
     pending_command: Option<crate::ui::UiCommand>,
     filters: Filters,
     applied: TorrentQuery,
+    torrent_batch_size: usize,
     filters_open: bool,
     details_open: bool,
     editing: bool,
@@ -179,6 +182,7 @@ pub(super) struct TorrentLibraryUi {
     pub(super) startup_error: Option<String>,
     loader: Option<PreviewLoader>,
     textures: SizedLruCache<String, egui::TextureHandle>,
+    cover_textures: SizedLruCache<String, egui::TextureHandle>,
     viewer_request: Option<i64>,
 }
 
@@ -190,6 +194,7 @@ impl Default for TorrentLibraryUi {
             pending_command: None,
             filters: Filters::default(),
             applied: TorrentQuery::default(),
+            torrent_batch_size: 10,
             filters_open: false,
             details_open: false,
             editing: false,
@@ -221,6 +226,7 @@ impl Default for TorrentLibraryUi {
             startup_error: None,
             loader: None,
             textures: SizedLruCache::new(96, 48 * 1024 * 1024),
+            cover_textures: SizedLruCache::new(MAX_COVER_PAGES, COVER_CACHE_BYTES),
             viewer_request: None,
         }
     }
@@ -298,6 +304,41 @@ impl TorrentLibraryUi {
         !self.busy && !self.editing
     }
 
+    pub(super) fn begin_torrent_batch(&mut self) -> bool {
+        if self.busy || self.editing {
+            return false;
+        }
+        self.busy = true;
+        self.error = None;
+        self.status = Some("Finding cards with missing .torrent files…".into());
+        true
+    }
+
+    pub(super) fn finish_torrent_batch(
+        &mut self,
+        limit: usize,
+        result: Result<usize, String>,
+    ) -> String {
+        self.busy = false;
+        self.status = None;
+        match result {
+            Ok(queued) => {
+                let message = if queued == 0 {
+                    "No matching missing .torrent files to queue. Check the filters and enabled extensions.".into()
+                } else {
+                    format!("Queued {queued} of {limit} requested .torrent downloads.")
+                };
+                self.status = Some(message.clone());
+                message
+            }
+            Err(error) => {
+                let message = format!("Could not queue missing .torrent files: {error}");
+                self.error = Some(message.clone());
+                message
+            }
+        }
+    }
+
     pub(super) fn open_card(&mut self, ctx: &egui::Context, config: &AppConfig, id: i64) {
         if !self.can_open_card() {
             return;
@@ -312,17 +353,18 @@ impl TorrentLibraryUi {
     }
 
     pub(super) fn page_download_finished(&mut self, url: &str) {
+        let selected = self
+            .selected
+            .as_ref()
+            .is_some_and(|card| card.page_url == url);
         if self.applied.missing_torrent
-            || self
-                .selected
-                .as_ref()
-                .is_some_and(|card| card.page_url == url)
+            || selected
+            || self.page.cards.iter().any(|card| card.page_url == url)
         {
             self.reload = true;
-            self.textures.clear();
-            if let Some(loader) = &mut self.loader {
-                loader.advance_generation();
-            }
+        }
+        if selected {
+            self.invalidate_previews();
         }
     }
 
@@ -425,10 +467,7 @@ impl TorrentLibraryUi {
                             self.reload = true;
                             self.refresh_suggestions = true;
                             self.status = Some("Card saved. File paths updated.".into());
-                            self.textures.clear();
-                            if let Some(loader) = &mut self.loader {
-                                loader.advance_generation();
-                            }
+                            self.invalidate_previews();
                         }
                         Ok(Outcome::PrimaryImageSaved(card)) => {
                             self.edit.primary_image_id = card.primary_image_id;
@@ -574,7 +613,7 @@ impl TorrentLibraryUi {
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::RED, error);
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(format!("{} torrent cards", self.page.total));
             if ui
                 .add_enabled(
@@ -598,6 +637,26 @@ impl TorrentLibraryUi {
             {
                 self.applied.offset += 40;
                 self.load(ui.ctx(), config);
+            }
+            ui.separator();
+            ui.label("Batch size");
+            ui.add(egui::DragValue::new(&mut self.torrent_batch_size).range(1..=usize::MAX));
+            if ui
+                .add_enabled(
+                    self.can_open_card()
+                        && self.page.total > 0
+                        && config.has_download_folder(),
+                    egui::Button::new("Download missing .torrent files"),
+                )
+                .on_hover_text(
+                    "Queue up to this many missing .torrent files across all pages of the applied search.",
+                )
+                .clicked()
+            {
+                self.pending_command = Some(crate::ui::UiCommand::DownloadMissingTorrentFiles {
+                    query: self.applied.clone(),
+                    limit: self.torrent_batch_size,
+                });
             }
         });
         ui.separator();
@@ -1646,8 +1705,26 @@ impl TorrentLibraryUi {
         }
         for preview in ready {
             let texture = ctx.load_texture(&preview.key, preview.image, Default::default());
-            self.textures
+            self.preview_cache(preview.mode)
                 .insert(preview.key, texture, preview.estimated_bytes);
+        }
+    }
+
+    fn preview_cache(
+        &mut self,
+        mode: ImageLoadMode,
+    ) -> &mut SizedLruCache<String, egui::TextureHandle> {
+        match mode {
+            ImageLoadMode::Preview => &mut self.textures,
+            ImageLoadMode::Original => &mut self.cover_textures,
+        }
+    }
+
+    fn invalidate_previews(&mut self) {
+        self.textures.clear();
+        self.cover_textures.clear();
+        if let Some(loader) = &mut self.loader {
+            loader.advance_generation();
         }
     }
 
@@ -1682,7 +1759,7 @@ impl TorrentLibraryUi {
             mode = ImageLoadMode::Preview;
             key = preview_key(image, mode);
         }
-        if let Some(texture) = self.textures.get(&key) {
+        if let Some(texture) = self.preview_cache(mode).get(&key) {
             if ui
                 .add(
                     egui::Image::new(texture)
@@ -1749,12 +1826,15 @@ fn leading_covers(card: &TorrentCard) -> usize {
             .filter(|path| !path.is_empty())
         {
             if relative.contains('/') {
-                // Subfolders are created for source image sections. The preceding
-                // files kept at the top level are the cover pages.
+                // A short ungrouped prefix before the first section can be a cover.
                 return leading;
             }
             if index == leading {
                 leading += 1;
+                if leading > MAX_COVER_PAGES {
+                    // Collections can have ungrouped screenshots before their first section.
+                    return 0;
+                }
             }
         }
     }
@@ -2549,6 +2629,75 @@ mod tests {
     }
 
     #[test]
+    fn large_collection_keeps_previews_stable_across_repaints() {
+        let (_root, config, _, mut editor, ctx) = fixture();
+        let mut card = editor.selected.as_deref().unwrap().clone();
+        let directory = std::path::Path::new(card.directory.as_ref().unwrap());
+        let paths = ["images/ungrouped.png", "images/01 - Scenes/grouped.png"].map(|path| {
+            let path = directory.join(path);
+            let absolute = config.effective_download_dir().join(&path);
+            std::fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+            image::RgbImage::from_pixel(20, 20, image::Rgb([128, 128, 128]))
+                .save(absolute)
+                .unwrap();
+            path.to_string_lossy().into_owned()
+        });
+        card.images = (0..198)
+            .map(|index| TorrentImage {
+                image_id: index + 1,
+                source_url: format!("https://example.test/assets/{index}.png"),
+                local_file_path: Some(paths[usize::from(index >= 120)].clone()),
+                thumbnail_path: None,
+            })
+            .collect();
+        editor.select(card);
+        let card = editor.selected.clone().unwrap();
+        let first_key = preview_key(&card.images[0], ImageLoadMode::Preview);
+        let has_loading_preview = |output: &egui::FullOutput| {
+            texts(output)
+                .iter()
+                .any(|(label, _)| label == "Image preview…")
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output = render(&mut editor, &config, &ctx, vec![]);
+            if !has_loading_preview(&output) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "visible collection previews kept loading"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(editor.cover_count, 0);
+        let first_texture = editor.textures.get(&first_key).unwrap().id();
+        assert!(editor
+            .textures
+            .contains_key(&preview_key(&card.images[1], ImageLoadMode::Preview)));
+        assert!(!editor
+            .textures
+            .contains_key(&preview_key(&card.images[197], ImageLoadMode::Preview)));
+        for _ in 0..3 {
+            assert!(!has_loading_preview(&render(
+                &mut editor,
+                &config,
+                &ctx,
+                vec![]
+            )));
+            assert_eq!(editor.textures.get(&first_key).unwrap().id(), first_texture);
+        }
+
+        editor.applied.missing_torrent = true;
+        editor.page_download_finished("https://example.test/topic?t=2");
+        assert!(editor.reload);
+        assert_eq!(editor.textures.get(&first_key).unwrap().id(), first_texture);
+        editor.page_download_finished(&card.page_url);
+        assert!(!editor.textures.contains_key(&first_key));
+    }
+
+    #[test]
     fn grouped_torrent_draws_two_original_cover_pages_side_by_side_above_screenshots() {
         let (_root, config, _, mut editor, ctx) = fixture();
         let mut card = editor.selected.as_deref().unwrap().clone();
@@ -2609,8 +2758,8 @@ mod tests {
             let output = frame(&mut editor, 1200.0, vec![]);
             if cover_keys
                 .iter()
-                .chain([&screenshot_key])
-                .all(|key| editor.textures.contains_key(key))
+                .all(|key| editor.cover_textures.contains_key(key))
+                && editor.textures.contains_key(&screenshot_key)
             {
                 break output;
             }
@@ -2621,8 +2770,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let texture_ids = [
-            editor.textures.get(&cover_keys[0]).unwrap().id(),
-            editor.textures.get(&cover_keys[1]).unwrap().id(),
+            editor.cover_textures.get(&cover_keys[0]).unwrap().id(),
+            editor.cover_textures.get(&cover_keys[1]).unwrap().id(),
             editor.textures.get(&screenshot_key).unwrap().id(),
         ];
         fn rect_for(texture: egui::TextureId, output: &egui::FullOutput) -> egui::Rect {

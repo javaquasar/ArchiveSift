@@ -926,6 +926,47 @@ impl Database {
         root: Option<&Path>,
         cancellation: Option<&QueryCancellation>,
     ) -> AppResult<(Vec<i64>, usize)> {
+        self.with_torrent_search(query, root, cancellation, |connection, sql, values| {
+            let total = connection.query_row(
+                &format!("SELECT COUNT(*){sql}"),
+                params_from_iter(values),
+                |row| row.get(0),
+            )?;
+            let mut statement = connection.prepare(&format!(
+                "SELECT sp.id{sql} ORDER BY sp.scraped_at DESC,sp.id DESC LIMIT 40 OFFSET {}",
+                query.offset
+            ))?;
+            let ids = statement
+                .query_map(params_from_iter(values), |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok((ids, total))
+        })
+    }
+
+    pub(crate) fn missing_torrent_urls(
+        &self,
+        mut query: TorrentQuery,
+        root: &Path,
+    ) -> AppResult<Vec<String>> {
+        query.missing_torrent = true;
+        self.with_torrent_search(&query, Some(root), None, |connection, sql, values| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT sp.page_url{sql} ORDER BY sp.scraped_at DESC,sp.id DESC"
+            ))?;
+            let urls = statement
+                .query_map(params_from_iter(values), |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(urls)
+        })
+    }
+
+    fn with_torrent_search<T>(
+        &self,
+        query: &TorrentQuery,
+        root: Option<&Path>,
+        cancellation: Option<&QueryCancellation>,
+        select: impl FnOnce(&Connection, &str, &[String]) -> AppResult<T>,
+    ) -> AppResult<T> {
         let year_bounds = torrent_year_bounds(&query.year)?;
         let filename = fold(&query.filename);
         if let Some(root) = root.filter(|_| !filename.is_empty()) {
@@ -1090,19 +1131,7 @@ impl Database {
             }
             sql.push(')');
         }
-        let total: usize = connection.query_row(
-            &format!("SELECT COUNT(*){sql}"),
-            params_from_iter(&values),
-            |r| r.get(0),
-        )?;
-        let mut q = connection.prepare(&format!(
-            "SELECT sp.id{sql} ORDER BY sp.scraped_at DESC,sp.id DESC LIMIT 40 OFFSET {}",
-            query.offset
-        ))?;
-        let ids = q
-            .query_map(params_from_iter(&values), |r| r.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((ids, total))
+        select(&connection, &sql, &values)
     }
 
     pub(crate) fn update_torrent_primary_image(

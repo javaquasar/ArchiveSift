@@ -1596,6 +1596,17 @@ impl AppWindow {
         self.failure_feedback = Some(message);
     }
 
+    pub(super) fn begin_torrent_batch(&mut self) -> bool {
+        !self.storage_settings.applying
+            && self.config.has_download_folder()
+            && self.torrent_library.begin_torrent_batch()
+    }
+
+    pub(super) fn finish_torrent_batch(&mut self, limit: usize, result: Result<usize, String>) {
+        let message = self.torrent_library.finish_torrent_batch(limit, result);
+        self.log.push(message);
+    }
+
     pub(super) fn failed_downloads_removed(&mut self, result: rusqlite::Result<usize>) {
         let message = match result {
             Ok(0) => "The selected downloads have already left the failure list.".into(),
